@@ -37,6 +37,16 @@ matmul kernels — carried over unchanged, because Moonlight's `config.json`
 matches colibrì's `glm_moe_dsa` runtime parameterization exactly
 (`n_group=1`, `topk_group=1`).
 
+## MoE runtime evolution
+
+`moe_route.h` is the first model-independent runtime component. It implements
+softmax, sigmoid, and square-root-softplus expert affinity while keeping
+selection bias separate from mixture weights. Moonlight now uses this shared
+path without changing its routing results. Expert execution, attention, KV
+cache, and weight loading remain architecture-specific; DeepSeek V4 hash-MoE,
+mHC, CSA/HCA attention, FP4/FP8 storage, and DSpark decoding are not yet
+implemented.
+
 ## What's *not* here (scope)
 
 Ported deliberately narrow, matching the
