@@ -41,6 +41,69 @@ def build_tiny():
     return model, cfg
 
 
+def convert_experts(sd, moe_inter):
+    """transformers >=5 的 state_dict 用 fused expert 张量:
+       experts.gate_up_proj (E, 2*moe_inter, hidden) —— modeling_deepseek_v3.py (5.13.0) L211:
+         gate, up = F.linear(x, gate_up_proj[e]).chunk(2, dim=-1)
+         => 行 [:moe_inter] = gate_proj, 行 [moe_inter:] = up_proj
+       experts.down_proj (E, hidden, moe_inter)      —— down_proj[e] 即 (hidden, moe_inter)
+       引擎（和 Moonlight 4.46 checkpoint）要 per-expert:
+         mlp.experts.E.{gate,up,down}_proj.weight
+       其余张量名原样保留。返回新的 name->tensor dict。"""
+    out = {}
+    for n, t in sd.items():
+        if n.endswith(".mlp.experts.gate_up_proj"):
+            base = n[: -len(".gate_up_proj")]
+            for e in range(t.shape[0]):
+                out[f"{base}.{e}.gate_proj.weight"] = t[e, :moe_inter, :].contiguous().clone()
+                out[f"{base}.{e}.up_proj.weight"] = t[e, moe_inter:, :].contiguous().clone()
+        elif n.endswith(".mlp.experts.down_proj"):
+            base = n[: -len(".down_proj")]
+            for e in range(t.shape[0]):
+                out[f"{base}.{e}.down_proj.weight"] = t[e].contiguous().clone()
+        else:
+            out[n] = t.contiguous().clone()
+    return out
+
+
+def verify_expert_split(model, cfg, sd_split, layer_idx=1, ntok=3):
+    """数值验证 split 顺序: 用 split 后的 per-expert 张量手工复算 MoE 前向
+       (sigmoid 路由 + e_score_correction_bias top-k 选择, norm_topk_prob 归一,
+       routed_scaling_factor, + shared experts), 对比 layer.mlp(x)。不匹配即 split 反了。"""
+    torch.manual_seed(4321)
+    D, K = cfg.hidden_size, cfg.num_experts_per_tok
+    x = torch.randn(1, ntok, D)
+    mlp = model.model.layers[layer_idx].mlp
+    with torch.no_grad():
+        want = mlp(x)[0]                                        # (ntok, D)
+        xf = x[0]
+        scores = (xf.float() @ mlp.gate.weight.float().T).sigmoid()
+        choice = scores + mlp.gate.e_score_correction_bias      # n_group=topk_group=1: 组掩码为恒等
+        topk_idx = choice.topk(K, dim=-1).indices
+        w = scores.gather(1, topk_idx)
+        if cfg.norm_topk_prob:
+            w = w / (w.sum(-1, keepdim=True) + 1e-20)
+        w = w * cfg.routed_scaling_factor
+        P = f"model.layers.{layer_idx}.mlp"
+        got = torch.zeros_like(xf)
+        for t in range(ntok):
+            for j in range(K):
+                e = topk_idx[t, j].item()
+                g = sd_split[f"{P}.experts.{e}.gate_proj.weight"]
+                u = sd_split[f"{P}.experts.{e}.up_proj.weight"]
+                d = sd_split[f"{P}.experts.{e}.down_proj.weight"]
+                h = torch.nn.functional.silu(g @ xf[t]) * (u @ xf[t])
+                got[t] += w[t, j] * (d @ h)
+            sg = sd_split[f"{P}.shared_experts.gate_proj.weight"]
+            su = sd_split[f"{P}.shared_experts.up_proj.weight"]
+            sdn = sd_split[f"{P}.shared_experts.down_proj.weight"]
+            got[t] += sdn @ (torch.nn.functional.silu(sg @ xf[t]) * (su @ xf[t]))
+    diff = (got - want).abs().max().item()
+    print(f"expert-split verify (layer {layer_idx}, {ntok} tok): max|diff| = {diff:.3e}")
+    assert diff < 1e-4, f"split order WRONG: max abs diff {diff}"
+    return diff
+
+
 def make_ref(model, prompt_ids, ngen):
     ids = torch.tensor([prompt_ids])
     with torch.no_grad():
@@ -60,11 +123,21 @@ def main():
     a = ap.parse_args()
 
     if a.mode == "tiny":
+        import os
+        from safetensors.torch import save_file
         model, cfg = build_tiny()
-        for n, p in model.state_dict().items():
+        # transformers >=5 fuses expert weights (experts.gate_up_proj); 引擎要
+        # Moonlight(4.46) 的 per-expert 布局, 所以自己转换并写 safetensors。
+        sd = convert_experts(model.state_dict(), cfg.moe_intermediate_size)
+        verify_expert_split(model, cfg, sd)
+        for n, p in sd.items():
+            e = n.split(".mlp.experts.")
+            if len(e) == 2 and not e[1].startswith("0."):
+                continue                        # 每层只打印 expert 0（其余 63 个同形状）
             print(f"  {n:60s} {tuple(p.shape)}")
         ref = make_ref(model, [3, 14, 159, 26, 53, 58, 200, 11, 77, 240, 5, 99], a.ngen)
-        model.save_pretrained(a.out, safe_serialization=True)
+        os.makedirs(a.out, exist_ok=True)
+        save_file(sd, f"{a.out}/model.safetensors", metadata={"format": "pt"})
         cfg_dict = cfg.to_dict()
         if "rope_theta" not in cfg_dict:
             # newer transformers nests rope_theta under rope_parameters; the
