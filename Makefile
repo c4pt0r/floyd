@@ -1,4 +1,5 @@
 UNAME_S := $(shell uname -s)
+PYTHON  ?= python3
 
 ifeq ($(UNAME_S),Darwin)
 CC      = clang
@@ -75,7 +76,10 @@ test-tok: tests/test_tok_moon
 tools/probe_safetensors: tools/probe_safetensors.c st.h st_probe.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+test-v4-oracle:
+	PYTHONPATH=. $(PYTHON) tests/test_make_v4_oracle.py
+
 clean:
 	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
 
-.PHONY: all test-c test-tok metal-test clean portable
+.PHONY: all test-c test-tok test-v4-oracle metal-test clean portable

@@ -47,6 +47,16 @@ cache, and weight loading remain architecture-specific; DeepSeek V4 hash-MoE,
 mHC, CSA/HCA attention, FP4/FP8 storage, and DSpark decoding are not yet
 implemented.
 
+Generate the deterministic CPU-sized V4 architecture oracle with:
+
+```bash
+.venv/bin/python tools/make_v4_oracle.py tiny
+```
+
+This creates ignored `fixture_tiny_v4/` and `ref_v4_tiny.json` artifacts. The
+fixture covers sliding/HCA/CSA attention, mHC, hash MoE, and learned
+sqrt-softplus routing; it is a correctness target, not a performance model.
+
 ## What's *not* here (scope)
 
 Ported deliberately narrow, matching the
