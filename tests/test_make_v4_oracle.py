@@ -61,15 +61,25 @@ def test_write_tiny_is_complete_and_deterministic():
         assert (fixture / "oracle.safetensors").is_file()
 
         with safe_open(fixture / "oracle.safetensors", framework="pt") as oracle:
-            assert set(oracle.keys()) == {
+            expected_keys = {
                 "hidden.0", "hidden.1", "hidden.2", "hidden.3",
                 "logits", "router.0", "router.1",
             }
+            for layer in range(3):
+                for field in ("input", "output", "logits", "weights", "indices"):
+                    expected_keys.add(f"moe.{layer}.{field}")
+            assert set(oracle.keys()) == expected_keys
             n_tokens = len(ref["full_ids"])
             assert oracle.get_slice("logits").get_shape() == [n_tokens, 128]
             assert oracle.get_slice("hidden.0").get_shape() == [n_tokens, 2, 64]
             assert oracle.get_slice("hidden.3").get_shape() == [n_tokens, 64]
             assert oracle.get_slice("router.0").get_shape() == [n_tokens, 8]
+            for layer in range(3):
+                assert oracle.get_slice(f"moe.{layer}.input").get_shape() == [n_tokens, 64]
+                assert oracle.get_slice(f"moe.{layer}.output").get_shape() == [n_tokens, 64]
+                assert oracle.get_slice(f"moe.{layer}.logits").get_shape() == [n_tokens, 8]
+                assert oracle.get_slice(f"moe.{layer}.weights").get_shape() == [n_tokens, 2]
+                assert oracle.get_slice(f"moe.{layer}.indices").get_shape() == [n_tokens, 2]
 
 
 if __name__ == "__main__":

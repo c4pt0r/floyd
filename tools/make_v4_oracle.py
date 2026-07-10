@@ -73,6 +73,53 @@ def greedy_ids(model, prompt_ids, ngen):
     return full_ids
 
 
+def forward_with_moe_captures(model, input_ids):
+    captures = {}
+    handles = []
+
+    for layer_index, layer in enumerate(model.model.layers):
+        def make_pre_hook(index):
+            def hook(module, args, kwargs):
+                captures[f"moe.{index}.input"] = args[0][0].detach().float().contiguous().clone()
+            return hook
+
+        def make_output_hook(index):
+            def hook(module, args, kwargs, output):
+                captures[f"moe.{index}.output"] = output[0].detach().float().contiguous().clone()
+            return hook
+
+        def make_gate_hook(index):
+            def hook(module, args, kwargs, output):
+                logits, weights, indices = output
+                captures[f"moe.{index}.logits"] = logits.detach().float().contiguous().clone()
+                captures[f"moe.{index}.weights"] = weights.detach().float().contiguous().clone()
+                captures[f"moe.{index}.indices"] = indices.detach().contiguous().clone()
+            return hook
+
+        handles.append(layer.mlp.register_forward_pre_hook(
+            make_pre_hook(layer_index), with_kwargs=True
+        ))
+        handles.append(layer.mlp.register_forward_hook(
+            make_output_hook(layer_index), with_kwargs=True
+        ))
+        handles.append(layer.mlp.gate.register_forward_hook(
+            make_gate_hook(layer_index), with_kwargs=True
+        ))
+
+    try:
+        with torch.no_grad():
+            output = model(
+                input_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                output_router_logits=True,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+    return output, captures
+
+
 def write_tiny(out_dir, ref_path, ngen=8):
     out_dir = Path(out_dir)
     ref_path = Path(ref_path)
@@ -82,20 +129,15 @@ def write_tiny(out_dir, ref_path, ngen=8):
     model, _ = build_tiny()
     full_ids = greedy_ids(model, PROMPT_IDS, ngen)
     input_ids = torch.tensor([full_ids], dtype=torch.long)
-    with torch.no_grad():
-        output = model(
-            input_ids,
-            use_cache=False,
-            output_hidden_states=True,
-            output_router_logits=True,
-        )
+    output, moe_captures = forward_with_moe_captures(model, input_ids)
 
     model.save_pretrained(out_dir, safe_serialization=True)
     oracle = {"logits": output.logits[0].float().contiguous()}
     for i, hidden in enumerate(output.hidden_states):
         oracle[f"hidden.{i}"] = hidden[0].float().contiguous()
     for i, router in enumerate(output.router_logits):
-        oracle[f"router.{i}"] = router.float().contiguous()
+        oracle[f"router.{i}"] = router.float().contiguous().clone()
+    oracle.update(moe_captures)
     save_file(oracle, out_dir / "oracle.safetensors")
 
     reference = {
