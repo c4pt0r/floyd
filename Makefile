@@ -31,7 +31,7 @@ METAL_OBJ = backend_metal.o
 LDFLAGS += -framework Metal -framework Foundation
 endif
 
-TEST_BINS = tests/test_json tests/test_st
+TEST_BINS = tests/test_json tests/test_st tests/test_moe_route
 
 all: floyd
 
@@ -55,6 +55,9 @@ tests/test_json: tests/test_json.c json.h
 tests/test_st: tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_moe_route: tests/test_moe_route.c moe_route.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 test-c: $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done
 
@@ -64,6 +67,6 @@ test-tok: tests/test_tok_moon
 	./tests/test_tok_moon models/Moonlight-16B-A3B-Instruct tok_cases.json
 
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_backend_metal tests/test_tok_moon
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_backend_metal tests/test_tok_moon
 
 .PHONY: all test-c test-tok metal-test clean portable
