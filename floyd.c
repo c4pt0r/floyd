@@ -56,7 +56,7 @@ static int g_metal=0, g_metal_min_s=8;
  * solo se g_metal e' attivo (un binario METAL=1 con FLOYD_METAL=0 a runtime
  * non paga nulla). Interamente compilati fuori nelle build non-METAL. */
 static uint64_t g_metal_batch_calls=0;   /* S>=g_metal_min_s -> dispatch GPU */
-static uint64_t g_metal_s1_calls=0;      /* S<g_metal_min_s ma S>=1 mentre g_metal e' attivo (possibile solo con FM_MIN_S abbassato) */
+static uint64_t g_metal_small_calls=0;   /* g_metal_min_s <= S < 8 (S>=1 mentre g_metal e' attivo; possibile solo con FM_MIN_S abbassato) */
 static uint64_t g_metal_cpu_calls=0;     /* fallthrough su CPU mentre g_metal e' attivo */
 #endif
 
@@ -471,13 +471,22 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         /* 8 qui e' la soglia CANONICA (default FM_MIN_S), non g_metal_min_s: se l'utente
          * abbassa FM_MIN_S sotto 8, questi S<8 finiscono comunque su GPU (sperimentale,
          * vedi warning a startup) — li contiamo separatamente dal batch path normale. */
-        if(S>=8) g_metal_batch_calls++; else g_metal_s1_calls++;
+        if(S>=8) {
+            #pragma omp atomic update
+            g_metal_batch_calls++;
+        } else {
+            #pragma omp atomic update
+            g_metal_small_calls++;
+        }
         int cache = !w->slab_backed;
         if(w->fmt==1) fm_matmul_q8(y,x,w->q8,w->s,w->O,w->I,S,cache);
         else          fm_matmul_q4(y,x,w->q4,w->s,w->O,w->I,S,cache);
         return;
     }
-    if(g_metal) g_metal_cpu_calls++;   /* fallthrough su CPU: gated su g_metal, zero costo se non attivo */
+    if(g_metal) {
+        #pragma omp atomic update
+        g_metal_cpu_calls++;   /* fallthrough su CPU: gated su g_metal, zero costo se non attivo */
+    }
 #endif
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
@@ -1741,7 +1750,7 @@ static void profile_print(Model *m, double elapsed){
      * passano da qui, quindi il riepilogo Metal si stampa una volta sola per chiamante. */
     if(g_metal)
         printf("[METAL] summary: %llu batch matmul su GPU, %llu S<soglia su GPU, %llu matmul su CPU\n",
-            (unsigned long long)g_metal_batch_calls, (unsigned long long)g_metal_s1_calls,
+            (unsigned long long)g_metal_batch_calls, (unsigned long long)g_metal_small_calls,
             (unsigned long long)g_metal_cpu_calls);
 #endif
 }
