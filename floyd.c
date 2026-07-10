@@ -1751,27 +1751,10 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #endif
 }
 
-/* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
- * detokenizza e stampa il testo in streaming. */
-static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
-    Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
-                                          * distribuzione int4 e' rumore di quantizzazione */
-    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
-    int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
-    if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
-    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
-    fputs(prompt,stdout); fflush(stdout);
-    kv_alloc(m, np+ngen+g_draft+2);
-    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
-    double t=now_s();
-    float *logit=step(m,pids,np,0);
-    EmitStream es={&T,m,t,0,0};
-    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
-    double dt=now_s()-t;
+/* coda di statistiche di fine generazione, condivisa dai due rami di run_text (GLM e
+ * moonshot, chat-task 5): tok/s, hit-rate expert, speculazione, profiling, LOOKAHEAD. */
+static void print_run_stats(Model *m, int produced, double dt){
+    Cfg *c=&m->c;
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\n%d token in %.2fs (%.2f tok/s) | hit-rate expert %.1f%% | RSS %.2f GB\n",
@@ -1793,6 +1776,40 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
+}
+
+/* ramo moonshot di run_text: definito piu' sotto (dopo emit_moon/MoonEmit, che riusa),
+ * dichiarato qui per poterlo chiamare da run_text. Chat-task 5. */
+static void run_text_moon(Model *m, const char *snap, const char *prompt, int ngen);
+
+/* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
+ * detokenizza e stampa il testo in streaming. */
+static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
+    /* rilevamento tokenizer: se <snap>/tiktoken.model esiste, il container e' Moonlight
+     * -> ramo chat_template moonshot (chat-task 5: 'run' deve funzionare anche li'). */
+    { char mkp[2048]; snprintf(mkp,sizeof(mkp),"%s/tiktoken.model",snap);
+      FILE *mp=fopen(mkp,"rb");
+      if(mp){ fclose(mp); run_text_moon(m,snap,prompt,ngen); return; }
+    }
+    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Tok T; tok_load(&T,tkp);
+    int eos=tok_id_of(&T,"<|endoftext|>");
+    stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
+                                          * distribuzione int4 e' rumore di quantizzazione */
+    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
+    int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
+    if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
+    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
+    fputs(prompt,stdout); fflush(stdout);
+    kv_alloc(m, np+ngen+g_draft+2);
+    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
+    double t=now_s();
+    float *logit=step(m,pids,np,0);
+    EmitStream es={&T,m,t,0,0};
+    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
+    double dt=now_s()-t;
+    print_run_stats(m, produced, dt);
     free(pids); free(all);
     usage_save(m);
 }
@@ -1945,35 +1962,77 @@ static void emit_moon(int t, void *ud){
     e->count++;
 }
 
+/* stop token moonshot: eos_token_id di generation_config.json (numero o array), fallback
+ * <|im_end|>. Condiviso da run_chat e dal ramo moonshot di run_text (chat-task 5: prima
+ * viveva solo dentro run_chat, fattorizzato qui per non duplicarlo). */
+static int moon_resolve_eos(MTok *T, const char *snap){
+    int eos=-1;
+    char gp[2048]; snprintf(gp,sizeof(gp),"%s/generation_config.json",snap[0]?snap:".");
+    FILE *gf=fopen(gp,"rb");
+    if(gf){
+        fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
+        char *gb=malloc(gn+1);
+        if(gb){
+            if(fread(gb,1,gn,gf)==(size_t)gn){
+                gb[gn]=0;
+                char *garena=NULL; jval *groot=json_parse(gb,&garena);
+                jval *ge=json_get(groot,"eos_token_id");
+                if(ge){
+                    if(ge->t==J_NUM) eos=(int)ge->num;
+                    else if(ge->t==J_ARR && ge->len>0 && ge->kids[0]->t==J_NUM) eos=(int)ge->kids[0]->num;
+                }
+            }
+            free(gb);
+        }
+        fclose(gf);
+    }
+    if(eos<0) eos = mtok_special(T, "<|im_end|>");
+    return eos;
+}
+
+/* ramo moonshot di run_text (chat-task 5): stessa semantica single-shot del ramo GLM
+ * (tokenizza, prefill + decode con stop su EOS, detokenizza in streaming), ma passando
+ * dal chat_template come run_chat fa per-turno (system + user + genprompt) — 'run' e'
+ * chat single-shot, non un completion grezzo. Attivato da run_text quando <snap>/tiktoken.model
+ * esiste (container Moonlight). */
+static void run_text_moon(Model *m, const char *snap, const char *prompt, int ngen){
+    MTok T; mtok_load(&T, snap[0]?snap:".");
+    int eos = moon_resolve_eos(&T, snap);
+    if(eos<0){ fprintf(stderr,"tokenizer senza <|im_end|>\n"); exit(1); }
+    stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=0.7f;  if(!getenv("NUCLEUS")) g_nuc=0.90f;
+    const char *systxt=getenv("SYSTEM")?getenv("SYSTEM"):"You are a helpful assistant";
+
+    /* buffer del template: system + user + marcatori di ruolo/genprompt (limite superiore
+     * largo — mtok_tmpl_* rifiuta il turno con -1 se anche cosi' non basta). */
+    int cap=(int)strlen(systxt)+(int)strlen(prompt)+64;
+    int *pids=malloc(cap*sizeof(int));
+    int no=mtok_tmpl_msg(&T,"system",systxt,pids,0,cap);
+    no=mtok_tmpl_msg(&T,"user",prompt,pids,no,cap);
+    no=mtok_tmpl_genprompt(&T,pids,no,cap);
+    if(no<1){ fprintf(stderr,"prompt vuoto/non valido dopo template chat\n"); free(pids); return; }
+    int np=no;
+
+    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
+    fputs(prompt,stdout); fflush(stdout);
+    kv_alloc(m, np+ngen+g_draft+2);
+    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
+    double t=now_s();
+    float *logit=step(m,pids,np,0);
+    MoonEmit me={&T,t,0,eos};
+    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_moon,&me,NULL);
+    double dt=now_s()-t;
+    print_run_stats(m, produced, dt);
+    free(pids); free(all);
+    usage_save(m);
+}
+
 /* modalita' CHAT interattiva (moonshot chat_template): loop REPL a riga singola, KV-cache
  * persistente tra i turni (in RAM E su disco via .coli_kv, come run_serve). Niente protocollo
  * \x01/\x02: e' per un umano al terminale, non per la CLI 'coli'. */
 static void run_chat(Model *m, const char *snap){
     MTok T; mtok_load(&T, snap[0]?snap:".");     /* --model directory e' la directory del modello */
-    /* stop token: eos_token_id di generation_config.json (numero o array), fallback <|im_end|> */
-    int eos=-1;
-    {
-        char gp[2048]; snprintf(gp,sizeof(gp),"%s/generation_config.json",snap[0]?snap:".");
-        FILE *gf=fopen(gp,"rb");
-        if(gf){
-            fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
-            char *gb=malloc(gn+1);
-            if(gb){
-                if(fread(gb,1,gn,gf)==(size_t)gn){
-                    gb[gn]=0;
-                    char *garena=NULL; jval *groot=json_parse(gb,&garena);
-                    jval *ge=json_get(groot,"eos_token_id");
-                    if(ge){
-                        if(ge->t==J_NUM) eos=(int)ge->num;
-                        else if(ge->t==J_ARR && ge->len>0 && ge->kids[0]->t==J_NUM) eos=(int)ge->kids[0]->num;
-                    }
-                }
-                free(gb);
-            }
-            fclose(gf);
-        }
-    }
-    if(eos<0) eos = mtok_special(&T, "<|im_end|>");
+    int eos = moon_resolve_eos(&T, snap);
     if(eos<0){ fprintf(stderr,"tokenizer senza <|im_end|>\n"); exit(1); }
     stops_arm(&m->c, eos);
     if(g_temp<0) g_temp=0.7f;  if(!getenv("NUCLEUS")) g_nuc=0.90f;
