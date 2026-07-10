@@ -58,7 +58,12 @@ tests/test_st: tests/test_st.c st.h json.h compat.h
 test-c: $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done
 
-clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_backend_metal
+tests/test_tok_moon: tests/test_tok_moon.c tok_moon.h tok.h tok_unicode.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+test-tok: tests/test_tok_moon
+	./tests/test_tok_moon models/Moonlight-16B-A3B-Instruct tok_cases.json
 
-.PHONY: all test-c metal-test clean portable
+clean:
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_backend_metal tests/test_tok_moon
+
+.PHONY: all test-c test-tok metal-test clean portable

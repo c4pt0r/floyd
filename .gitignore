@@ -7,6 +7,7 @@ ref*.json
 tests/test_json
 tests/test_st
 tests/test_backend_metal
+tests/test_tok_moon
 kernels_metal.h
 fixture_tiny*/
 *.log
