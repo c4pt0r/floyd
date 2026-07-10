@@ -32,7 +32,7 @@ METAL_OBJ = backend_metal.o
 LDFLAGS += -framework Metal -framework Foundation
 endif
 
-TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant tests/test_st_probe
+TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_quant tests/test_st_probe
 
 all: floyd
 
@@ -59,6 +59,9 @@ tests/test_st: tests/test_st.c st.h json.h compat.h
 tests/test_moe_route: tests/test_moe_route.c moe_route.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_moe_exec: tests/test_moe_exec.c moe_exec.h moe_route.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_v4_quant: tests/test_v4_quant.c v4_quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -80,6 +83,6 @@ test-v4-oracle:
 	PYTHONPATH=. $(PYTHON) tests/test_make_v4_oracle.py
 
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
 
 .PHONY: all test-c test-tok test-v4-oracle metal-test clean portable

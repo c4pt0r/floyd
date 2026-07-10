@@ -8,6 +8,7 @@ ref*.json
 tests/test_json
 tests/test_st
 tests/test_moe_route
+tests/test_moe_exec
 tests/test_st_probe
 tests/test_v4_quant
 tests/test_backend_metal
