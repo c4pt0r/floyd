@@ -116,13 +116,42 @@ present) — useful as an f32 control run isolated from quantization noise.
 ### 4. Metal backend (optional, Apple Silicon only)
 
 ```bash
-make clean && make METAL=1
+PATH=/opt/homebrew/bin:$PATH make METAL=1 clean
+PATH=/opt/homebrew/bin:$PATH make METAL=1
 make metal-test                       # kernel-level unit test vs CPU f64 reference
 ./floyd tf --model models/moonlight_i8 --ref ref_moonlight.json --metal
 ```
 
+The `PATH=/opt/homebrew/bin:$PATH` prefix matters: the Makefile locates
+`libomp` via `$(shell brew --prefix libomp)` (see `Makefile`), and if `brew`
+itself isn't on `PATH` (e.g. a minimal shell/CI environment) that `shell`
+call silently returns empty — no error, just a `libomp non trovato` build
+warning and a single-thread binary. Put Homebrew's `bin` on `PATH` before
+building (`METAL=1` or not) to get the multi-threaded OpenMP build.
+
 `--metal` (or legacy `FLOYD_METAL=1`) on a CPU-only build (`make` without
 `METAL=1`) hard-errors (exit code 2) rather than silently ignoring the flag.
+
+#### Metal is for batch, not chat decode
+
+Metal accelerates the **batch** matmul path (prefill / teacher-forcing /
+forward over `S >= FM_MIN_S` tokens at once, default `FM_MIN_S=8`) — chat
+decode (`S=1`, one token at a time) stays on CPU by design and default, and
+should. The generic Metal dispatch wrapper this project ships (transient
+`x`/`y` buffers per call, `waitUntilCompleted` synchronous per-call) pays a
+fixed per-dispatch overhead that batch shapes amortize and single-token
+decode cannot. Measured on an Apple M3 Ultra: forcing `FM_MIN_S=1` (so
+decode also routes to the GPU) collapsed chat throughput to **1.66 tok/s**,
+against **5.93 tok/s on CPU** for the same run — a ~3.6x regression, not a
+rounding difference. With the default `FM_MIN_S=8` (decode stays CPU),
+long-generation throughput was ~7.16 tok/s vs 6.89 tok/s CPU-only: parity,
+because Metal simply isn't in the decode path.
+
+**Do not lower `FM_MIN_S` for chat.** The engine now warns loudly on stderr
+at startup if you do (`FM_MIN_S<8` with `--metal`/`FLOYD_METAL=1`); this is
+an experimental, currently-slower code path, not a hidden win waiting to be
+unlocked. `FM_MIN_S` remains useful for tuning where the batch/prefill
+threshold kicks in on shapes other than chat decode.
 
 ## CLI reference
 
