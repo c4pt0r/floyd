@@ -1976,7 +1976,7 @@ static void run_chat(Model *m, const char *snap){
     if(eos<0) eos = mtok_special(&T, "<|im_end|>");
     if(eos<0){ fprintf(stderr,"tokenizer senza <|im_end|>\n"); exit(1); }
     stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=0.7f;  g_nuc = getenv("NUCLEUS")?g_nuc:0.90f;
+    if(g_temp<0) g_temp=0.7f;  if(!getenv("NUCLEUS")) g_nuc=0.90f;
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):512;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     const char *systxt=getenv("SYSTEM")?getenv("SYSTEM"):"You are a helpful assistant";
@@ -2008,6 +2008,7 @@ static void run_chat(Model *m, const char *snap){
         fprintf(stderr,"\n[%d tok, %.2f tok/s | ctx %d/%d | RSS %.2f GB]\n",prod,prod/dt,len,maxctx,rss_gb());
         kv_disk_append(m,hist,len);
     }
+    usage_save(m);
     free(hist);
     free(line);
 }
