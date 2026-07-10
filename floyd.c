@@ -621,6 +621,7 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
+    if(!th) th=json_get(r,"rope_theta");   /* deepseek_v3/Moonlight: chiave top-level */
     c->theta = th?(float)th->num:10000.f;
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
@@ -715,9 +716,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
-        l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
-        l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
-        l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
+        if(c->q_lora>0){
+            l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
+            l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
+            l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
+        } else {
+            /* q_lora_rank=null (Moonlight/V2-Lite): proiezione q diretta, niente q_a/rmsnorm */
+            l->q_b   = qt_load(m,P("self_attn.q_proj.weight"), H*c->qk_head, D, dbits);
+        }
         l->kv_a  = qt_load(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
         l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
@@ -788,7 +794,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     /* DSA lightning indexer: attivo SOLO se i pesi (conversione --indexer) ci sono per
      * TUTTI i layer full. Auto-rilevamento come per MTP: niente flag, niente passi extra. */
     {
-        m->has_dsa = (c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
+        m->has_dsa = (c->q_lora>0 && c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
         char inm[300];
         for(int i=0;i<c->n_layers && m->has_dsa;i++){
             if(!c->idx_type[i]) continue;
@@ -980,15 +986,20 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     double ta0=now_s();
     float *ctx=falloc((int64_t)S*H*vh);
     float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
-    float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
+    float *QR=falloc((int64_t)S*(c->q_lora>0?c->q_lora:1)), *comp=falloc(c->kv_lora+c->qk_rope);
     /* 1) per ogni token nuovo: query roped + latente normato e k_rot roped -> in cache.
      * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA. */
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D; int pos=pos_base+s;
-        float *qresid=QR+(int64_t)s*c->q_lora;
-        matmul_qt(qresid, xs, &l->q_a, 1);
-        rmsnorm(qresid, qresid, l->q_a_ln, c->q_lora, c->eps);
-        float *qfull=Q+(int64_t)s*H*qh; matmul_qt(qfull, qresid, &l->q_b, 1);
+        float *qfull=Q+(int64_t)s*H*qh;
+        if(c->q_lora>0){
+            float *qresid=QR+(int64_t)s*c->q_lora;
+            matmul_qt(qresid, xs, &l->q_a, 1);
+            rmsnorm(qresid, qresid, l->q_a_ln, c->q_lora, c->eps);
+            matmul_qt(qfull, qresid, &l->q_b, 1);
+        } else {
+            matmul_qt(qfull, xs, &l->q_b, 1);   /* q diretta: [H*qk_head, hidden] */
+        }
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
         matmul_qt(comp, xs, &l->kv_a, 1);
         float *Ldst=m->Lc[layer]+(int64_t)pos*c->kv_lora, *Rdst=m->Rc[layer]+(int64_t)pos*c->qk_rope;
