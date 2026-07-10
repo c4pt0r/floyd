@@ -4,3 +4,5 @@ models/
 floyd
 ref*.json
 .DS_Store
+tests/test_json
+tests/test_st
