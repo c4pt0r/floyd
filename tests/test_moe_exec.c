@@ -89,10 +89,28 @@ static int test_clamped_swiglu(void) {
     return 0;
 }
 
+static int test_rejects_missing_shared_experts(void) {
+    const float router[] = {0.0f};
+    const float weight[] = {1.0f};
+    const MoeExpertF32 experts[] = {{.w1 = weight, .w2 = weight, .w3 = weight}};
+    const MoeF32 model = {
+        .hidden = 1, .intermediate = 1, .n_experts = 1, .top_k = 1,
+        .score_fn = MOE_SCORE_SOFTMAX, .normalize = 1, .route_scale = 1.0f,
+        .router = router, .experts = experts,
+        .shared_experts = NULL, .n_shared_experts = 1,
+    };
+    const float input[] = {1.0f};
+    float output[1];
+
+    CHECK(!moe_f32_forward(&model, input, NULL, 1, output));
+    return 0;
+}
+
 int main(void) {
     CHECK(test_learned_route_and_shared_expert() == 0);
     CHECK(test_hash_route_uses_token_table() == 0);
     CHECK(test_clamped_swiglu() == 0);
+    CHECK(test_rejects_missing_shared_experts() == 0);
     puts("moe execution tests: ok");
     return 0;
 }

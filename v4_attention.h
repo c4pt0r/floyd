@@ -71,6 +71,7 @@ static inline int v4_sliding_attention_forward(const V4SlidingAttentionF32 *mode
         model->window <= 0 || !model->q_a || !model->q_a_norm || !model->q_b ||
         !model->kv || !model->kv_norm || !model->sinks || !model->o_a || !model->o_b)
         return 0;
+    if (n_tokens == 0) return 1;
 
     int hidden = model->hidden, heads = model->heads, head_dim = model->head_dim;
     int q_width = heads * head_dim;

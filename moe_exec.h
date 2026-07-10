@@ -66,7 +66,9 @@ static inline int moe_f32_forward(const MoeF32 *model, const float *input,
                                   const int *token_ids, int n_tokens, float *output) {
     if (!model || !input || !output || n_tokens < 0 || model->hidden <= 0 ||
         model->intermediate <= 0 || model->n_experts <= 0 || model->top_k <= 0 ||
-        model->top_k > model->n_experts || !model->router || !model->experts) return 0;
+        model->top_k > model->n_experts || model->n_shared_experts < 0 ||
+        (model->n_shared_experts > 0 && !model->shared_experts) ||
+        !model->router || !model->experts) return 0;
 
     int hidden = model->hidden, experts = model->n_experts, top_k = model->top_k;
     float logits[experts], scores[experts], choices[experts], weights[top_k];

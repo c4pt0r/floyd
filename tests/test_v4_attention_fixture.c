@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
     float *expected = load_f32(&source, "attn.0.output", n_tokens * D);
     float *actual = malloc((size_t)n_tokens * D * sizeof(float));
 
+    CHECK(v4_sliding_attention_forward(&model, input, 0, actual));
     CHECK(v4_sliding_attention_forward(&model, input, (int)n_tokens, actual));
 
     float max_abs = 0.0f;
