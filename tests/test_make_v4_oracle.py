@@ -66,6 +66,8 @@ def test_write_tiny_is_complete_and_deterministic():
                 "input_ids", "logits", "router.0", "router.1",
             }
             for layer in range(3):
+                expected_keys.add(f"attn.{layer}.input")
+                expected_keys.add(f"attn.{layer}.output")
                 for field in ("input", "output", "logits", "weights", "indices"):
                     expected_keys.add(f"moe.{layer}.{field}")
                 for site in ("attn", "ffn"):
@@ -79,6 +81,8 @@ def test_write_tiny_is_complete_and_deterministic():
             assert oracle.get_slice("hidden.3").get_shape() == [n_tokens, 64]
             assert oracle.get_slice("router.0").get_shape() == [n_tokens, 8]
             for layer in range(3):
+                assert oracle.get_slice(f"attn.{layer}.input").get_shape() == [n_tokens, 64]
+                assert oracle.get_slice(f"attn.{layer}.output").get_shape() == [n_tokens, 64]
                 assert oracle.get_slice(f"moe.{layer}.input").get_shape() == [n_tokens, 64]
                 assert oracle.get_slice(f"moe.{layer}.output").get_shape() == [n_tokens, 64]
                 assert oracle.get_slice(f"moe.{layer}.logits").get_shape() == [n_tokens, 8]

@@ -96,6 +96,16 @@ def forward_with_moe_captures(model, input_ids):
                 captures[f"moe.{index}.indices"] = indices.detach().contiguous().clone()
             return hook
 
+        def make_attn_pre_hook(index):
+            def hook(module, args, kwargs):
+                captures[f"attn.{index}.input"] = args[0][0].detach().float().contiguous().clone()
+            return hook
+
+        def make_attn_output_hook(index):
+            def hook(module, args, kwargs, output):
+                captures[f"attn.{index}.output"] = output[0][0].detach().float().contiguous().clone()
+            return hook
+
         def make_hc_pre_hook(index, site):
             def hook(module, args, kwargs):
                 captures[f"hc.{index}.{site}.input"] = (
@@ -121,6 +131,12 @@ def forward_with_moe_captures(model, input_ids):
         ))
         handles.append(layer.mlp.gate.register_forward_hook(
             make_gate_hook(layer_index), with_kwargs=True
+        ))
+        handles.append(layer.self_attn.register_forward_pre_hook(
+            make_attn_pre_hook(layer_index), with_kwargs=True
+        ))
+        handles.append(layer.self_attn.register_forward_hook(
+            make_attn_output_hook(layer_index), with_kwargs=True
         ))
         for site, module in (("attn", layer.attn_hc), ("ffn", layer.ffn_hc)):
             handles.append(module.register_forward_pre_hook(
