@@ -4,6 +4,7 @@
  * a livello kernel contro il riferimento CPU (tests/test_backend_metal.c). */
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <os/lock.h>
 #include "backend_metal.h"
 #include "kernels_metal.h"      /* xxd -i kernels.metal: unsigned char kernels_metal[], kernels_metal_len */
 
@@ -18,6 +19,12 @@ static id<MTLComputePipelineState> g_p8, g_p4;
 #define FM_WCACHE 4096
 static struct { const void *host; id<MTLBuffer> buf; } g_wc[FM_WCACHE];
 static int g_nwc;
+/* matmul_qt (floyd.c, Task 7) e' chiamato da region OpenMP parallele nel motore: senza
+ * lock, lookup+insert su g_wc[]/g_nwc sarebbe raced (doppia lettura di g_nwc -> scrittura
+ * OOB oltre lo slot FM_WCACHE-1; aggiornamenti persi tra thread; scritture concorrenti sul
+ * campo id<MTLBuffer> sono UB sotto ARC per il retain/release implicito). os_unfair_lock:
+ * uncontended fast-path economico, sezione critica breve anche sul miss (una newBufferWithBytes). */
+static os_unfair_lock g_wc_lock = OS_UNFAIR_LOCK_INIT;
 
 int fm_init(void) {
     @autoreleasepool {
@@ -35,11 +42,20 @@ int fm_init(void) {
 }
 const char *fm_device_name(void) { return g_dev ? g_dev.name.UTF8String : "(none)"; }
 
-/* Lookup/insert nella cache chiave-puntatore. */
+/* Lookup/insert nella cache chiave-puntatore, sotto g_wc_lock (vedi commento sopra g_wc_lock).
+ * NOTA: un cache HIT ignora `len` — contratto del chiamante: un solo puntatore stabile per
+ * tensore residente (stessa shape/contenuto per tutta la vita del puntatore); e' cache=0
+ * (wbuf() sotto) che va usato per qualunque puntatore il cui contenuto puo' cambiare. */
 static id<MTLBuffer> wbuf_cached(const void *host, size_t len) {
-    for (int i = 0; i < g_nwc; i++) if (g_wc[i].host == host) return g_wc[i].buf;
+    os_unfair_lock_lock(&g_wc_lock);
+    for (int i = 0; i < g_nwc; i++) if (g_wc[i].host == host) {
+        id<MTLBuffer> hit = g_wc[i].buf;
+        os_unfair_lock_unlock(&g_wc_lock);
+        return hit;
+    }
     id<MTLBuffer> b = [g_dev newBufferWithBytes:host length:len options:MTLResourceStorageModeShared];
     if (g_nwc < FM_WCACHE) { g_wc[g_nwc].host = host; g_wc[g_nwc].buf = b; g_nwc++; }
+    os_unfair_lock_unlock(&g_wc_lock);
     return b;
 }
 

@@ -48,6 +48,10 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
+#ifdef FLOYD_METAL
+#include "backend_metal.h"
+static int g_metal=0, g_metal_min_s=8;
+#endif
 
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
@@ -71,6 +75,13 @@ typedef struct {
     ColiCudaTensor *cuda;
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+    int slab_backed;      /* 1 = q8/q4/s puntano dentro una slab/buffer RIUSATO tra load diversi
+                            * (ESlot expert: slab coalescente O il buffer fallback qt_from_disk,
+                            * entrambi riciclati tra eid diversi sullo stesso slot). matmul_qt passa
+                            * cache=!slab_backed a fm_matmul_*: un buffer Metal cache-ato per
+                            * puntatore su un tensore slab-backed servirebbe pesi stantii dopo un
+                            * repin/evict, senza errore visibile (host pointer stabile, contenuto no).
+                            * Default 0 (memset/calloc) = tensore denso residente -> cache OK. */
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -444,6 +455,18 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
 }
 
 static void matmul_qt(float *y, const float *x, QT *w, int S){
+#ifdef FLOYD_METAL
+    /* batch path (prefill/TF, S>=g_metal_min_s): dispatch a GPU. Tensori densi residenti
+     * (slab_backed==0) usano il cache pesi Metal chiave-puntatore (upload lazy una volta);
+     * viste/expert slab (slab_backed==1) vanno SEMPRE non cache-ate (cache=0) perche' il
+     * puntatore e' stabile ma il contenuto viene riciclato tra load di eid diversi. */
+    if(g_metal && S>=g_metal_min_s && (w->fmt==1 || w->fmt==2)){
+        int cache = !w->slab_backed;
+        if(w->fmt==1) fm_matmul_q8(y,x,w->q8,w->s,w->O,w->I,S,cache);
+        else          fm_matmul_q4(y,x,w->q4,w->s,w->O,w->I,S,cache);
+        return;
+    }
+#endif
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
      * Streaming expert slots are reused for different IDs and must never enter
@@ -869,6 +892,9 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
+        /* anche qui i buffer q8/q4 sono RIUSATI tra un eid e l'altro sullo stesso ESlot
+         * (qt_from_disk rialloca solo se cambia fmt) -> stesso rischio del ramo slab. */
+        s->g.slab_backed=s->u.slab_backed=s->d.slab_backed=1;
         s->eid=eid; return;
     }
     st_tensor *tw[3], *tq[3];
@@ -931,6 +957,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+        qt[k]->slab_backed=1;                 /* vista dentro s->slab, riciclato tra eid diversi */
     }
     s->eid=eid;
 }
@@ -2306,6 +2333,17 @@ int main(int argc, char **argv){
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+#ifdef FLOYD_METAL
+    g_metal = (getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))) ? 1 : 0;
+    g_metal_min_s = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;
+    if(g_metal){
+        if(!fm_init()){ fprintf(stderr,"[METAL] richiesto ma non disponibile\n"); return 2; }
+        fprintf(stderr,"[METAL] attivo: %s (batch S>=%d)\n", fm_device_name(), g_metal_min_s);
+    }
+#else
+    if(getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))){
+        fprintf(stderr,"FLOYD_METAL richiede: make METAL=1\n"); return 2; }
+#endif
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
