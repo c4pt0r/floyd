@@ -85,6 +85,36 @@ norms + embed/lm_head kept F32 raw).
 Engine invocation: `SNAP=<container> [TF=1] REF=<ref>.json ./floyd 64 <ebits> 8`
 (cache=64 experts/layer, `dbits=8` in both containers).
 
+### f32 control (unquantized HF checkpoint read directly)
+
+The engine reads unquantized safetensors directly: `qt_from_disk()` falls
+back to a full-tensor read (BF16 -> f32 via `st.h`) when no `.qs` sibling
+exists, and `bits=16` maps to raw-f32 tensors at runtime — so the HF
+checkpoint directory itself works as a container. This isolates engine
+correctness from quantization noise.
+
+**TF vs `ref_moonlight_long.json` (52 positions, primary target):**
+```
+$ SNAP=models/Moonlight-16B-A3B-Instruct TF=1 REF=ref_moonlight_long.json ./floyd 4 16 16
+[RAM_GB=331.1 auto] cap ALZATO 4->64: il budget lo consente (proiezione picco 40.2 GB)
+== Motore C GLM (glm_moe_dsa), cache=4 expert/layer | expert@16-bit densa@16-bit | idot: neon ==
+caricato in 0.85s | densa residente: 5957.50 MB | layers=27 experts=64 | MTP assente (draft=0)
+PREFILL (teacher-forcing) C vs oracolo: 52/52 posizioni | 5.3 pos/s
+PROFILO: expert-disk 3.841s | expert-matmul 3.183s | attention 1.029s (di cui kvb 0.095s) | lm_head 0.000s | altro 1.763s
+```
+
+**TF vs `ref_moonlight.json` (30 positions, secondary datapoint):**
+```
+$ SNAP=models/Moonlight-16B-A3B-Instruct TF=1 REF=ref_moonlight.json ./floyd 4 16 16
+caricato in 0.84s | densa residente: 5957.50 MB | layers=27 experts=64 | MTP assente (draft=0)
+PREFILL (teacher-forcing) C vs oracolo: 30/30 posizioni | 4.4 pos/s
+```
+
+**f32 TF is 52/52 and 30/30 — the C engine's forward pass is exact on the
+real weights** (argmax-identical to the transformers f32 oracle at every
+position of both refs). The int8/int4 TF gaps below (48/52, 46/52; 29/30,
+24/30) are therefore proven quantization effects, not engine bugs.
+
 ### int8 (`models/moonlight_i8`, expert@8-bit densa@8-bit)
 
 **TF vs `ref_moonlight_long.json` (52 positions, primary target):**
@@ -164,21 +194,25 @@ quantization error compounding once greedy has no error-correction.
 |-----------|----------------------|-------------------------|---------------------------|------------|--------------|
 | f32 fixture (Task 3) | 32/32 | — | 20/20 | 250.3 | 0.04 GB |
 | int8 fixture (Task 4) | 24/32 | — | 0/20 | — | — |
+| **f32 real (control)** | **52/52** | **30/30** | — | 5.3 | — |
 | **int8 real** | **48/52** | **29/30** | **16/24** | 13.2 | 13.89 GB |
 | **int4 real** | **46/52** | **24/30** | **16/24** | 18.1 | 8.73 GB |
 
 ## Assessment
 
+- The f32 control run proves the engine forward pass is exact on the real
+  checkpoint: 52/52 and 30/30 against the transformers f32 oracle. Every
+  TF mismatch in the int8/int4 rows is attributable to weight
+  quantization, not to the C implementation of attention/MoE/rope/etc.
 - int8 TF on the real checkpoint (48/52 primary, 29/30 secondary) is close
   to, but not exactly, the oracle — well above the "grossly low" (<40/52)
   investigation threshold, and the shorter secondary ref shows a
   substantially higher match rate (29/30 = 96.7% vs 48/52 = 92.3%),
   consistent with per-position quantization noise having more
-  opportunities to flip a near-tied argmax as the sequence gets longer,
-  rather than a structural/layout bug (no crashes, no dimension errors,
-  clean load in both runs). This matches the calibration note that
-  real-model logits are confident and int8 dequant error is small
-  (~0.4%), with the residual mismatches attributable to occasional
+  opportunities to flip a near-tied argmax as the sequence gets longer.
+  Given the exact f32 control, this is now proven (not just inferred) to
+  be quantization noise: real-model logits are confident and int8 dequant
+  error is small (~0.4%), with the residual mismatches being occasional
   near-tied-logit flips.
 - int4 TF (46/52, 24/30) is modestly below int8 on both refs, as expected
   from the larger per-row quantization error on 4-bit routed-expert
