@@ -7,8 +7,12 @@ ref*.json
 .DS_Store
 tests/test_json
 tests/test_st
+tests/test_moe_route
+tests/test_st_probe
+tests/test_v4_quant
 tests/test_backend_metal
 tests/test_tok_moon
+tools/probe_safetensors
 kernels_metal.h
 fixture_tiny*/
 *.log
