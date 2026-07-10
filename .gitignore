@@ -10,3 +10,4 @@ tests/test_backend_metal
 kernels_metal.h
 fixture_tiny*/
 *.log
+tok_cases.json
