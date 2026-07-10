@@ -141,7 +141,10 @@ comandi:
 flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)
   --dbits 4|8|16 (8) | --ram GB | --metal
 chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)
-  --top-p P (0.90) | --system "..." | --prompt "..." (run) | --draft N | --no-kvsave
+  --top-p P (0.90) | --system "..." | --prompt "..." (solo run) | --draft N
+chat:      --no-kvsave (disattiva persistenza KV su disco; solo chat, run non persiste mai)
+tf/gen:    --ref FILE (obbligatorio)
+flag duplicati: l'ultima occorrenza vince
 
 variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)
 ```
@@ -150,10 +153,12 @@ variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ..
 conversation, `run` = single generation, `tf` = teacher-forcing vs oracle,
 `gen` = greedy vs oracle. `--cap` is the per-layer expert LRU cache size,
 `--ebits`/`--dbits` are expert/dense quantization bit-widths, `--ref` is the
-oracle reference JSON for `tf`/`gen` (not listed in the tool's own usage
-banner but required by those two subcommands), `--draft` is the n-gram
-speculative-decoding draft window, `--no-kvsave` disables the on-disk KV
-persistence chat/run otherwise do by default.)
+oracle reference JSON, required by `tf`/`gen` and rejected (exit 2) for
+`chat`/`run`, `--draft` is the n-gram speculative-decoding draft window,
+`--prompt` is likewise rejected (exit 2) for anything other than `run`.
+`--no-kvsave` disables the on-disk KV persistence `chat` does by default —
+`run` is single-shot and never persists KV, with or without the flag. If a
+flag is repeated, the last occurrence wins.)
 
 `chat` starts a REPL (`:reset` clears context, `:exit` quits) that keeps its
 KV-cache warm across turns **and** across process restarts — `<model-dir>/.coli_kv`
@@ -270,7 +275,7 @@ normal use.
 | `NOPACK` | disable weight packing | 0 |
 | `DROP` | drop-on-evict cache policy variant (keep evicted expert pages in the OS page cache as free L2, vs. discarding them) | 0 |
 | `PREFETCH` | re-enable cross-layer `WILLNEED` madvise prefetch (boolean; off by default because parallel real loads made it redundant, and under memory pressure the speculative readahead was getting re-evicted) | 0 |
-| `TOPK` | MoE **expert-routing** knob: force exactly `n` experts/token, overriding the checkpoint's configured top-k. Independent of `TOPP`; no CLI equivalent | 0 (off = use checkpoint's config top-k) |
+| `TOPK` | MoE **expert-routing** knob: force `n` experts/token (clamped to the checkpoint's top-k — `n` above it has no further effect). Independent of `TOPP`; no CLI equivalent | 0 (off = use checkpoint's config top-k) |
 | `TOPP` | MoE **expert-routing** knob: adaptive top-p — after ranking the routed experts by router weight, keep only as many as needed for cumulative weight to reach `p` (0..1) of the total, i.e. the disk-read reducer benchmarked by colibrì. Independent of `TOPK`, no CLI equivalent | 0 (off) |
 | `MLOCK` | force/disable `mlock()` of resident weights | auto (on, macOS) |
 | `SPEC` | n-gram speculative decoding | 1 |

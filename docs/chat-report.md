@@ -201,6 +201,16 @@ PREFILL (teacher-forcing) C vs oracolo: 24/32 posizioni | 218.5 pos/s
 Matches the report's recorded `24/32` exactly — no `docs/parity-report.md`
 changes were needed.
 
+## 6. Deviation from spec: oversized input lines
+
+The design spec (`docs/superpowers/specs/2026-07-10-floyd-chat-cli-design.md`)
+called for input lines over 64KB to be truncated with a warning; the
+implementation instead refuses the turn with the same "context full"
+message used for `:reset` (`floyd.c`'s `run_chat`, `(contesto pieno:
+:reset)`) whenever the tokenized turn would overflow `maxctx` — safer than
+silently truncating a user's message, so the deviation is recorded here
+rather than silently shipped.
+
 ## Summary
 
 | Check | Result |

@@ -2490,7 +2490,10 @@ static void usage(int code){
 "flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)\n"
 "  --dbits 4|8|16 (8) | --ram GB | --metal\n"
 "chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)\n"
-"  --top-p P (0.90) | --system \"...\" | --prompt \"...\" (run) | --draft N | --no-kvsave\n\n"
+"  --top-p P (0.90) | --system \"...\" | --prompt \"...\" (solo run) | --draft N\n"
+"chat:      --no-kvsave (disattiva persistenza KV su disco; solo chat, run non persiste mai)\n"
+"tf/gen:    --ref FILE (obbligatorio)\n"
+"flag duplicati: l'ultima occorrenza vince\n\n"
 "variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)\n",
     code?stderr:stdout); exit(code);
 }
@@ -2538,6 +2541,7 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
             setenv("SYSTEM",argv[i],1);
         } else if(!strcmp(a,"--prompt")){
             if(++i>=argc) usage(2);
+            if(strcmp(cmd,"run")){ fprintf(stderr,"--prompt e' solo per 'run'\n"); usage(2); }
             setenv("PROMPT",argv[i],1); have_prompt=1;
         } else if(!strcmp(a,"--draft")){
             if(++i>=argc) usage(2);
@@ -2568,16 +2572,29 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
         }
     }
     if(!have_model){ fprintf(stderr,"manca --model\n"); usage(2); }
+    /* Isolamento modo (new-style): un env di modo ereditato dalla shell (PROMPT=,
+     * SERVE=1, CHAT=1, ...) puo' anticipare il dispatch di main() rispetto al
+     * comando appena scelto (main() controlla SCORE/SERVE/PROMPT/CHAT/REPLAY/TF
+     * in quest'ordine prima del default gen/tf). Ripuliamo qui, dopo aver gia'
+     * fatto setenv() del modo scelto sopra, tutte le env di modo che main()
+     * controllerebbe PRIMA di quella del comando scelto — cosi' l'invocazione
+     * new-style e' isolata dall'ambiente ereditato. Path legacy (niente
+     * subcommand): non tocca nulla, cli_adapt torna 0 subito. */
     if(!strcmp(cmd,"chat")){
         setenv("CHAT","1",1);
+        unsetenv("PROMPT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     } else if(!strcmp(cmd,"run")){
         if(!have_prompt){ fprintf(stderr,"run richiede --prompt\n"); usage(2); }
-        if(!have_ngen) setenv("NGEN","256",1);   /* run_text legge NGEN con default 64: alziamolo qui */
+        if(!have_ngen) setenv("NGEN","256",0);   /* run_text legge NGEN con default 64: alziamolo qui,
+                                                   * ma senza sovrascrivere un NGEN ereditato esplicito */
+        unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     } else if(!strcmp(cmd,"tf")){
         if(!have_ref){ fprintf(stderr,"tf richiede --ref\n"); usage(2); }
         setenv("TF","1",1);
+        unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY");
     } else if(!strcmp(cmd,"gen")){
         if(!have_ref){ fprintf(stderr,"gen richiede --ref\n"); usage(2); }
+        unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     }
     return 1;
 }
