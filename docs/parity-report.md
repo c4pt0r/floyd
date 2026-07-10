@@ -78,7 +78,7 @@ norms + embed/lm_head kept F32 raw).
 | container      | TF (teacher-forcing)     | greedy            |
 |----------------|---------------------------|--------------------|
 | f32 fixture    | 32/32                      | 20/20              |
-| int8 fixture   | 24/32 (fixture-noise: tiny random-initialized weights are unusually sensitive to per-row absmax quantization at this scale, not representative of the real checkpoint) | 0/20 (no error-correction across greedy steps once the first token diverges) |
+| int8 fixture   | 24/32 (plausibly fixture-scale noise sensitivity — tiny random weights sit near argmax decision boundaries; consistent with, though not isolated by, the real-model results where int8 reaches 92-97%) | 0/20 (no error-correction across greedy steps once the first token diverges) |
 
 ## Real-model results
 
@@ -212,7 +212,7 @@ quantization error compounding once greedy has no error-correction.
   opportunities to flip a near-tied argmax as the sequence gets longer.
   Given the exact f32 control, this is now proven (not just inferred) to
   be quantization noise: real-model logits are confident and int8 dequant
-  error is small (~0.4%), with the residual mismatches being occasional
+  error is small (measured 0.39% max rel. error in a per-tensor dequant spot check during converter review; single-tensor sample, not a full-model sweep), with the residual mismatches being occasional
   near-tied-logit flips.
 - int4 TF (46/52, 24/30) is modestly below int8 on both refs, as expected
   from the larger per-row quantization error on 4-bit routed-expert
