@@ -53,10 +53,43 @@ static int test_dequant_row_changes_scale_at_32_values(void) {
     return 0;
 }
 
+static int test_e4m3_values(void) {
+    CHECK(v4_e4m3_to_f32(0x00) == 0.0f);
+    CHECK(v4_e4m3_to_f32(0x01) == 0.001953125f);
+    CHECK(v4_e4m3_to_f32(0x08) == 0.015625f);
+    CHECK(v4_e4m3_to_f32(0x38) == 1.0f);
+    CHECK(v4_e4m3_to_f32(0x3c) == 1.5f);
+    CHECK(v4_e4m3_to_f32(0x7e) == 448.0f);
+    CHECK(isnan(v4_e4m3_to_f32(0x7f)));
+    CHECK(v4_e4m3_to_f32(0xb8) == -1.0f);
+    return 0;
+}
+
+static int test_fp8_block_dequant(void) {
+    const uint8_t weights[16] = {
+        0x38, 0x38, 0x38, 0x38,
+        0x38, 0x38, 0x38, 0x38,
+        0x38, 0x38, 0x38, 0x38,
+        0x38, 0x38, 0x38, 0x38,
+    };
+    const uint8_t scales[4] = {127, 128, 126, 129};
+    float output[16];
+
+    v4_fp8_dequant_matrix(output, weights, scales, 4, 4, 2);
+
+    CHECK(output[0] == 1.0f && output[1] == 1.0f);
+    CHECK(output[2] == 2.0f && output[3] == 2.0f);
+    CHECK(output[8] == 0.5f && output[9] == 0.5f);
+    CHECK(output[10] == 4.0f && output[11] == 4.0f);
+    return 0;
+}
+
 int main(void) {
     CHECK(test_all_fp4_codes_and_nibble_order() == 0);
     CHECK(test_e8m0_values() == 0);
     CHECK(test_dequant_row_changes_scale_at_32_values() == 0);
+    CHECK(test_e4m3_values() == 0);
+    CHECK(test_fp8_block_dequant() == 0);
     puts("v4 quant tests: ok");
     return 0;
 }

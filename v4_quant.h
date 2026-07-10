@@ -24,11 +24,38 @@ static inline float v4_e8m0_to_f32(uint8_t code) {
     return ldexpf(1.0f, (int)code - 127);
 }
 
+static inline float v4_e4m3_to_f32(uint8_t code) {
+    int sign = (code & 0x80) ? -1 : 1;
+    int exponent = (code >> 3) & 0x0f;
+    int mantissa = code & 0x07;
+    if (exponent == 0x0f && mantissa == 0x07) return NAN;
+    float value;
+    if (exponent == 0)
+        value = ldexpf((float)mantissa / 8.0f, -6);
+    else
+        value = ldexpf(1.0f + (float)mantissa / 8.0f, exponent - 7);
+    return sign * value;
+}
+
 static inline void v4_fp4_dequant_row(float *out, const uint8_t *packed,
                                       const uint8_t *scales, int count) {
     for (int i = 0; i < count; i++) {
         float scale = v4_e8m0_to_f32(scales[i / 32]);
         out[i] = v4_fp4_packed_value(packed, i) * scale;
+    }
+}
+
+static inline void v4_fp8_dequant_matrix(float *out, const uint8_t *weights,
+                                         const uint8_t *scales, int rows,
+                                         int columns, int block_size) {
+    int scale_columns = (columns + block_size - 1) / block_size;
+    for (int row = 0; row < rows; row++) {
+        for (int column = 0; column < columns; column++) {
+            int scale_index = (row / block_size) * scale_columns + column / block_size;
+            float scale = v4_e8m0_to_f32(scales[scale_index]);
+            out[(int64_t)row * columns + column] =
+                v4_e4m3_to_f32(weights[(int64_t)row * columns + column]) * scale;
+        }
     }
 }
 
