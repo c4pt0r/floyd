@@ -6,3 +6,5 @@ ref*.json
 .DS_Store
 tests/test_json
 tests/test_st
+tests/test_backend_metal
+kernels_metal.h
