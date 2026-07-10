@@ -30,7 +30,7 @@ engine's qt_from_disk()/qt_load() expect (see floyd.c: `st_has(&m->S, name+".qs"
 the quantized-container path; byte count alone selects int8 (nb==O*I) vs int4
 (nb==O*ceil(I/2))).
 """
-import argparse, glob, os, re, shutil
+import argparse, glob, os, re, shutil, sys
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -79,10 +79,16 @@ def is_quantizable(name, t):
     return True
 
 def convert(a):
-    os.makedirs(a.outdir, exist_ok=True)
     cfg_src = os.path.join(a.indir, "config.json")
-    if os.path.exists(cfg_src):
-        shutil.copy(cfg_src, a.outdir)
+    if not os.path.exists(cfg_src):
+        sys.exit(f"config.json mancante in {a.indir}: non e' una directory modello HF")
+    os.makedirs(a.outdir, exist_ok=True)
+    shutil.copy(cfg_src, a.outdir)
+    stale = glob.glob(os.path.join(a.outdir, "out-*.safetensors.tmp"))
+    if stale:
+        print(f"rimuovo {len(stale)} .tmp residui da una conversione interrotta")
+        for p in stale:
+            os.remove(p)
     shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
     assert shards, f"nessun safetensors in {a.indir}"
     for i, sp in enumerate(shards):
@@ -101,7 +107,9 @@ def convert(a):
                     out[name], out[name + ".qs"] = qb, s
                 else:
                     out[name] = t.float().numpy()   # embed/lm_head/router/1D: F32 原样
-        save_file(out, outp)
+        tmp = outp + ".tmp"
+        save_file(out, tmp)
+        os.replace(tmp, outp)   # atomico sullo stesso filesystem: resume non vede mai un file troncato
         print(f"[{i+1}/{len(shards)}] {os.path.basename(sp)} -> {outp} ({len(out)} tensori)", flush=True)
 
 if __name__ == "__main__":
