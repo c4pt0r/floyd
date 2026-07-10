@@ -73,6 +73,19 @@ static inline int moe_route_select(const float *logits, const float *selection_b
     return top_k;
 }
 
+static inline int moe_route_fixed(const float *logits, int n_experts,
+                                  const int *indices, int count,
+                                  MoeScoreFn score_fn, float *weights,
+                                  float *scores) {
+    if (n_experts <= 0 || count <= 0) return 0;
+    for (int k = 0; k < count; k++)
+        if (indices[k] < 0 || indices[k] >= n_experts) return 0;
+
+    moe_route_scores(logits, n_experts, score_fn, scores);
+    for (int k = 0; k < count; k++) weights[k] = scores[indices[k]];
+    return count;
+}
+
 static inline void moe_route_finalize(float *weights, int count,
                                       int normalize, float routed_scale) {
     if (count <= 0) return;

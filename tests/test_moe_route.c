@@ -95,6 +95,23 @@ static int test_finalize_uses_effective_expert_count(void) {
     return 0;
 }
 
+static int test_fixed_route_uses_supplied_experts(void) {
+    const float logits[] = {-1.0f, 0.0f, 2.0f};
+    const int indices[] = {2, 0};
+    float weights[2], scores[3];
+
+    int n = moe_route_fixed(logits, 3, indices, 2,
+                            MOE_SCORE_SQRT_SOFTPLUS, weights, scores);
+    moe_route_finalize(weights, n, 1, 1.5f);
+
+    float first = sqrtf(log1pf(expf(2.0f)));
+    float second = sqrtf(log1pf(expf(-1.0f)));
+    CHECK(n == 2);
+    CHECK_NEAR(weights[0], first / (first + second) * 1.5f, 1e-6f);
+    CHECK_NEAR(weights[1], second / (first + second) * 1.5f, 1e-6f);
+    return 0;
+}
+
 int main(void) {
     CHECK(test_sigmoid_bias_affects_selection_only() == 0);
     CHECK(test_sigmoid_preserves_legacy_extreme_value_behavior() == 0);
@@ -102,6 +119,7 @@ int main(void) {
     CHECK(test_sqrt_softplus_scores() == 0);
     CHECK(test_ties_keep_lower_expert_index() == 0);
     CHECK(test_finalize_uses_effective_expert_count() == 0);
+    CHECK(test_fixed_route_uses_supplied_experts() == 0);
     puts("moe routing tests: ok");
     return 0;
 }
