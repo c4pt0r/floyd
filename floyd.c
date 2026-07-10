@@ -31,6 +31,7 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#include "tok_moon.h"                              /* tokenizer moonshot (Chat-Task 4): mtok_*, template builders */
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -1930,6 +1931,87 @@ out:
     return nrec;
 }
 
+/* emit callback CHAT: detokenizza via mtok_decode e stampa in streaming (bytewise, l'UTF-8
+ * a cavallo di piu' token lo ricompone il terminale). Non stampa MAI lo stop token: spec_decode
+ * gia' non lo passa a emit() (si ferma prima), ma il controllo su e->eos resta come difesa
+ * in profondita' (nessun leak del marcatore letterale <|im_end|> in nessun percorso). */
+typedef struct { MTok *T; double t0; int count; int eos; } MoonEmit;
+static void emit_moon(int t, void *ud){
+    MoonEmit *e=(MoonEmit*)ud;
+    if(t==e->eos) return;
+    char dec[256];
+    int dn=mtok_decode(e->T,&t,1,dec,sizeof(dec)-1);
+    fwrite(dec,1,dn,stdout); fflush(stdout);
+    e->count++;
+}
+
+/* modalita' CHAT interattiva (moonshot chat_template): loop REPL a riga singola, KV-cache
+ * persistente tra i turni (in RAM E su disco via .coli_kv, come run_serve). Niente protocollo
+ * \x01/\x02: e' per un umano al terminale, non per la CLI 'coli'. */
+static void run_chat(Model *m, const char *snap){
+    MTok T; mtok_load(&T, snap[0]?snap:".");     /* --model directory e' la directory del modello */
+    /* stop token: eos_token_id di generation_config.json (numero o array), fallback <|im_end|> */
+    int eos=-1;
+    {
+        char gp[2048]; snprintf(gp,sizeof(gp),"%s/generation_config.json",snap[0]?snap:".");
+        FILE *gf=fopen(gp,"rb");
+        if(gf){
+            fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
+            char *gb=malloc(gn+1);
+            if(gb){
+                if(fread(gb,1,gn,gf)==(size_t)gn){
+                    gb[gn]=0;
+                    char *garena=NULL; jval *groot=json_parse(gb,&garena);
+                    jval *ge=json_get(groot,"eos_token_id");
+                    if(ge){
+                        if(ge->t==J_NUM) eos=(int)ge->num;
+                        else if(ge->t==J_ARR && ge->len>0 && ge->kids[0]->t==J_NUM) eos=(int)ge->kids[0]->num;
+                    }
+                }
+                free(gb);
+            }
+            fclose(gf);
+        }
+    }
+    if(eos<0) eos = mtok_special(&T, "<|im_end|>");
+    if(eos<0){ fprintf(stderr,"tokenizer senza <|im_end|>\n"); exit(1); }
+    stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=0.7f;  g_nuc = getenv("NUCLEUS")?g_nuc:0.90f;
+    int ngen=getenv("NGEN")?atoi(getenv("NGEN")):512;
+    int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+    const char *systxt=getenv("SYSTEM")?getenv("SYSTEM"):"You are a helpful assistant";
+    kv_alloc(m,maxctx);
+    int len=0, *hist=malloc(maxctx*sizeof(int));
+    g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
+    snprintf(g_kv_path,sizeof(g_kv_path),"%s/.coli_kv",snap);
+    { int r=kv_disk_load(m,hist,maxctx); if(r>0) len=r; }
+    fprintf(stderr,"floyd chat — :reset azzera, :exit esce\n");
+    char *line=NULL; size_t cap=0; ssize_t nr;
+    for(;;){
+        fputs("\n\xe2\x80\xba ",stdout); fflush(stdout);
+        if((nr=getline(&line,&cap,stdin))<=0) break;
+        if(line[nr-1]=='\n') line[--nr]=0;
+        if(!strcmp(line,":exit")) break;
+        if(!strcmp(line,":reset")){ len=0; kv_disk_reset(); puts("(reset)"); continue; }
+        if(!nr) continue;
+        int no=len;
+        if(len==0) no=mtok_tmpl_msg(&T,"system",systxt,hist,no,maxctx);
+        no=mtok_tmpl_msg(&T,"user",line,hist,no,maxctx);
+        no=mtok_tmpl_genprompt(&T,hist,no,maxctx);
+        if(no+ngen+g_draft+2>=maxctx || no<0){ fprintf(stderr,"(contesto pieno: :reset)\n"); continue; }
+        int k=no-len;
+        float *logit=step(m,hist+len,k,len); len=no;
+        fputs("\xe2\x97\x86 ",stdout);
+        MoonEmit me={&T,now_s(),0,eos};
+        int prod=spec_decode(m,hist,len,ngen,eos,logit,emit_moon,&me,&len);
+        double dt=now_s()-me.t0;
+        fprintf(stderr,"\n[%d tok, %.2f tok/s | ctx %d/%d | RSS %.2f GB]\n",prod,prod/dt,len,maxctx,rss_gb());
+        kv_disk_append(m,hist,len);
+    }
+    free(hist);
+    free(line);
+}
+
 static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
@@ -2446,6 +2528,9 @@ int main(int argc, char **argv){
         if(stats) stats_dump(&m,stats);
         return 0;
     }
+
+    /* modo chat interattiva (moonshot chat_template, tokenizer tiktoken): CHAT=1 */
+    if(getenv("CHAT")){ run_chat(&m,snap); if(stats) stats_dump(&m,stats); return 0; }
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";

@@ -80,30 +80,51 @@ int main(int argc, char **argv) {
     }
     printf("tokenizer parity: %d/%d\n", ok, tot);
 
-    /* Template (Chat-Task 4 fa la costruzione completa): qui solo decode-direction
-     * sui 42 id del template, verificando che il testo renderizzato contenga i
-     * marcatori di ruolo e il contenuto del primo turno utente. */
+    /* Template (Chat-Task 4): costruzione COMPLETA via mtok_tmpl_msg/mtok_tmpl_genprompt
+     * (chat_template moonshot), confrontata id-per-id contro l'oracolo apply_chat_template. */
     int tmpl_pass = 1;
+    int tmpl_n_ok = 0, tmpl_n_tot = 0;
     jval *tmpl = json_get(root, "template");
     if (tmpl) {
         jval *tids = json_get(tmpl, "ids");
-        if (tids && tids->t == J_ARR) {
+        jval *msgs = json_get(tmpl, "messages");
+        jval *agp = json_get(tmpl, "add_generation_prompt");
+        if (tids && tids->t == J_ARR && msgs && msgs->t == J_ARR) {
             int tn = tids->len;
-            int *tarr = malloc((tn > 0 ? tn : 1) * sizeof(int));
-            for (int k = 0; k < tn; k++) tarr[k] = (int)tids->kids[k]->num;
-            int dl = mtok_decode(&T, tarr, tn, decbuf, MAXOUT);
-            if (dl < 0 || dl >= MAXOUT) dl = MAXOUT - 1;
-            decbuf[dl] = 0;
-            if (!strstr(decbuf, "<|im_system|>") || !strstr(decbuf, "What is 2+2?")) {
-                tmpl_pass = 0;
-                printf("FAIL template roundtrip: decoded=\"%s\"\n", decbuf);
+            tmpl_n_tot = tn;
+            int *texp = malloc((tn > 0 ? tn : 1) * sizeof(int));
+            for (int k = 0; k < tn; k++) texp[k] = (int)tids->kids[k]->num;
+
+            int *tact = malloc(MAXIDS * sizeof(int));
+            int no = 0;
+            for (int i = 0; i < msgs->len && no >= 0; i++) {
+                jval *msg = msgs->kids[i];
+                jval *jrole = json_get(msg, "role");
+                jval *jcontent = json_get(msg, "content");
+                no = mtok_tmpl_msg(&T, jrole->str, jcontent->str, tact, no, MAXIDS);
             }
-            free(tarr);
+            if (no >= 0 && (!agp || agp->t != J_BOOL || agp->boolean))
+                no = mtok_tmpl_genprompt(&T, tact, no, MAXIDS);
+
+            if (no != tn) {
+                tmpl_pass = 0;
+            } else {
+                for (int k = 0; k < tn; k++) {
+                    if (tact[k] == texp[k]) tmpl_n_ok++;
+                    else tmpl_pass = 0;
+                }
+            }
+            if (!tmpl_pass) {
+                printf("FAIL template build: got %d ids, expected %d\n", no, tn);
+                printf("  expected: "); print_ids(texp, tn); printf("\n");
+                printf("  actual:   "); print_ids(tact, no >= 0 ? no : 0); printf("\n");
+            }
+            free(texp); free(tact);
         } else {
             tmpl_pass = 0;
         }
     }
-    printf("template roundtrip: %s\n", tmpl_pass ? "ok" : "FAIL");
+    printf("template build: %s (%d/%d ids)\n", tmpl_pass ? "ok" : "FAIL", tmpl_n_ok, tmpl_n_tot);
 
     int all_ok = (ok == tot) && tmpl_pass;
     if (!all_ok) return 1;

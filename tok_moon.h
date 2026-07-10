@@ -287,6 +287,62 @@ static int mtok_decode(MTok *T, const int *ids, int n, char *out, int max){
     return o;
 }
 
+/* ---------- costruttori del chat_template moonshot (Chat-Task 4) ----------
+ * Replica fedele di chat_template.jinja per un turno:
+ *   <|im_{role}|> + encode(role) + <|im_middle|> + encode(content) + <|im_end|>
+ * role_txt/content sono UTF-8 puro (mai special: encode() non li riconosce mai,
+ * i soli special immessi sono i marcatori di ruolo, iniettati per id qui).
+ * Ritornano il nuovo `no`, o -1 se `max` non basta (il chiamante rifiuta il turno). */
+static int mtok_tmpl_msg(MTok *T, const char *role, const char *content, int *out, int no, int max){
+    if(no<0) return -1;  /* chiamata incatenata dopo un -1 precedente: propaga il rifiuto, non scrive out[-1] */
+    char key[32];
+    int kn = snprintf(key,sizeof(key),"<|im_%s|>",role);
+    if(kn<0 || kn>=(int)sizeof(key)) return -1;
+    int rsp = mtok_special(T,key);
+    if(rsp<0) return -1;
+    if(no>=max) return -1;
+    out[no++]=rsp;
+
+    int rlen=(int)strlen(role);
+    if(no+rlen>max) return -1;  /* limite superiore sicuro: mai piu' token di byte grezzi */
+    no += mtok_encode(T, role, rlen, out+no, max-no);
+
+    int mid = mtok_special(T,"<|im_middle|>");
+    if(mid<0) return -1;
+    if(no>=max) return -1;
+    out[no++]=mid;
+
+    int clen=(int)strlen(content);
+    if(no+clen>max) return -1;
+    no += mtok_encode(T, content, clen, out+no, max-no);
+
+    int end = mtok_special(T,"<|im_end|>");
+    if(end<0) return -1;
+    if(no>=max) return -1;
+    out[no++]=end;
+    return no;
+}
+/* prompt di generazione: <|im_assistant|> + encode("assistant") + <|im_middle|> (nessun <|im_end|>:
+ * il modello continua da qui). */
+static int mtok_tmpl_genprompt(MTok *T, int *out, int no, int max){
+    if(no<0) return -1;  /* stessa propagazione difensiva di mtok_tmpl_msg */
+    int asp = mtok_special(T,"<|im_assistant|>");
+    if(asp<0) return -1;
+    if(no>=max) return -1;
+    out[no++]=asp;
+
+    static const char role[]="assistant";
+    int rlen=(int)(sizeof(role)-1);
+    if(no+rlen>max) return -1;
+    no += mtok_encode(T, role, rlen, out+no, max-no);
+
+    int mid = mtok_special(T,"<|im_middle|>");
+    if(mid<0) return -1;
+    if(no>=max) return -1;
+    out[no++]=mid;
+    return no;
+}
+
 #undef M_UPC
 #undef M_LOC
 
