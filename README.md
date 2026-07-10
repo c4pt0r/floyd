@@ -43,16 +43,28 @@ Ported deliberately narrow, matching the
 [design doc](docs/superpowers/specs/2026-07-10-floyd-moonlight-parity-design.md)'s
 non-goals:
 
-- No C-side tokenizer or chat loop (`tok.h`/`tok_unicode.h` are carried over
-  from colibrì but unused at runtime here — Python does tokenization for the
-  oracle only, same boundary as colibrì).
 - No MTP speculative decoding (Moonlight has no MTP head).
 - No DSA sparse attention (Moonlight has no indexer weights).
 - No CUDA, no HTTP server.
 - Metal accelerates the **batch** matmul path only (prefill / teacher-forcing,
   sequence length ≥ 8 by default); single-token decode stays on CPU.
 
+The design doc above's own non-goals *did* originally include "no C-side
+tokenizer or chat loop" (`tok.h`/`tok_unicode.h` were carried over from
+colibrì unused, and Python did tokenization for the oracle only). A later
+chat phase closed that gap: `tok_moon.h` is a from-scratch C implementation
+of the moonshot tokenizer (raw-byte-rank BPE + moonshot pre-tokenizer,
+independently gated at 52/52 cases vs the `tiktoken` oracle — see
+[`docs/chat-report.md`](docs/chat-report.md)), and `./floyd chat`/`./floyd run`
+now do the whole prompt → tokenize → generate → detokenize loop natively,
+with no Python in the loop. See the Quickstart and CLI reference below.
+
 ## Quick start
+
+`floyd` has a CLI: `chat` (interactive multi-turn), `run` (single-shot),
+`tf`/`gen` (teacher-forcing / greedy parity checks vs a Python oracle). Every
+command needs `--model DIR` pointing at a converted container or a raw HF
+checkpoint directory.
 
 ### 1. Python venv (conversion + oracle generation only — the engine itself has zero runtime dependencies)
 
@@ -67,8 +79,8 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python tools/make_oracle.py tiny          # -> fixture_tiny/ + ref_tiny.json
 make
-SNAP=fixture_tiny TF=1 REF=ref_tiny.json ./floyd 8 16 16   # teacher-forcing: expect 32/32
-SNAP=fixture_tiny REF=ref_tiny.json ./floyd 8 16 16        # greedy: expect 20/20
+./floyd tf  --model fixture_tiny --ref ref_tiny.json --cap 8 --ebits 16 --dbits 16   # teacher-forcing: expect 32/32
+./floyd gen --model fixture_tiny --ref ref_tiny.json --cap 8 --ebits 16 --dbits 16   # greedy: expect 20/20
 ```
 
 ### 3. Real model (Moonlight-16B-A3B-Instruct, ~32 GB BF16 download)
@@ -86,11 +98,18 @@ SNAP=fixture_tiny REF=ref_tiny.json ./floyd 8 16 16        # greedy: expect 20/2
 .venv/bin/python tools/convert_moonlight.py \
   --indir models/Moonlight-16B-A3B-Instruct --outdir models/moonlight_i8 --ebits 8 --dbits 8
 
-# engine run: SNAP=<container> [TF=1] REF=<ref>.json ./floyd <expert-cache> <expert-bits> <dense-bits>
-SNAP=models/moonlight_i8 TF=1 REF=ref_moonlight.json ./floyd 64 8 8
+# parity check against the oracle
+./floyd tf --model models/moonlight_i8 --ref ref_moonlight.json
+
+# interactive multi-turn chat (moonshot chat_template, KV-cache persists across turns
+# and across process restarts unless --no-kvsave)
+./floyd chat --model models/moonlight_i8
+
+# single-shot generation
+./floyd run --model models/moonlight_i8 --prompt "What is the capital of France? Answer in one word."
 ```
 
-The unquantized HF checkpoint directory also works directly as `SNAP=` (the
+The unquantized HF checkpoint directory also works directly as `--model` (the
 engine falls back to reading raw safetensors when no `.qs` container is
 present) — useful as an f32 control run isolated from quantization noise.
 
@@ -99,11 +118,50 @@ present) — useful as an f32 control run isolated from quantization noise.
 ```bash
 make clean && make METAL=1
 make metal-test                       # kernel-level unit test vs CPU f64 reference
-FLOYD_METAL=1 SNAP=models/moonlight_i8 TF=1 REF=ref_moonlight.json ./floyd 64 8 8
+./floyd tf --model models/moonlight_i8 --ref ref_moonlight.json --metal
 ```
 
-`FLOYD_METAL=1` on a CPU-only build (`make` without `METAL=1`) hard-errors
-(exit code 2) rather than silently ignoring the flag.
+`--metal` (or legacy `FLOYD_METAL=1`) on a CPU-only build (`make` without
+`METAL=1`) hard-errors (exit code 2) rather than silently ignoring the flag.
+
+## CLI reference
+
+```
+$ ./floyd help
+floyd — Moonlight-16B-A3B in pure C
+uso: floyd <comando> [flags] | (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>
+
+comandi:
+  chat   conversazione interattiva     floyd chat --model DIR
+  run    generazione singola           floyd run  --model DIR --prompt "..."
+  tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json
+  gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json
+  help   questo testo
+
+flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)
+  --dbits 4|8|16 (8) | --ram GB | --metal
+chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)
+  --top-p P (0.90) | --system "..." | --prompt "..." (run) | --draft N | --no-kvsave
+
+variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)
+```
+
+(Italian in the tool's own output; English gloss: `chat` = interactive
+conversation, `run` = single generation, `tf` = teacher-forcing vs oracle,
+`gen` = greedy vs oracle. `--cap` is the per-layer expert LRU cache size,
+`--ebits`/`--dbits` are expert/dense quantization bit-widths, `--ref` is the
+oracle reference JSON for `tf`/`gen` (not listed in the tool's own usage
+banner but required by those two subcommands), `--draft` is the n-gram
+speculative-decoding draft window, `--no-kvsave` disables the on-disk KV
+persistence chat/run otherwise do by default.)
+
+`chat` starts a REPL (`:reset` clears context, `:exit` quits) that keeps its
+KV-cache warm across turns **and** across process restarts — `<model-dir>/.coli_kv`
+is loaded on startup and appended to after every turn, so re-running
+`./floyd chat --model DIR` on the same conversation resumes instantly with no
+re-prefill (see `docs/chat-report.md` for measured evidence: a 61-token
+conversation resumed in 0.0s). Pass `--no-kvsave` to keep everything
+in-memory only.
 
 ## Results
 
@@ -117,6 +175,8 @@ per-run detail. Machine: Apple M3 Ultra, 32 cores, 512 GB RAM, macOS 15.5.
 | Moonlight-16B-A3B-Instruct | f32 (control, unquantized) | **52/52** · 30/30 (secondary ref) | — | 5.3 |
 | Moonlight-16B-A3B-Instruct | int8 | 48/52 · 29/30 | 16/24* | 13.2 |
 | Moonlight-16B-A3B-Instruct | int4 | 46/52 · 24/30 | 16/24* | 18.1 |
+| Moonlight tokenizer (`tok_moon.h` vs `tiktoken`/oracle) | — | **52/52** cases · **42/42** chat-template ids | — | — |
+| Moonlight chat E2E (`./floyd chat`, int8, real weights) | int8 | — | 2-turn memory check: correct "Paris" + correct recall of prior question | 6.7-7.4 tok/s |
 
 \* Both int8 and int4 greedy runs match the oracle for the first 16 of 24
 tokens, then emit one spurious extra token at position 17; int8's tail then
@@ -163,10 +223,61 @@ scratch. No performance tuning was attempted; this is reported as measured,
 per this project's culture of honest numbers. See `docs/parity-report.md`
 for the full breakdown.
 
+## Legacy & debug environment variables
+
+The original interface — before the `chat`/`run`/`tf`/`gen`/`help` CLI
+existed — was entirely environment-variable driven:
+`SNAP=<dir> [TF=1] [REF=<ref>.json] ./floyd <expert-cache> <expert-bits> <dense-bits>`.
+The CLI is a thin adapter in front of this: every `--flag` just calls
+`setenv()` before falling through to the same unmodified engine code. **Both
+interfaces work and are tested** (`docs/parity-report.md` uses the legacy
+env-var form throughout and was re-verified against the current binary as
+part of this task — see `docs/chat-report.md`). The env-var form remains
+useful as a compatibility/developer interface: scripting one-off debug
+knobs without adding a CLI flag for each of them, and it's what
+`docs/parity-report.md`'s existing logs document verbatim.
+
+```bash
+# legacy positional form, still works exactly as documented in docs/parity-report.md:
+SNAP=fixture_tiny_i8 TF=1 REF=ref_tiny.json ./floyd 8 8 8
+SNAP=models/moonlight_i8 TF=1 REF=ref_moonlight.json ./floyd 64 8 8
+FLOYD_METAL=1 SNAP=models/moonlight_i8 TF=1 REF=ref_moonlight.json ./floyd 64 8 8
+```
+
+Env vars beyond `SNAP`/`TF`/`REF`/`FLOYD_METAL` are debug/tuning knobs with
+no CLI equivalent (by design — these are for developing/profiling the engine,
+not for normal use):
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `IDOT` | int8 activation-quantization matmul kernel (0 = exact f32 activations) | 1 |
+| `DSA` | DSA sparse attention (only if the checkpoint has indexer weights) | auto |
+| `MTP` | multi-token-prediction speculative decoding (only if the checkpoint has an MTP head) | auto |
+| `PILOT` | router-piloted expert prefetch | 0 |
+| `PILOT_K` | pilot prefetch fan-out | 8 |
+| `STATS` | `STATS=<file>` writes an expert-usage histogram at end of run | unset |
+| `NOPACK` | disable weight packing | 0 |
+| `DROP` | drop-on-evict cache policy variant | 0 |
+| `PREFETCH` | expert-cache prefetch depth | 0 |
+| `TOPK` / `TOPP` | sampling controls (legacy names for `--top-p` etc.) | 0 |
+| `MLOCK` | force/disable `mlock()` of resident weights | auto (on, macOS) |
+| `SPEC` | n-gram speculative decoding | 1 |
+| `REPIN` | re-pin hot experts every N emitted tokens | 0 (off) |
+| `ABSORB` | MLA weight-absorption toggle | auto |
+| `CHAT_TEMPLATE` | apply chat template in `run_serve`'s legacy protocol mode | 1 |
+| `KVSAVE` | on-disk KV persistence (legacy name for `--no-kvsave`, `0` disables) | 1 |
+| `THINK` | emit `<think>` reasoning block instead of `<think></think>` (nothink) | 0 |
+
+See `usage()`/`floyd help` and the CLI reference above for the supported
+flags most users need; this table is for developers who need the
+lower-level knobs `tf`/`gen`/`chat`/`run` don't expose.
+
 ## Known limitations
 
-- No C-side tokenizer/chat interaction loop — engine consumes token IDs via
-  `ref.json`, produced by the Python oracle tooling.
+- `tf`/`gen` (teacher-forcing / greedy parity checks) still consume token IDs
+  via `ref.json`, produced by the Python oracle tooling — that's a parity
+  fixture format, not a limitation of the engine's own tokenizer, which
+  `chat`/`run` use directly (see CLI reference above).
 - No MTP speculative decoding (Moonlight has no MTP head — `num_nextn_predict_layers=0`).
 - No DSA sparse attention (Moonlight has no indexer weights).
 - Metal backend accelerates only the batch matmul path (prefill / TF,
