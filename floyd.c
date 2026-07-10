@@ -2524,6 +2524,7 @@ static void usage(int code){
 static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
     if(argc<2) return 0;
     const char *cmd=argv[1];
+    if(!strcmp(cmd,"--help") || !strcmp(cmd,"-h")) usage(0);   /* CLI polish: alias di 'help' */
     if(strcmp(cmd,"chat") && strcmp(cmd,"run") && strcmp(cmd,"tf") &&
        strcmp(cmd,"gen") && strcmp(cmd,"help")) return 0;
     if(!strcmp(cmd,"help")) usage(0);
