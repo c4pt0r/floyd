@@ -45,9 +45,10 @@ selection bias separate from mixture weights. Moonlight now uses this shared
 path without changing its routing results. `moe_exec.h` provides the F32
 reference execution path for learned and hash routing, clamped SwiGLU, and
 shared experts. `v4_hc.h` provides the F32 mHC/Sinkhorn reference. Attention,
-KV cache, and production weight loading remain architecture-specific;
-DeepSeek V4 CSA/HCA attention, optimized FP4/FP8 kernels, and DSpark decoding
-are not yet implemented.
+`v4_attention.h` provides the full-sequence F32 sliding-attention reference.
+KV cache and production weight loading remain architecture-specific; DeepSeek
+V4 CSA/HCA compressors and indexer, optimized FP4/FP8 kernels, and DSpark
+decoding are not yet implemented.
 
 Generate the deterministic CPU-sized V4 architecture oracle with:
 
@@ -55,6 +56,7 @@ Generate the deterministic CPU-sized V4 architecture oracle with:
 .venv/bin/python tools/make_v4_oracle.py tiny
 make test-v4-moe
 make test-v4-hc
+make test-v4-attention
 ```
 
 This creates ignored `fixture_tiny_v4/` and `ref_v4_tiny.json` artifacts. The
