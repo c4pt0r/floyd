@@ -1,0 +1,6 @@
+models/
+.venv/
+*.o
+floyd
+ref*.json
+.DS_Store
