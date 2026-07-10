@@ -127,6 +127,10 @@ point. See `docs/parity-report.md` for the full token dumps.
 The f32 control run is the load-bearing result: **52/52 and 30/30 argmax-exact
 against the `transformers` f32 oracle on the real 16B checkpoint** — proof
 that every int8/int4 TF gap above is quantization noise, not an engine bug.
+A meaningful share of that noise is the CPU engine's own int8
+activation-quantization matmul kernel (`IDOT`, on by default): on the tiny
+int8 fixture, `IDOT=0` (exact f32 activations) alone raises TF from 24/32 to
+29/32. See `docs/parity-report.md` for the full IDOT isolation.
 
 ### Metal A/B (`FLOYD_METAL=1` vs CPU-only, same container, same ref)
 
@@ -136,11 +140,16 @@ that every int8/int4 TF gap above is quantization noise, not an engine bug.
 | Moonlight int8, long ref (S=52) | 48/52 | 51/52 | 3 positions flip, all MISS→OK; margins 0.03-0.25 on a ~14-18 logit scale |
 | Moonlight int8, short ref (S=30) | 29/30 | 29/30 | exact match, 0 flips |
 
-Every flip was verified to sit on a narrow top1-vs-top2 logit margin — GPU
-vs. CPU floating-point reduction-order non-associativity landing on either
-side of an already-close call, not a kernel correctness bug (the Metal q8/q4
-kernels are independently validated against an f64 CPU reference at
-~2e-5 max relative error, see `make metal-test`).
+Every flip was verified to sit on a narrow top1-vs-top2 logit margin. The
+CPU side of these A/Bs still runs the int8 activation-quantization kernel
+(`IDOT`, default on), while Metal consumes f32 activations directly — so the
+CPU-vs-Metal delta here is dominated by that CPU-side activation
+quantization, not by GPU-vs-CPU floating-point reduction-order
+non-associativity (bounded at ~2e-5 max relative error by the
+independently-validated kernel-level test, see `make metal-test`). Metal
+landing systematically closer to the f32 oracle (27/32, 51/52 vs CPU's
+24/32, 48/52) follows from that: it simply skips a lossy step the CPU path
+takes. Not a kernel correctness bug either way.
 
 **Honest performance note: Metal is currently 15-25% slower than CPU** on
 these shapes (13.2 vs 17.3 pos/s on the long ref, 211 vs sub-260 pos/s on the

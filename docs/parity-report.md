@@ -78,7 +78,42 @@ norms + embed/lm_head kept F32 raw).
 | container      | TF (teacher-forcing)     | greedy            |
 |----------------|---------------------------|--------------------|
 | f32 fixture    | 32/32                      | 20/20              |
-| int8 fixture   | 24/32 (plausibly fixture-scale noise sensitivity — tiny random weights sit near argmax decision boundaries; consistent with, though not isolated by, the real-model results where int8 reaches 92-97%) | 0/20 (no error-correction across greedy steps once the first token diverges) |
+| int8 fixture   | 24/32 (see IDOT isolation below) | 0/20 (no error-correction across greedy steps once the first token diverges) |
+
+**IDOT isolation (final-review addendum, measured directly, not carried over
+from Task 3/4):** the CPU engine runs int8-activation matmul kernels
+(`IDOT`, `g_idot`, default on — `floyd.c` quantizes activations to int8
+per row, ~0.3% RMS error per matmul) by default even in the "int8
+container" TF/greedy runs above. Re-running with `IDOT=0` (forces the exact
+f32 activation path) isolates how much of the 24/32 and 0/20 depression is
+activation-quantization noise vs. genuine fixture-scale argmax-tie
+sensitivity:
+
+| Run | Score |
+|---|---|
+| `SNAP=fixture_tiny_i8 TF=1 REF=ref_tiny.json ./floyd 8 8 8` (default, `IDOT=1`) | 24/32 |
+| `IDOT=0 SNAP=fixture_tiny_i8 TF=1 REF=ref_tiny.json ./floyd 8 8 8` | 29/32 |
+| `SNAP=fixture_tiny_i8 REF=ref_tiny.json ./floyd 8 8 8` (greedy, default) | 0/20 |
+| `IDOT=0 SNAP=fixture_tiny_i8 REF=ref_tiny.json ./floyd 8 8 8` (greedy) | 6/20 |
+
+IDOT activation quantization alone accounts for most of the depression (24/32
+→ 29/32 TF; 0/20 → 6/20 greedy). The remaining gap from the f32-oracle
+32/32 / 20/20 (i.e. 29/32 and 6/20, both still short of exact) is explained
+by the near-argmax-tie sensitivity described above — the container's weight
+quantization plus the tiny random-weight fixture sitting close to decision
+boundaries. Note `IDOT` only affects `fmt!=0` (quantized) matmul kernels;
+the f32 control below (`fmt=0`, unquantized weights) never dispatches
+through the IDOT path and is unaffected by this variable.
+
+For the record: the design spec's fixture-level exact-gate wording
+(`docs/superpowers/specs/2026-07-10-floyd-moonlight-parity-design.md:89`)
+originally scoped the 32/32 TF / 20/20 greedy exact gate to the "int8
+容器" (int8 container). The implementation plan re-baselined this before
+implementation to CPU + f32 only (`docs/superpowers/plans/2026-07-10-floyd-moonlight-parity.md`,
+§Global Constraints, and reaffirmed at Task 4 Step 2: "门槛仍是 Task 3 的
+f32 32/32") — an approved amendment. int8/int4 fixture and real-model
+numbers are reported honestly throughout this document but are not held to
+an exact-match gate.
 
 ## Real-model results
 
@@ -260,14 +295,24 @@ OK
 7 of 32 positions differ between CPU and Metal on this run: positions 3, 4,
 12, 15, 19 flip MISS→OK, positions 7, 27 flip OK→MISS (net +3 → 24+3=27).
 Every differing position has a small top1-top2 logit margin (0.004 to 0.19,
-against a logit scale of ~2.1-2.5) — near-ties consistent with GPU-vs-CPU
-floating-point reduction-order non-associativity landing on either side of
-an already-narrow quantization-noise margin on this tiny synthetic fixture
-(documented since Task 3/5 as "fixture-noise depressed" — this is not the
-32/32 f32-oracle gate, which is exact and unaffected). This is not a kernel
-correctness bug: the kernel-level unit test above independently validates
-`fm_matmul_q8`/`q4` against an f64 CPU reference at ~2e-5 max relative
-error.
+against a logit scale of ~2.1-2.5) — narrow margins on this tiny synthetic
+fixture (documented since Task 3/5 as "fixture-noise depressed" — this is
+not the 32/32 f32-oracle gate, which is exact and unaffected).
+
+**Corrected attribution (final-review amendment):** both CPU-only and
+`FLOYD_METAL` builds run the CPU IDOT int8-activation-quantization kernel
+by default (`g_idot=1`) when `FLOYD_METAL` is unset, but the Metal batch
+path consumes f32 activations directly and never quantizes them through
+IDOT. So the CPU side of this A/B (24/32) is not a clean f32 CPU baseline —
+it already carries the ~29/32-vs-24/32 activation-quantization depression
+measured directly above (`IDOT=0` recovers 29/32 on the same fixture/ref).
+The CPU-vs-Metal delta here is dominated by that CPU-side activation
+quantization, not by GPU-vs-CPU floating-point reduction-order
+non-associativity (which the kernel-level unit test bounds at ~2e-5 max
+relative error — far too small to explain 3-7 position flips on its own).
+This is not a kernel correctness bug: the kernel-level unit test above
+independently validates `fm_matmul_q8`/`q4` against an f64 CPU reference at
+~2e-5 max relative error.
 
 ### Real-model A/B (`models/moonlight_i8`, int8 container)
 
@@ -300,11 +345,24 @@ MISS(CPU)→OK(Metal) — positions 3, 20, 22:
 
 All three are narrow-margin positions relative to the ~14-18 logit scale
 (1-2% gaps) — genuine near-ties in the already quantization-noise-affected
-int8 path, not evidence of a Metal computation error. Net effect happens to
-be positive for Metal (48→51) on this particular reference, but that should
-be read as "reduction-order noise happened to land favorably on this
-input," not "Metal is more accurate" — the same phenomenon as the fixture's
-mixed +5/-2 flips, just landing the same direction here by chance.
+int8 path, not evidence of a Metal computation error.
+
+**Corrected attribution (final-review amendment):** Metal sitting closer to
+the f32 oracle than CPU here (51/52 vs 48/52; 29/30 tie) is systematic, not
+chance. As established above, the CPU run in this A/B still quantizes
+activations to int8 via IDOT (`g_idot=1` default) while Metal consumes f32
+activations and skips that quantization step entirely — so on every
+reference Metal has strictly less activation-noise than the CPU side it is
+compared against, which biases Metal's score toward the oracle. This
+mirrors the fixture-level result directly above (Metal 27/32 vs CPU 24/32,
+both against an f32 oracle where `IDOT=0` alone already recovers 29/32 on
+CPU). The earlier framing — "reduction-order noise happened to land
+favorably... not Metal is more accurate... by chance" — is retracted: it
+attributed the delta to GPU/CPU float non-associativity (bounded at ~2e-5
+by the kernel-level unit test, too small to move 3/52 scores) when the
+dominant cause is the CPU-only IDOT activation-quantization path. Metal
+*is* systematically closer to the f32 oracle on these int8-container runs,
+because it does not pay the CPU's activation-quantization cost.
 
 ### pos/s summary (honest performance numbers)
 
@@ -336,10 +394,14 @@ Root causes, visible in the `PROFILO` breakdown:
 
 The Metal backend is correctness-validated (kernel-level ~2e-5 max rel
 error) and integration-correct (all observed CPU/Metal score differences
-are explained by narrow-margin argmax flips under floating-point
-reduction-order non-associativity, not by wrong numbers). It is not yet a
-performance win: 15-25% slower than CPU on the shapes measured here, for the
-structural reasons above (no dispatch batching, no cross-invocation weight
-cache, mandatory re-upload for recycled expert-slab pointers). Reported as
+are explained by narrow-margin argmax flips, dominated by the CPU-side
+IDOT activation-quantization path (see "Corrected attribution" notes
+above) rather than by GPU-vs-CPU floating-point reduction-order
+non-associativity — the kernel-level ~2e-5 bound rules out the latter as a
+material contributor. None of the observed flips indicate wrong numbers.
+It is not yet a performance win: 15-25% slower than CPU on the shapes
+measured here, for the structural reasons above (no dispatch batching, no
+cross-invocation weight cache, mandatory re-upload for recycled expert-slab
+pointers). Reported as
 measured, per this project's culture of honest numbers — no tuning was
 attempted in Task 7 or in this task.
