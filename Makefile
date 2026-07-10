@@ -31,7 +31,7 @@ METAL_OBJ = backend_metal.o
 LDFLAGS += -framework Metal -framework Foundation
 endif
 
-TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant
+TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant tests/test_st_probe
 
 all: floyd
 
@@ -61,6 +61,9 @@ tests/test_moe_route: tests/test_moe_route.c moe_route.h
 tests/test_v4_quant: tests/test_v4_quant.c v4_quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_st_probe: tests/test_st_probe.c st.h st_probe.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 test-c: $(TEST_BINS)
 	@for t in $(TEST_BINS); do ./$$t || exit 1; done
 
@@ -69,7 +72,10 @@ tests/test_tok_moon: tests/test_tok_moon.c tok_moon.h tok.h tok_unicode.h json.h
 test-tok: tests/test_tok_moon
 	./tests/test_tok_moon models/Moonlight-16B-A3B-Instruct tok_cases.json
 
+tools/probe_safetensors: tools/probe_safetensors.c st.h st_probe.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant tests/test_backend_metal tests/test_tok_moon
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
 
 .PHONY: all test-c test-tok metal-test clean portable
