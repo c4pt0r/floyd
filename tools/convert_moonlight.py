@@ -84,6 +84,9 @@ def convert(a):
         sys.exit(f"config.json mancante in {a.indir}: non e' una directory modello HF")
     os.makedirs(a.outdir, exist_ok=True)
     shutil.copy(cfg_src, a.outdir)
+    for extra in ("tiktoken.model", "tokenizer_config.json", "generation_config.json"):
+        src = os.path.join(a.indir, extra)
+        if os.path.exists(src): shutil.copy(src, a.outdir)
     stale = glob.glob(os.path.join(a.outdir, "out-*.safetensors.tmp"))
     if stale:
         print(f"rimuovo {len(stale)} .tmp residui da una conversione interrotta")

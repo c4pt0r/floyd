@@ -2412,7 +2412,123 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
 }
 
+/* ---- CLI: floyd <comando> [flags] --------------------------------------
+ * Adapter sottile: traduce flags in setenv() PRIMA di tutto il resto, cosi'
+ * il vecchio corpo di main() (che legge solo getenv + argv[1..3] posizionali)
+ * resta identico. Le variabili d'ambiente restano l'interfaccia legacy/debug
+ * (IDOT, DSA, MTP, PILOT, STATS, ...): questo strato copre solo le manopole
+ * che un utente normale deve toccare per usare chat/run/tf/gen. */
+static void usage(int code){
+    fputs(
+"floyd — Moonlight-16B-A3B in pure C\n"
+"uso: floyd <comando> [flags] | (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>\n\n"
+"comandi:\n"
+"  chat   conversazione interattiva     floyd chat --model DIR\n"
+"  run    generazione singola           floyd run  --model DIR --prompt \"...\"\n"
+"  tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json\n"
+"  gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json\n"
+"  help   questo testo\n\n"
+"flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)\n"
+"  --dbits 4|8|16 (8) | --ram GB | --metal\n"
+"chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)\n"
+"  --top-p P (0.90) | --system \"...\" | --prompt \"...\" (run) | --draft N | --no-kvsave\n\n"
+"variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)\n",
+    code?stderr:stdout); exit(code);
+}
+
+/* ritorna 1 se argv[1] e' uno dei 5 comandi nuovi (allora la chiamante ha gia'
+ * fatto setenv/validazione e questa funzione ha riempito cap, ebits, dbits
+ * (via puntatore) quando --cap/--ebits/--dbits erano presenti, altrimenti
+ * li lascia a -1). */
+static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
+    if(argc<2) return 0;
+    const char *cmd=argv[1];
+    if(strcmp(cmd,"chat") && strcmp(cmd,"run") && strcmp(cmd,"tf") &&
+       strcmp(cmd,"gen") && strcmp(cmd,"help")) return 0;
+    if(!strcmp(cmd,"help")) usage(0);
+
+    int have_model=0, have_ref=0, have_prompt=0, have_ngen=0;
+    *cap=-1; *ebits=-1; *dbits=-1;
+    for(int i=2;i<argc;i++){
+        const char *a=argv[i];
+        char *e;
+        if(!strcmp(a,"--model")){
+            if(++i>=argc) usage(2);
+            setenv("SNAP",argv[i],1); have_model=1;
+        } else if(!strcmp(a,"--ref")){
+            if(++i>=argc) usage(2);
+            setenv("REF",argv[i],1); have_ref=1;
+        } else if(!strcmp(a,"--ngen")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<1) usage(2);
+            setenv("NGEN",argv[i],1); have_ngen=1;
+        } else if(!strcmp(a,"--ctx")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<1) usage(2);
+            setenv("CTX",argv[i],1);
+        } else if(!strcmp(a,"--temp")){
+            if(++i>=argc) usage(2);
+            double v=strtod(argv[i],&e); if(*e||v<0||v>2) usage(2);
+            setenv("TEMP",argv[i],1);
+        } else if(!strcmp(a,"--top-p")){
+            if(++i>=argc) usage(2);
+            double v=strtod(argv[i],&e); if(*e||v<=0||v>1) usage(2);
+            setenv("NUCLEUS",argv[i],1);
+        } else if(!strcmp(a,"--system")){
+            if(++i>=argc) usage(2);
+            setenv("SYSTEM",argv[i],1);
+        } else if(!strcmp(a,"--prompt")){
+            if(++i>=argc) usage(2);
+            setenv("PROMPT",argv[i],1); have_prompt=1;
+        } else if(!strcmp(a,"--draft")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<0) usage(2);
+            setenv("DRAFT",argv[i],1);
+        } else if(!strcmp(a,"--ram")){
+            if(++i>=argc) usage(2);
+            double v=strtod(argv[i],&e); if(*e||v<=0) usage(2);
+            setenv("RAM_GB",argv[i],1);
+        } else if(!strcmp(a,"--no-kvsave")){
+            setenv("KVSAVE","0",1);
+        } else if(!strcmp(a,"--metal")){
+            setenv("FLOYD_METAL","1",1);
+        } else if(!strcmp(a,"--cap")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<1||v>4096) usage(2);
+            *cap=(int)v;
+        } else if(!strcmp(a,"--ebits")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||(v!=4&&v!=8&&v!=16)) usage(2);
+            *ebits=(int)v;
+        } else if(!strcmp(a,"--dbits")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||(v!=4&&v!=8&&v!=16)) usage(2);
+            *dbits=(int)v;
+        } else {
+            fprintf(stderr,"flag sconosciuto: %s\n",a); usage(2);
+        }
+    }
+    if(!have_model){ fprintf(stderr,"manca --model\n"); usage(2); }
+    if(!strcmp(cmd,"chat")){
+        setenv("CHAT","1",1);
+    } else if(!strcmp(cmd,"run")){
+        if(!have_prompt){ fprintf(stderr,"run richiede --prompt\n"); usage(2); }
+        if(!have_ngen) setenv("NGEN","256",1);   /* run_text legge NGEN con default 64: alziamolo qui */
+    } else if(!strcmp(cmd,"tf")){
+        if(!have_ref){ fprintf(stderr,"tf richiede --ref\n"); usage(2); }
+        setenv("TF","1",1);
+    } else if(!strcmp(cmd,"gen")){
+        if(!have_ref){ fprintf(stderr,"gen richiede --ref\n"); usage(2); }
+    }
+    return 1;
+}
+
 int main(int argc, char **argv){
+    /* flags -> setenv, solo se argv[1] e' chat/run/tf/gen/help. Legacy path
+     * (argv[1] numerico o assente) resta invariato: cli_adapt torna 0 subito. */
+    int flag_cap=-1, flag_ebits=-1, flag_dbits=-1;
+    int newstyle = cli_adapt(argc, argv, &flag_cap, &flag_ebits, &flag_dbits);
+
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
@@ -2449,9 +2565,9 @@ int main(int argc, char **argv){
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
-    int cap  = argc>1?atoi(argv[1]):64;
-    int ebits= argc>2?atoi(argv[2]):8;
-    int dbits= argc>3?atoi(argv[3]):ebits;
+    int cap  = newstyle ? (flag_cap  >=0?flag_cap  :64) : (argc>1?atoi(argv[1]):64);
+    int ebits= newstyle ? (flag_ebits>=0?flag_ebits:8)  : (argc>2?atoi(argv[2]):8);
+    int dbits= newstyle ? (flag_dbits>=0?flag_dbits:ebits) : (argc>3?atoi(argv[3]):ebits);
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
