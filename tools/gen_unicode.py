@@ -10,17 +10,22 @@ pre-tokenizer cl100k (regex del tokenizer GLM-5.2) e dal pre-tokenizer moonshot:
   - \\p{Lo}             altre lettere (senza maiuscola/minuscola, es. CJK/Hangul/Arabo)
   - [\\p{Mn}\\p{Mc}\\p{Me}]  marchi combinanti (Mn unione Mc unione Me)
 Ogni classe diventa un array ordinato di range [lo,hi] inclusivi; il C fa ricerca
-binaria. Eseguire una volta: python3 tools/gen_unicode.py > tok_unicode.h
+binaria.
 
-NOTA: uni_L/uni_N/uni_S (le tre tabelle originali, usate dal tokenizer GLM) sono
-generate con la stessa logica di sempre (categoria/whitespace via unicodedata) e
-DEVONO restare identiche byte-per-byte a ogni rigenerazione con lo stesso
-unicodedata.unidata_version del file esistente: se si rigenera con un Python che
-porta una versione Unicode piu' recente, uni_L/uni_N cambieranno (nuovi codepoint
-assegnati) e vanno NON usati per sovrascrivere le tabelle esistenti — solo le
-tabelle nuove (uni_Han/uni_LuLt/uni_Ll/uni_Lm/uni_Lo/uni_M) vanno innestate nel
-tok_unicode.h esistente. Vedi chat-task-1-report.md per i dettagli di questa
-rigenerazione.
+WARNING: MAI usare `python3 tools/gen_unicode.py > tok_unicode.h` — cio' sovrascrive
+le tabelle uni_L/uni_N/uni_S che sono pinned a unicodedata 15.0.0 (Unicode 15.0).
+Rigenerare con una versione piu' recente di Python (es. 3.14 con unicodedata 16.0.0)
+produce tabelle uni_L/uni_N/uni_S diverse, il che silenziosamente cambia il comportamento
+del tokenizer GLM.
+
+Procedura manutenzione:
+1. Eseguire: python3 tools/gen_unicode.py > /tmp/gen_unicode.h
+2. Dal file generato, estrarre SOLO i sei array moonshot (uni_Han/uni_LuLt/uni_Ll/
+   uni_Lm/uni_Lo/uni_M) e le relative is_* function (is_Han/is_LuLt/is_Ll/is_Lm/
+   is_Lo/is_M).
+3. Innestare i dati estratti in tok_unicode.h PRIMA di #endif. Non toccare mai
+   uni_L/uni_N/uni_S.
+4. Byte-diff per verificare che uni_L/uni_N/uni_S non siano state modificate.
 """
 import sys, random, unicodedata
 
