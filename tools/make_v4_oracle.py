@@ -132,7 +132,10 @@ def write_tiny(out_dir, ref_path, ngen=8):
     output, moe_captures = forward_with_moe_captures(model, input_ids)
 
     model.save_pretrained(out_dir, safe_serialization=True)
-    oracle = {"logits": output.logits[0].float().contiguous()}
+    oracle = {
+        "input_ids": input_ids[0].contiguous().clone(),
+        "logits": output.logits[0].float().contiguous(),
+    }
     for i, hidden in enumerate(output.hidden_states):
         oracle[f"hidden.{i}"] = hidden[0].float().contiguous()
     for i, router in enumerate(output.router_logits):

@@ -42,15 +42,17 @@ matches colibrì's `glm_moe_dsa` runtime parameterization exactly
 `moe_route.h` is the first model-independent runtime component. It implements
 softmax, sigmoid, and square-root-softplus expert affinity while keeping
 selection bias separate from mixture weights. Moonlight now uses this shared
-path without changing its routing results. Expert execution, attention, KV
-cache, and weight loading remain architecture-specific; DeepSeek V4 hash-MoE,
-mHC, CSA/HCA attention, FP4/FP8 storage, and DSpark decoding are not yet
-implemented.
+path without changing its routing results. `moe_exec.h` provides the F32
+reference execution path for learned and hash routing, clamped SwiGLU, and
+shared experts. Attention, KV cache, and production weight loading remain
+architecture-specific; DeepSeek V4 mHC, CSA/HCA attention, optimized FP4/FP8
+kernels, and DSpark decoding are not yet implemented.
 
 Generate the deterministic CPU-sized V4 architecture oracle with:
 
 ```bash
 .venv/bin/python tools/make_v4_oracle.py tiny
+make test-v4-moe
 ```
 
 This creates ignored `fixture_tiny_v4/` and `ref_v4_tiny.json` artifacts. The
