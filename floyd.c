@@ -52,6 +52,12 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 #ifdef FLOYD_METAL
 #include "backend_metal.h"
 static int g_metal=0, g_metal_min_s=8;
+/* Osservabilita' (chat-patch): contatori a livello di matmul_qt, incrementati
+ * solo se g_metal e' attivo (un binario METAL=1 con FLOYD_METAL=0 a runtime
+ * non paga nulla). Interamente compilati fuori nelle build non-METAL. */
+static uint64_t g_metal_batch_calls=0;   /* S>=g_metal_min_s -> dispatch GPU */
+static uint64_t g_metal_s1_calls=0;      /* S<g_metal_min_s ma S>=1 mentre g_metal e' attivo (possibile solo con FM_MIN_S abbassato) */
+static uint64_t g_metal_cpu_calls=0;     /* fallthrough su CPU mentre g_metal e' attivo */
 #endif
 
 typedef struct {
@@ -462,11 +468,16 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * viste/expert slab (slab_backed==1) vanno SEMPRE non cache-ate (cache=0) perche' il
      * puntatore e' stabile ma il contenuto viene riciclato tra load di eid diversi. */
     if(g_metal && S>=g_metal_min_s && (w->fmt==1 || w->fmt==2)){
+        /* 8 qui e' la soglia CANONICA (default FM_MIN_S), non g_metal_min_s: se l'utente
+         * abbassa FM_MIN_S sotto 8, questi S<8 finiscono comunque su GPU (sperimentale,
+         * vedi warning a startup) — li contiamo separatamente dal batch path normale. */
+        if(S>=8) g_metal_batch_calls++; else g_metal_s1_calls++;
         int cache = !w->slab_backed;
         if(w->fmt==1) fm_matmul_q8(y,x,w->q8,w->s,w->O,w->I,S,cache);
         else          fm_matmul_q4(y,x,w->q4,w->s,w->O,w->I,S,cache);
         return;
     }
+    if(g_metal) g_metal_cpu_calls++;   /* fallthrough su CPU: gated su g_metal, zero costo se non attivo */
 #endif
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
@@ -1725,6 +1736,14 @@ static void profile_print(Model *m, double elapsed){
     printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
            "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+#ifdef FLOYD_METAL
+    /* punto unico di stampa (chat-patch): tutti gli exit path (tf/gen/run/chat/replay)
+     * passano da qui, quindi il riepilogo Metal si stampa una volta sola per chiamante. */
+    if(g_metal)
+        printf("[METAL] summary: %llu batch matmul su GPU, %llu S<soglia su GPU, %llu matmul su CPU\n",
+            (unsigned long long)g_metal_batch_calls, (unsigned long long)g_metal_s1_calls,
+            (unsigned long long)g_metal_cpu_calls);
+#endif
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -2614,6 +2633,14 @@ int main(int argc, char **argv){
     if(g_metal){
         if(!fm_init()){ fprintf(stderr,"[METAL] richiesto ma non disponibile\n"); return 2; }
         fprintf(stderr,"[METAL] attivo: %s (batch S>=%d)\n", fm_device_name(), g_metal_min_s);
+        /* policy hardening (chat-patch): il default FM_MIN_S=8 tiene il decode (S=1) su CPU
+         * di proposito — il wrapper Metal generico (buffer x/y transienti + waitUntilCompleted
+         * per chiamata) e' sperimentale e piu' lento del CPU path per S piccoli (misurato:
+         * 1.66 tok/s vs 5.93 tok/s CPU forzando FM_MIN_S=1 su M3 Ultra). Chi abbassa la soglia
+         * sotto 8 lo sta facendo consapevolmente: avvisiamo forte, ma non tocchiamo il default. */
+        if(g_metal_min_s<8)
+            fprintf(stderr,"[METAL] FM_MIN_S=%d: S<8 (decode) su Metal e' SPERIMENTALE e piu' LENTO "
+                           "del CPU path nel backend attuale — sconsigliato per chat tok/s\n", g_metal_min_s);
     }
 #else
     if(getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))){
@@ -2669,6 +2696,11 @@ int main(int argc, char **argv){
         fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
         return 2;
     }
+#endif
+#ifdef FLOYD_METAL
+    if(g_metal)
+        printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | backend: " IDOT_KERNEL "+metal(batch>=%d) ==\n", cap, ebits, dbits, g_metal_min_s);
+    else
 #endif
     printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
