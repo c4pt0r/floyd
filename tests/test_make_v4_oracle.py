@@ -68,6 +68,9 @@ def test_write_tiny_is_complete_and_deterministic():
             for layer in range(3):
                 for field in ("input", "output", "logits", "weights", "indices"):
                     expected_keys.add(f"moe.{layer}.{field}")
+                for site in ("attn", "ffn"):
+                    for field in ("input", "post", "comb", "collapsed"):
+                        expected_keys.add(f"hc.{layer}.{site}.{field}")
             assert set(oracle.keys()) == expected_keys
             n_tokens = len(ref["full_ids"])
             assert oracle.get_slice("input_ids").get_shape() == [n_tokens]
@@ -81,6 +84,11 @@ def test_write_tiny_is_complete_and_deterministic():
                 assert oracle.get_slice(f"moe.{layer}.logits").get_shape() == [n_tokens, 8]
                 assert oracle.get_slice(f"moe.{layer}.weights").get_shape() == [n_tokens, 2]
                 assert oracle.get_slice(f"moe.{layer}.indices").get_shape() == [n_tokens, 2]
+                for site in ("attn", "ffn"):
+                    assert oracle.get_slice(f"hc.{layer}.{site}.input").get_shape() == [n_tokens, 2, 64]
+                    assert oracle.get_slice(f"hc.{layer}.{site}.post").get_shape() == [n_tokens, 2]
+                    assert oracle.get_slice(f"hc.{layer}.{site}.comb").get_shape() == [n_tokens, 2, 2]
+                    assert oracle.get_slice(f"hc.{layer}.{site}.collapsed").get_shape() == [n_tokens, 64]
 
 
 if __name__ == "__main__":

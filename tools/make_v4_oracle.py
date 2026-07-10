@@ -96,6 +96,23 @@ def forward_with_moe_captures(model, input_ids):
                 captures[f"moe.{index}.indices"] = indices.detach().contiguous().clone()
             return hook
 
+        def make_hc_pre_hook(index, site):
+            def hook(module, args, kwargs):
+                captures[f"hc.{index}.{site}.input"] = (
+                    args[0][0].detach().float().contiguous().clone()
+                )
+            return hook
+
+        def make_hc_output_hook(index, site):
+            def hook(module, args, kwargs, output):
+                post, comb, collapsed = output
+                captures[f"hc.{index}.{site}.post"] = post[0].detach().float().contiguous().clone()
+                captures[f"hc.{index}.{site}.comb"] = comb[0].detach().float().contiguous().clone()
+                captures[f"hc.{index}.{site}.collapsed"] = (
+                    collapsed[0].detach().float().contiguous().clone()
+                )
+            return hook
+
         handles.append(layer.mlp.register_forward_pre_hook(
             make_pre_hook(layer_index), with_kwargs=True
         ))
@@ -105,6 +122,13 @@ def forward_with_moe_captures(model, input_ids):
         handles.append(layer.mlp.gate.register_forward_hook(
             make_gate_hook(layer_index), with_kwargs=True
         ))
+        for site, module in (("attn", layer.attn_hc), ("ffn", layer.ffn_hc)):
+            handles.append(module.register_forward_pre_hook(
+                make_hc_pre_hook(layer_index, site), with_kwargs=True
+            ))
+            handles.append(module.register_forward_hook(
+                make_hc_output_hook(layer_index, site), with_kwargs=True
+            ))
 
     try:
         with torch.no_grad():
