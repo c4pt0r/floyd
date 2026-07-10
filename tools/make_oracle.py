@@ -155,14 +155,19 @@ def main():
     how = "remote_code"
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            a.model, trust_remote_code=True, torch_dtype=torch.float32, device_map=None).eval()
+            a.model, trust_remote_code=True, dtype=torch.float32, device_map=None).eval()
     except Exception as e:
         print(f"[fallback] remote code fallito ({type(e).__name__}: {e}); provo il nativo transformers")
         from transformers import DeepseekV3ForCausalLM
-        model = DeepseekV3ForCausalLM.from_pretrained(a.model, torch_dtype=torch.float32).eval()
+        model = DeepseekV3ForCausalLM.from_pretrained(a.model, dtype=torch.float32).eval()
         how = "native"
     msgs = [{"role": "user", "content": a.prompt}]
     prompt_ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    if hasattr(prompt_ids, "keys"):                    # transformers 5.x: BatchEncoding
+        prompt_ids = prompt_ids["input_ids"]
+    if prompt_ids and isinstance(prompt_ids[0], list): # batched form
+        prompt_ids = prompt_ids[0]
+    prompt_ids = [int(t) for t in prompt_ids]
     ref = make_ref(model, prompt_ids, a.ngen)
     ref["loader"] = how
     ref["text"] = tok.decode(ref["full_ids"][len(prompt_ids):])
