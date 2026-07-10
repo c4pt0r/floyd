@@ -17,6 +17,16 @@
 #include "json.h"
 #include "compat.h"
 
+enum {
+    ST_DTYPE_BF16 = 0,
+    ST_DTYPE_F16 = 1,
+    ST_DTYPE_F32 = 2,
+    ST_DTYPE_U8 = 3,
+    ST_DTYPE_I64 = 4,
+    ST_DTYPE_F8_E8M0 = 5,
+    ST_DTYPE_F8_E4M3 = 6
+};
+
 typedef struct {
     char   *name;
     int     fd;
@@ -47,11 +57,14 @@ static uint64_t st_hash(const char *s){
 }
 
 static int st_dtype_code(const char *s) {
-    if (!strcmp(s, "BF16")) return 0;
-    if (!strcmp(s, "F16"))  return 1;
-    if (!strcmp(s, "F32"))  return 2;
-    if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
-    if (!strcmp(s, "I8"))   return 3;
+    if (!strcmp(s, "BF16")) return ST_DTYPE_BF16;
+    if (!strcmp(s, "F16"))  return ST_DTYPE_F16;
+    if (!strcmp(s, "F32"))  return ST_DTYPE_F32;
+    if (!strcmp(s, "U8"))   return ST_DTYPE_U8;   /* dati quantizzati (int4 packed / int8) */
+    if (!strcmp(s, "I8"))   return ST_DTYPE_U8;
+    if (!strcmp(s, "I64")) return ST_DTYPE_I64;
+    if (!strcmp(s, "F8_E8M0")) return ST_DTYPE_F8_E8M0;
+    if (!strcmp(s, "F8_E4M3")) return ST_DTYPE_F8_E4M3;
     fprintf(stderr, "dtype non gestito: %s\n", s); exit(1);
 }
 
@@ -183,11 +196,14 @@ static void st_prefetch(shards *S, const char *name) {
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
+    if (t->dtype != ST_DTYPE_F32 && t->dtype != ST_DTYPE_BF16 && t->dtype != ST_DTYPE_F16) {
+        fprintf(stderr, "tensore %s: dtype raw-only %d non convertibile in f32\n", name, t->dtype); exit(1);
+    }
     void *raw = malloc(t->nbytes);
     if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
-    if (t->dtype == 2) {
+    if (t->dtype == ST_DTYPE_F32) {
         memcpy(out, raw, t->nbytes);
-    } else if (t->dtype == 0) {
+    } else if (t->dtype == ST_DTYPE_BF16) {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
     } else {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
@@ -219,12 +235,15 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
-    int esz = (t->dtype == 2) ? 4 : 2;
+    if (t->dtype != ST_DTYPE_F32 && t->dtype != ST_DTYPE_BF16 && t->dtype != ST_DTYPE_F16) {
+        fprintf(stderr, "tensore %s: dtype raw-only %d non convertibile in f32\n", name, t->dtype); exit(1);
+    }
+    int esz = (t->dtype == ST_DTYPE_F32) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
     if (pread(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
-    if (t->dtype == 2) memcpy(out, raw, nb);
-    else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
+    if (t->dtype == ST_DTYPE_F32) memcpy(out, raw, nb);
+    else if (t->dtype == ST_DTYPE_BF16) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
     free(raw);
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);

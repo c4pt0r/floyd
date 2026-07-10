@@ -12,6 +12,14 @@
 } while (0)
 
 int main(void) {
+    CHECK(st_dtype_code("BF16") == 0);
+    CHECK(st_dtype_code("F16") == 1);
+    CHECK(st_dtype_code("F32") == 2);
+    CHECK(st_dtype_code("U8") == 3);
+    CHECK(st_dtype_code("I8") == 3);
+    CHECK(st_dtype_code("I64") == 4);
+    CHECK(st_dtype_code("F8_E8M0") == 5);
+    CHECK(st_dtype_code("F8_E4M3") == 6);
     CHECK(bf16_to_f32(0x3f80) == 1.0f);
     CHECK(bf16_to_f32(0xc020) == -2.5f);
     CHECK(f16_to_f32(0x3c00) == 1.0f);
