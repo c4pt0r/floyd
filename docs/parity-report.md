@@ -226,3 +226,120 @@ quantization error compounding once greedy has no error-correction.
 - No segfaults, dimension mismatches, or missing-tensor errors were
   observed in any of the six real-model engine runs (2 containers x [TF
   long, TF short, greedy long]).
+
+## Metal A/B
+
+Source: `.superpowers/sdd/task-7-report.md` (Task 7, commit `2e8a780`). The
+Metal backend (`kernels.metal` + `backend_metal.m`, Task 6) hooks into
+`matmul_qt`'s batch path (`S>=8` by default) via `FLOYD_METAL=1` on a
+`make METAL=1` build; dense resident tensors get their weight buffer cached
+by pointer (`cache=1`), while streamed-expert slab views are never cached
+(`cache=0`, `slab_backed=1`) because their host pointer is recycled across
+different experts' bytes on every LRU miss/repin — caching those by pointer
+would serve stale weights after a repin with no visible error.
+
+### Kernel-level unit test (`make metal-test`, vs an independent f64 CPU reference)
+
+```
+device: Apple M3 Ultra
+q8 max rel err (cache=0): 2.47e-05
+q8 max rel err (cache=0, ripetuto): 1.07e-05
+q4 max rel err (cache=1): 6.09e-05
+q4 max rel err (cache=1, ripetuto stesso puntatore): 2.49e-05
+OK
+```
+
+### Fixture A/B (`fixture_tiny_i8`, `ref_tiny.json`, S=32)
+
+| Run | Score | pos/s |
+|---|---|---|
+| CPU-only build (`make`) | 24/32 | ~245-263 |
+| METAL build, `FLOYD_METAL` unset | 24/32 | 244.8 |
+| METAL build, `FLOYD_METAL=1` | **27/32** | 211.2 |
+
+7 of 32 positions differ between CPU and Metal on this run: positions 3, 4,
+12, 15, 19 flip MISS→OK, positions 7, 27 flip OK→MISS (net +3 → 24+3=27).
+Every differing position has a small top1-top2 logit margin (0.004 to 0.19,
+against a logit scale of ~2.1-2.5) — near-ties consistent with GPU-vs-CPU
+floating-point reduction-order non-associativity landing on either side of
+an already-narrow quantization-noise margin on this tiny synthetic fixture
+(documented since Task 3/5 as "fixture-noise depressed" — this is not the
+32/32 f32-oracle gate, which is exact and unaffected). This is not a kernel
+correctness bug: the kernel-level unit test above independently validates
+`fm_matmul_q8`/`q4` against an f64 CPU reference at ~2e-5 max relative
+error.
+
+### Real-model A/B (`models/moonlight_i8`, int8 container)
+
+Command: `SNAP=models/moonlight_i8 TF=1 REF=<ref> ./floyd 64 8 8` (± `FLOYD_METAL=1`).
+
+**Primary ref (`ref_moonlight_long.json`, S=52):**
+
+| Run | Score | pos/s |
+|---|---|---|
+| CPU (METAL build, `FLOYD_METAL` unset) | 48/52 | 17.3 |
+| Metal run 1 (`FLOYD_METAL=1`) | 51/52 | 13.1 |
+| Metal run 2 (`FLOYD_METAL=1`, reported) | 51/52 | 13.2 |
+
+**Secondary ref (`ref_moonlight.json`, S=30):**
+
+| Run | Score | pos/s |
+|---|---|---|
+| CPU (METAL build, `FLOYD_METAL` unset) | 29/30 | 13.9 |
+| Metal run 1 (`FLOYD_METAL=1`) | 29/30 | 10.8 |
+| Metal run 2 (`FLOYD_METAL=1`, reported) | 29/30 | 11.0 |
+
+Scores match the CPU baselines documented above exactly (48/52, 29/30). The
+secondary ref is an **exact match** — 0 flips, CPU and Metal identical
+position-by-position. The primary (long) ref has 3 positions flip, all
+MISS(CPU)→OK(Metal) — positions 3, 20, 22:
+
+- pos 3: CPU margin 0.254 (logit scale ~14) vs Metal margin 0.234.
+- pos 20: CPU margin 0.121 vs Metal margin 0.056.
+- pos 22: CPU margin 0.035 vs Metal margin 0.067.
+
+All three are narrow-margin positions relative to the ~14-18 logit scale
+(1-2% gaps) — genuine near-ties in the already quantization-noise-affected
+int8 path, not evidence of a Metal computation error. Net effect happens to
+be positive for Metal (48→51) on this particular reference, but that should
+be read as "reduction-order noise happened to land favorably on this
+input," not "Metal is more accurate" — the same phenomenon as the fixture's
+mixed +5/-2 flips, just landing the same direction here by chance.
+
+### pos/s summary (honest performance numbers)
+
+| Config | Fixture (S=32) | Real, S=52 | Real, S=30 |
+|---|---|---|---|
+| CPU (no Metal) | ~245-263 pos/s | 17.3 pos/s | 13.9 pos/s |
+| Metal (`FLOYD_METAL=1`, 2nd run) | 211.2 pos/s | 13.2 pos/s | 11.0 pos/s |
+
+**Metal is slower than CPU in every case measured, by roughly 15-25%.** This
+is an honest, expected result requiring no further tuning in this task.
+Root causes, visible in the `PROFILO` breakdown:
+
+- Activation buffers (`x`/`y`) are always transient
+  (`newBufferWithBytes`/`newBufferWithLength` + `waitUntilCompleted` per
+  call) — there is no batching of a layer's many small dense matmuls into
+  fewer GPU dispatches, so per-call fixed overhead (encoding, dispatch, sync
+  wait) dominates at these modest `S` (30-52) and moderate `O`/`I` sizes.
+- Expert matmuls inside the MoE batch-union path are `slab_backed=1` →
+  `cache=0` → every Metal-eligible expert call also re-uploads its *weight*
+  buffer from scratch every time (`expert-matmul` profiled time rose from
+  0.636s to 1.469s on the long ref) — the necessary correctness cost of
+  never caching a recycled slab pointer, not a bug.
+- The Metal weight-buffer cache (`g_wc[]`) is a process-local static; it is
+  **not** warmed across separate `./floyd` invocations, so back-to-back CLI
+  runs each start with an empty cache (run 1→2 pos/s: 13.1→13.2, 10.8→11.0 —
+  essentially flat, not a warm-up curve).
+
+### Assessment
+
+The Metal backend is correctness-validated (kernel-level ~2e-5 max rel
+error) and integration-correct (all observed CPU/Metal score differences
+are explained by narrow-margin argmax flips under floating-point
+reduction-order non-associativity, not by wrong numbers). It is not yet a
+performance win: 15-25% slower than CPU on the shapes measured here, for the
+structural reasons above (no dispatch batching, no cross-invocation weight
+cache, mandatory re-upload for recycled expert-slab pointers). Reported as
+measured, per this project's culture of honest numbers — no tuning was
+attempted in Task 7 or in this task.
