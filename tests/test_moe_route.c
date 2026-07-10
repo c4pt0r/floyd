@@ -32,6 +32,11 @@ static int test_sigmoid_bias_affects_selection_only(void) {
     return 0;
 }
 
+static int test_sigmoid_preserves_legacy_extreme_value_behavior(void) {
+    CHECK(moe_sigmoid(-100.0f) == 0.0f);
+    return 0;
+}
+
 static int test_softmax_is_stable_and_selects_top_k(void) {
     const float logits[] = {1000.0f, 1001.0f, 999.0f};
     const float denom = expf(-1.0f) + 1.0f + expf(-2.0f);
@@ -92,6 +97,7 @@ static int test_finalize_uses_effective_expert_count(void) {
 
 int main(void) {
     CHECK(test_sigmoid_bias_affects_selection_only() == 0);
+    CHECK(test_sigmoid_preserves_legacy_extreme_value_behavior() == 0);
     CHECK(test_softmax_is_stable_and_selects_top_k() == 0);
     CHECK(test_sqrt_softplus_scores() == 0);
     CHECK(test_ties_keep_lower_expert_index() == 0);

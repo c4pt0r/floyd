@@ -31,6 +31,7 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#include "moe_route.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -1179,14 +1180,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
-        for(int e=0;e<E;e++){ sig[e]=sigmoidf(logit[e]); choice[e]=sig[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
-        for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-            idx[kk]=best; w[kk]=sig[best];
-        }
+        moe_route_select(logit,l->router_bias,E,Ksel,MOE_SCORE_SIGMOID,
+                         idx,w,sig,choice);
         int Ke=Ksel;
         if(g_topp>0 && g_topp<1.f){
             for(int a=1;a<Ksel;a++){ int ii=idx[a]; float ww=w[a]; int b=a-1;
@@ -1196,8 +1193,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         }
         keff[s]=Ke; m->ereq+=Ke;
         for(int kk=0;kk<Ke;kk++) m->eusage[layer][idx[kk]]++;
-        if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
-        for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
+        moe_route_finalize(w,Ke,c->norm_topk,c->routed_scale);
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
     if(g_looka && S==1 && layer<c->n_layers){

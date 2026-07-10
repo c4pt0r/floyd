@@ -10,9 +10,7 @@ typedef enum {
 } MoeScoreFn;
 
 static inline float moe_sigmoid(float x) {
-    if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
-    float z = expf(x);
-    return z / (1.0f + z);
+    return 1.0f / (1.0f + expf(-x));
 }
 
 static inline float moe_sqrt_softplus(float x) {

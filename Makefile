@@ -35,7 +35,7 @@ TEST_BINS = tests/test_json tests/test_st tests/test_moe_route
 
 all: floyd
 
-floyd: floyd.c st.h json.h tok.h tok_unicode.h compat.h $(METAL_OBJ)
+floyd: floyd.c st.h json.h tok.h tok_unicode.h moe_route.h compat.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) floyd.c $(METAL_OBJ) -o floyd $(LDFLAGS)
 
 backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
