@@ -244,9 +244,20 @@ SNAP=models/moonlight_i8 TF=1 REF=ref_moonlight.json ./floyd 64 8 8
 FLOYD_METAL=1 SNAP=models/moonlight_i8 TF=1 REF=ref_moonlight.json ./floyd 64 8 8
 ```
 
-Env vars beyond `SNAP`/`TF`/`REF`/`FLOYD_METAL` are debug/tuning knobs with
-no CLI equivalent (by design — these are for developing/profiling the engine,
-not for normal use):
+Below, the env vars split into two groups: a handful that are just the
+legacy name for a documented CLI flag (`cli_adapt()` sets them via
+`setenv()` under the hood), and the rest — debug/tuning knobs with **no**
+CLI equivalent by design, for developing/profiling the engine rather than
+normal use.
+
+### Compat (CLI equivalent exists)
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `KVSAVE` | on-disk KV persistence; legacy name for `--no-kvsave` (`0` disables) | 1 |
+| `NUCLEUS` | token-sampling nucleus (top-p) on the vocabulary logits; legacy name for `--top-p` | 0.90 |
+
+### Developer/debug (env-only, no CLI flag)
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -257,20 +268,39 @@ not for normal use):
 | `PILOT_K` | pilot prefetch fan-out | 8 |
 | `STATS` | `STATS=<file>` writes an expert-usage histogram at end of run | unset |
 | `NOPACK` | disable weight packing | 0 |
-| `DROP` | drop-on-evict cache policy variant | 0 |
-| `PREFETCH` | expert-cache prefetch depth | 0 |
-| `TOPK` / `TOPP` | sampling controls (legacy names for `--top-p` etc.) | 0 |
+| `DROP` | drop-on-evict cache policy variant (keep evicted expert pages in the OS page cache as free L2, vs. discarding them) | 0 |
+| `PREFETCH` | re-enable cross-layer `WILLNEED` madvise prefetch (boolean; off by default because parallel real loads made it redundant, and under memory pressure the speculative readahead was getting re-evicted) | 0 |
+| `TOPK` | MoE **expert-routing** knob: force exactly `n` experts/token, overriding the checkpoint's configured top-k. Independent of `TOPP`; no CLI equivalent | 0 (off = use checkpoint's config top-k) |
+| `TOPP` | MoE **expert-routing** knob: adaptive top-p — after ranking the routed experts by router weight, keep only as many as needed for cumulative weight to reach `p` (0..1) of the total, i.e. the disk-read reducer benchmarked by colibrì. Independent of `TOPK`, no CLI equivalent | 0 (off) |
 | `MLOCK` | force/disable `mlock()` of resident weights | auto (on, macOS) |
 | `SPEC` | n-gram speculative decoding | 1 |
 | `REPIN` | re-pin hot experts every N emitted tokens | 0 (off) |
 | `ABSORB` | MLA weight-absorption toggle | auto |
 | `CHAT_TEMPLATE` | apply chat template in `run_serve`'s legacy protocol mode | 1 |
-| `KVSAVE` | on-disk KV persistence (legacy name for `--no-kvsave`, `0` disables) | 1 |
 | `THINK` | emit `<think>` reasoning block instead of `<think></think>` (nothink) | 0 |
+| `PIN` | `PIN=<statsfile>` pins the top experts by usage frequency permanently in RAM (evaluated before the RAM cap, so pinned experts count against the resident budget) | unset (off) |
+| `PIN_GB` | RAM budget in GB for `PIN`'s pinned experts | 10.0 |
+| `AUTOPIN` | auto-pin the historically most-used experts (from `<model-dir>/.coli_usage`) once usage history is confident enough (>=5000 recorded selections); `AUTOPIN=0` disables | 1 (on) |
+| `CAP_RAISE` | auto-raise the per-layer expert LRU cache size when the RAM budget allows more than `--cap` requested, up to `n_experts` (fixes large-RAM machines running with an undersized cache); `CAP_RAISE=0` restores the old fixed-cap behavior | 1 (on) |
+| `SERVE` | `SERVE=1` starts the persistent serve mode used by the `coli` CLI / HTTP gateway (model stays resident, answers requests) instead of the one-shot batch/validation paths | unset (off) |
+| `SCORE` | `SCORE=<requests.txt>` runs benchmark scoring mode: log-likelihood per line instead of generation | unset |
+| `REPLAY` | fixed-token decode benchmark: prefills all but the prompt's last oracle token, then replays the oracle continuation one token at a time, so CPU and CUDA see identical hidden-state inputs for a controlled perf comparison | unset |
+| `DIRECT` | `DIRECT=1` uses `O_DIRECT` for expert weight slab reads instead of buffered I/O; measured worse on this project's dev host (VHDX on NVMe, DRAM-less) but expected better on real NVMe | 0 (buffered) |
+| `LOOKA` | `LOOKA=1` measures (counters only, zero behavioral effect) how predictable MoE routing is ahead of time, to evaluate whether a router-piloted prefetch could hide disk latency | 0 (off) |
+| `SEED` | fixes the sampling RNG seed for deterministic generation | unset (seeded from clock + pid) |
+| `DSA_FORCE` | `DSA_FORCE=1` forces the DSA lightning-indexer selection to always run (test knob: makes the sparse top-min(k,T) selection behave like dense attention) | 0 (off) |
+| `DSA_TOPK` | overrides the DSA indexer's `index_topk` config value (test/dev override) | unset (use checkpoint config) |
+| `MTP_DEBUG` | `>=2` prints per-step MTP draft debug info (pre/post-block predictions, hidden-state norms); any truthy value also logs a draft-vs-verified-token hit/miss line during decode | unset (off) |
+| `MTP_PRENORM` | RFC/experiment toggle for the MTP head's hidden-state normalization order (whether `h` skips the post-`model.norm` rmsnorm before its own `hnorm`) | unset (off — uses the vLLM-matching post-norm path) |
+| `MTP_SWAP` | swaps the concatenation order of the MTP head's two input halves (embedding vs. hidden state) fed into `eh_proj` | unset (off — embedding first, hidden state second) |
+| `FM_MIN_S` | Metal backend only (`make METAL=1`): minimum batch size `S` before a matmul is dispatched to the GPU; smaller batches run on CPU | 8 |
+| `OMP_WAIT_POLICY` | not floyd-specific: set to `passive` automatically at startup (if not already set by the caller), so idle OpenMP threads sleep instead of spinning while the engine waits on disk I/O | `passive` (auto-set) |
 
 See `usage()`/`floyd help` and the CLI reference above for the supported
-flags most users need; this table is for developers who need the
-lower-level knobs `tf`/`gen`/`chat`/`run` don't expose.
+flags most users need; the developer/debug table is for people who need the
+lower-level knobs `tf`/`gen`/`chat`/`run` don't expose. `PIN` and
+`CAP_RAISE` are the two most likely to matter in practice — see the
+transcripts in `docs/chat-report.md`.
 
 ## Known limitations
 

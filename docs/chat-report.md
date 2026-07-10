@@ -210,7 +210,7 @@ changes were needed.
 | Reviewer adversarial sweep (ledger) | 50/50 |
 | Multi-turn memory (2-turn chat, real i8) | Paris; second answer correctly references first question |
 | `<|im_end|>` leak check | none found |
-| KV warm restore after process restart | 61/61 token resumed, 0.0s, no re-prefill |
+| KV warm restore after process restart | 61 token resumed (matches prior session ctx), 0 re-prefill, 0.0s |
 | `--no-kvsave` | confirmed no `.coli_kv` written |
 | `run` English one-shot | "Paris" |
 | `run` Chinese one-shot | "巴黎" |
