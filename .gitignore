@@ -24,6 +24,7 @@ tests/test_v4_model_manifest
 tests/test_v4_real_layer0
 tests/test_v4_real_decode
 tests/test_v4_dspark_decode
+tests/test_v4_spec_runtime
 tests/test_backend_metal
 tests/test_tok_moon
 tests/test_v4_chat_format
