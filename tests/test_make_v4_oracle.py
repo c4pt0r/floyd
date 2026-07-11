@@ -19,6 +19,10 @@ def test_build_tiny():
     assert config.mlp_layer_types == ["hash_moe", "moe", "moe"]
     assert config.hc_mult == 2
     assert config.scoring_func == "sqrtsoftplus"
+    assert config.compress_rates == {
+        "compressed_sparse_attention": 4,
+        "heavily_compressed_attention": 128,
+    }
 
     hash_ids = model.model.layers[0].mlp.gate.tid2eid
     assert hash_ids[3].tolist() == [3, 2]
@@ -73,6 +77,9 @@ def test_write_tiny_is_complete_and_deterministic():
                 for site in ("attn", "ffn"):
                     for field in ("input", "post", "comb", "collapsed"):
                         expected_keys.add(f"hc.{layer}.{site}.{field}")
+            for mode in ("hca", "csa"):
+                for field in ("kv", "gate", "ape", "norm", "output"):
+                    expected_keys.add(f"compress.{mode}.{field}")
             assert set(oracle.keys()) == expected_keys
             n_tokens = len(ref["full_ids"])
             assert oracle.get_slice("input_ids").get_shape() == [n_tokens]
@@ -93,6 +100,16 @@ def test_write_tiny_is_complete_and_deterministic():
                     assert oracle.get_slice(f"hc.{layer}.{site}.post").get_shape() == [n_tokens, 2]
                     assert oracle.get_slice(f"hc.{layer}.{site}.comb").get_shape() == [n_tokens, 2, 2]
                     assert oracle.get_slice(f"hc.{layer}.{site}.collapsed").get_shape() == [n_tokens, 64]
+            assert oracle.get_slice("compress.hca.kv").get_shape() == [256, 16]
+            assert oracle.get_slice("compress.hca.gate").get_shape() == [256, 16]
+            assert oracle.get_slice("compress.hca.ape").get_shape() == [128, 16]
+            assert oracle.get_slice("compress.hca.norm").get_shape() == [16]
+            assert oracle.get_slice("compress.hca.output").get_shape() == [2, 16]
+            assert oracle.get_slice("compress.csa.kv").get_shape() == [12, 32]
+            assert oracle.get_slice("compress.csa.gate").get_shape() == [12, 32]
+            assert oracle.get_slice("compress.csa.ape").get_shape() == [4, 32]
+            assert oracle.get_slice("compress.csa.norm").get_shape() == [16]
+            assert oracle.get_slice("compress.csa.output").get_shape() == [3, 16]
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ def build_tiny():
         ],
         compress_rates={
             "compressed_sparse_attention": 4,
-            "heavily_compressed_attention": 8,
+            "heavily_compressed_attention": 128,
         },
         hc_mult=2,
         hc_sinkhorn_iters=4,
@@ -160,6 +160,41 @@ def forward_with_moe_captures(model, input_ids):
     return output, captures
 
 
+def build_compressor_captures(model):
+    captures = {}
+    cases = (
+        ("hca", model.model.layers[1].self_attn.compressor, 256, 1),
+        ("csa", model.model.layers[2].self_attn.compressor, 12, 2),
+    )
+
+    with torch.no_grad():
+        for mode, compressor, n_tokens, layer_index in cases:
+            hidden = torch.linspace(
+                -1.0, 1.0, n_tokens * model.config.hidden_size, dtype=torch.float32
+            ).reshape(1, n_tokens, model.config.hidden_size)
+            q_residual = torch.linspace(
+                0.5, -0.5, n_tokens * model.config.q_lora_rank, dtype=torch.float32
+            ).reshape(1, n_tokens, model.config.q_lora_rank)
+            position_ids = torch.arange(n_tokens, dtype=torch.long).unsqueeze(0)
+            kv = compressor.kv_proj(hidden)
+            gate = compressor.gate_proj(hidden)
+            compressed, _ = compressor(
+                hidden, q_residual, position_ids, None, layer_index
+            )
+
+            captures[f"compress.{mode}.kv"] = kv[0].float().contiguous()
+            captures[f"compress.{mode}.gate"] = gate[0].float().contiguous()
+            captures[f"compress.{mode}.ape"] = (
+                compressor.position_bias.detach().float().contiguous().clone()
+            )
+            captures[f"compress.{mode}.norm"] = (
+                compressor.kv_norm.weight.detach().float().contiguous().clone()
+            )
+            captures[f"compress.{mode}.output"] = compressed[0, 0].float().contiguous()
+
+    return captures
+
+
 def write_tiny(out_dir, ref_path, ngen=8):
     out_dir = Path(out_dir)
     ref_path = Path(ref_path)
@@ -181,6 +216,7 @@ def write_tiny(out_dir, ref_path, ngen=8):
     for i, router in enumerate(output.router_logits):
         oracle[f"router.{i}"] = router.float().contiguous().clone()
     oracle.update(moe_captures)
+    oracle.update(build_compressor_captures(model))
     save_file(oracle, out_dir / "oracle.safetensors")
 
     reference = {
