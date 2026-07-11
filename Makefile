@@ -103,11 +103,11 @@ tests/test_deepseek_v4_kv_cache_fixture: tests/test_deepseek_v4_kv_cache_fixture
 test-deepseek-v4-kv-cache: tests/test_deepseek_v4_kv_cache_fixture
 	./tests/test_deepseek_v4_kv_cache_fixture fixture_tiny_deepseek_v4
 
-tests/test_deepseek_v4_quant: tests/test_deepseek_v4_quant.c deepseek_v4_quant.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_deepseek_v4_quant: tests/test_deepseek_v4_quant.c deepseek_v4_quant.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_deepseek_v4_native_quant: tests/test_deepseek_v4_native_quant.c deepseek_v4_quant.h st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_deepseek_v4_native_quant: tests/test_deepseek_v4_native_quant.c deepseek_v4_quant.h st.h json.h compat.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 test-deepseek-v4-native-quant: tests/test_deepseek_v4_native_quant
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
@@ -232,23 +232,23 @@ fixture_dspark_dspark_decode/oracle.safetensors: tools/make_deepseek_v4_forward_
 	$(PYTHON) tools/make_deepseek_v4_forward_oracle.py --model "$(DSPARK)" \
 	  --output fixture_dspark_layer0/oracle.safetensors --dspark-decode-output $@
 
-tests/test_deepseek_v4_forward: tests/test_deepseek_v4_forward.c deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_deepseek_v4_forward: tests/test_deepseek_v4_forward.c deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_deepseek_v4_decode: tests/test_deepseek_v4_decode.c deepseek_v4_runtime.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_deepseek_v4_decode: tests/test_deepseek_v4_decode.c deepseek_v4_runtime.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 test-deepseek-v4-decode: fixture_dspark_base_decode/oracle.safetensors tests/test_deepseek_v4_decode
 	./tests/test_deepseek_v4_decode "$(DSPARK)" fixture_dspark_base_decode
 
-tests/test_deepseek_v4_dspark_decode: tests/test_deepseek_v4_dspark_decode.c deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_deepseek_v4_dspark_decode: tests/test_deepseek_v4_dspark_decode.c deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 test-deepseek-v4-dspark-decode: fixture_dspark_dspark_decode/oracle.safetensors tests/test_deepseek_v4_dspark_decode
 	./tests/test_deepseek_v4_dspark_decode "$(DSPARK)" fixture_dspark_dspark_decode
 
-tests/test_deepseek_v4_spec_runtime: tests/test_deepseek_v4_spec_runtime.c deepseek_v4_runtime.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_deepseek_v4_spec_runtime: tests/test_deepseek_v4_spec_runtime.c deepseek_v4_runtime.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h moe_route.h st.h json.h compat.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 test-deepseek-v4-spec-runtime: fixture_dspark_dspark_decode/oracle.safetensors tests/test_deepseek_v4_spec_runtime
 	./tests/test_deepseek_v4_spec_runtime "$(DSPARK)" fixture_dspark_dspark_decode
