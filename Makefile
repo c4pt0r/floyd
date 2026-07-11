@@ -140,6 +140,10 @@ tests/test_tok_moon: tests/test_tok_moon.c tok_moon.h tok.h tok_unicode.h json.h
 test-tok: tests/test_tok_moon
 	./tests/test_tok_moon models/Moonlight-16B-A3B-Instruct tok_cases.json
 
+test-cli-default-chat: floyd
+	@test -n "$(MOONLIGHT)" || (echo "set MOONLIGHT=/path/to/moonlight_i8"; exit 2)
+	sh tests/test_cli_default_chat.sh "$(MOONLIGHT)"
+
 tests/test_v4_chat_format: tests/test_v4_chat_format.c tok.h tok_unicode.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -249,4 +253,4 @@ test-v4-real-layer0: fixture_dspark_layer0/oracle.safetensors fixture_dspark_lay
 clean:
 	rm -f floyd v4_chat *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_v4_native_quant tests/test_v4_native_quant_metal tests/test_v4_model_manifest tests/test_v4_real_layer0 tests/test_v4_real_decode tests/test_v4_dspark_decode tests/test_v4_spec_runtime tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_v4_chat_format tools/probe_safetensors
 
-.PHONY: all v4_chat test-c test-tok test-v4-attention test-v4-chat test-v4-chat-metal test-v4-chat-backend test-v4-chat-backend-metal test-v4-chat-format test-v4-chat-spec test-v4-compress test-v4-dspark-decode test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-model-manifest test-v4-moe test-v4-native-quant test-v4-native-quant-metal test-v4-oracle test-v4-real-decode test-v4-real-layer0 test-v4-real-layer0-oracle test-v4-spec-runtime metal-test clean portable
+.PHONY: all v4_chat test-c test-tok test-cli-default-chat test-v4-attention test-v4-chat test-v4-chat-metal test-v4-chat-backend test-v4-chat-backend-metal test-v4-chat-format test-v4-chat-spec test-v4-compress test-v4-dspark-decode test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-model-manifest test-v4-moe test-v4-native-quant test-v4-native-quant-metal test-v4-oracle test-v4-real-decode test-v4-real-layer0 test-v4-real-layer0-oracle test-v4-spec-runtime metal-test clean portable
