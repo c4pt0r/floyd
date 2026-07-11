@@ -23,6 +23,15 @@ endif
 
 METAL    ?= 0
 METAL_OBJ =
+LLAMA_CPP_DIR ?= .deps/llama.cpp
+LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
+LLAMA_INCLUDES = -I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
+LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
+	$(LLAMA_BUILD_DIR)/ggml/src/libggml.a \
+	$(LLAMA_BUILD_DIR)/ggml/src/ggml-metal/libggml-metal.a \
+	$(LLAMA_BUILD_DIR)/ggml/src/libggml-cpu.a \
+	$(LLAMA_BUILD_DIR)/ggml/src/ggml-blas/libggml-blas.a \
+	$(LLAMA_BUILD_DIR)/ggml/src/libggml-base.a
 ifeq ($(METAL),1)
 ifneq ($(UNAME_S),Darwin)
 $(error METAL=1 e' supportato solo su macOS)
@@ -154,6 +163,15 @@ tests/test_deepseek_v4_ggml: tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp 
 
 test-deepseek-v4-ggml: tests/test_deepseek_v4_ggml
 	./tests/test_deepseek_v4_ggml
+
+tests/test_deepseek_v4_ggml_official: tests/test_deepseek_v4_ggml_official.c deepseek_v4_ggml.cpp deepseek_v4_ggml.h
+	$(CXX) -O2 -std=c++17 -DFLOYD_DEEPSEEK_V4_GGML $(LLAMA_INCLUDES) \
+		-x c++ $< deepseek_v4_ggml.cpp -x none $(LLAMA_STATIC_LIBS) -o $@ \
+		-framework Accelerate -framework Metal -framework MetalKit -framework Foundation
+
+test-deepseek-v4-ggml-official: tests/test_deepseek_v4_ggml_official
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	./tests/test_deepseek_v4_ggml_official "$(DSPARK)"
 
 prepare-deepseek-v4-gguf:
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
