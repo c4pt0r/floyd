@@ -180,6 +180,193 @@ def write_layer0_oracle(model_dir, output_path, token_id=3):
     save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
 
 
+def quant_linear_batch(checkpoint, prefix, x, fp4=False, row_start=0, row_count=None):
+    if fp4:
+        packed = checkpoint.tensor(f"{prefix}.weight").view(torch.uint8)
+        low, high = packed & 0x0F, (packed >> 4) & 0x0F
+        weight = FP4_TABLE[torch.stack((low, high), dim=-1).long()].flatten(1)
+        weight.mul_(checkpoint.tensor(f"{prefix}.scale").float().repeat_interleave(32, 1))
+    else:
+        weight = checkpoint.tensor(f"{prefix}.weight")
+        if row_count is None:
+            row_count = weight.shape[0] - row_start
+        weight = weight[row_start:row_start + row_count].float()
+        scale = checkpoint.tensor(f"{prefix}.scale").float()
+        scale = scale[row_start // 128:(row_start + row_count) // 128]
+        weight.mul_(scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:, :weight.shape[1]])
+    output = F.linear(x.float(), weight)
+    del weight
+    gc.collect()
+    return output
+
+
+def norm_batch(x, weight):
+    return x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6) * weight.float()
+
+
+def hc_batch(checkpoint, layer, site, streams):
+    prefix = f"layers.{layer}.hc_{site}"
+    flat = streams.flatten(1).float()
+    normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+    mixes = F.linear(normalized, checkpoint.tensor(f"{prefix}_fn").float())
+    base = checkpoint.tensor(f"{prefix}_base").float()
+    scale = checkpoint.tensor(f"{prefix}_scale").float()
+    pre = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + 1e-6
+    post = 2.0 * torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8])
+    comb = (mixes[:, 8:].reshape(-1, 4, 4) * scale[2] + base[8:].reshape(1, 4, 4)).softmax(-1) + 1e-6
+    comb = comb / (comb.sum(1, keepdim=True) + 1e-6)
+    for _ in range(19):
+        comb = comb / (comb.sum(2, keepdim=True) + 1e-6)
+        comb = comb / (comb.sum(1, keepdim=True) + 1e-6)
+    return (pre.unsqueeze(-1) * streams.float()).sum(1), post, comb
+
+
+def hc_post_batch(block, residual, post, comb):
+    return post.unsqueeze(-1) * block.unsqueeze(1) + torch.einsum("sij,sjd->sid", comb, residual.float())
+
+
+def rope_frequencies(compressed):
+    dim, base = 64, 160000.0 if compressed else 10000.0
+    frequencies = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+    if compressed:
+        def correction(rotations):
+            return dim * math.log(65536 / (rotations * 2 * math.pi)) / (2 * math.log(base))
+        low = max(math.floor(correction(32)), 0)
+        high = min(math.ceil(correction(1)), dim - 1)
+        ramp = ((torch.arange(dim // 2).float() - low) / (high - low)).clamp(0, 1)
+        smooth = 1 - ramp
+        frequencies = frequencies / 16 * (1 - smooth) + frequencies * smooth
+    return frequencies
+
+
+def rope_batch(x, positions, compressed, inverse=False):
+    rope = x[..., -64:].float().reshape(*x.shape[:-1], 32, 2)
+    angles = positions.float()[:, None] * rope_frequencies(compressed)[None, :]
+    cosine, sine = angles.cos(), angles.sin()
+    while cosine.ndim < rope.ndim - 1:
+        cosine, sine = cosine.unsqueeze(1), sine.unsqueeze(1)
+    if inverse:
+        sine = -sine
+    first, second = rope[..., 0], rope[..., 1]
+    rotated = torch.stack((first * cosine - second * sine,
+                           second * cosine + first * sine), dim=-1).flatten(-2)
+    return torch.cat((x[..., :-64].float(), rotated), dim=-1)
+
+
+def compressor_batch(checkpoint, prefix, hidden, head_dim):
+    kv = F.linear(hidden.float(), checkpoint.tensor(f"{prefix}.wkv.weight").float())
+    gate = F.linear(hidden.float(), checkpoint.tensor(f"{prefix}.wgate.weight").float())
+    gate = gate + checkpoint.tensor(f"{prefix}.ape").float()
+    ratio = 4
+    current_kv, current_gate = kv[:, head_dim:], gate[:, head_dim:]
+    pooled = (current_kv * current_gate.softmax(0)).sum(0, keepdim=True)
+    pooled = norm_batch(pooled, checkpoint.tensor(f"{prefix}.norm.weight"))
+    pooled = rope_batch(pooled, torch.tensor([0]), compressed=True)
+    return pooled
+
+
+def attention_batch(checkpoint, layer, hidden, captures):
+    prefix = f"layers.{layer}.attn"
+    positions = torch.arange(hidden.shape[0])
+    compressed = layer >= 2
+    q_residual = norm_batch(
+        quant_linear_batch(checkpoint, f"{prefix}.wq_a", hidden),
+        checkpoint.tensor(f"{prefix}.q_norm.weight"),
+    )
+    q = quant_linear_batch(checkpoint, f"{prefix}.wq_b", q_residual).reshape(-1, 64, 512)
+    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
+    q = rope_batch(q, positions, compressed)
+    kv = norm_batch(
+        quant_linear_batch(checkpoint, f"{prefix}.wkv", hidden),
+        checkpoint.tensor(f"{prefix}.kv_norm.weight"),
+    )
+    kv = rope_batch(kv, positions, compressed)
+    compressed_kv, index_scores, index_ids, block_bias = None, None, None, None
+    if layer == 2:
+        compressed_kv = compressor_batch(checkpoint, f"{prefix}.compressor", hidden, 512)
+        index_kv = compressor_batch(checkpoint, f"{prefix}.indexer.compressor", hidden, 128)
+        index_q = quant_linear_batch(checkpoint, f"{prefix}.indexer.wq_b", q_residual).reshape(-1, 64, 128)
+        index_q = rope_batch(index_q, positions, compressed=True)
+        head_weights = F.linear(hidden.float(), checkpoint.tensor(f"{prefix}.indexer.weights_proj.weight").float())
+        dots = torch.einsum("shd,td->sht", index_q, index_kv).relu() / math.sqrt(128.0)
+        index_scores = (dots * (head_weights / 8.0).unsqueeze(-1)).sum(1)
+        threshold = (positions + 1) // 4
+        index_ids = torch.where(threshold[:, None] > 0,
+                                torch.zeros((4, 1), dtype=torch.long),
+                                torch.full((4, 1), -1, dtype=torch.long))
+        block_bias = torch.where(index_ids >= 0, torch.zeros_like(index_scores),
+                                 torch.full_like(index_scores, float("-inf")))
+        captures["layer.2.compressor.kv"] = compressed_kv
+        captures["layer.2.indexer.scores"] = index_scores
+        captures["layer.2.indexer.indices"] = index_ids
+        captures["layer.2.block_bias"] = block_bias
+
+    sinks = checkpoint.tensor(f"{prefix}.attn_sink").float()
+    context = torch.zeros_like(q)
+    for token in range(hidden.shape[0]):
+        keys = kv[:token + 1]
+        if layer == 2 and index_ids[token, 0] >= 0:
+            keys = torch.cat((keys, compressed_kv), dim=0)
+        scores = torch.einsum("hd,td->ht", q[token], keys) / math.sqrt(512.0)
+        maximum = torch.maximum(scores.max(-1).values, sinks)
+        probabilities = torch.exp(scores - maximum[:, None])
+        denominator = probabilities.sum(-1) + torch.exp(sinks - maximum)
+        context[token] = torch.einsum("ht,td->hd", probabilities / denominator[:, None], keys)
+    context = rope_batch(context, positions, compressed, inverse=True)
+    grouped = []
+    for group in range(8):
+        grouped.append(quant_linear_batch(
+            checkpoint, f"{prefix}.wo_a",
+            context[:, group * 8:(group + 1) * 8].reshape(-1, 4096),
+            row_start=group * 1024, row_count=1024,
+        ))
+    return quant_linear_batch(checkpoint, f"{prefix}.wo_b", torch.cat(grouped, -1))
+
+
+def moe_batch(checkpoint, layer, hidden, token_ids):
+    prefix = f"layers.{layer}.ffn"
+    logits = F.linear(hidden.float(), checkpoint.tensor(f"{prefix}.gate.weight").float())
+    scores = F.softplus(logits).sqrt()
+    output = torch.zeros_like(hidden.float())
+    for token, token_id in enumerate(token_ids):
+        indices = checkpoint.row(f"{prefix}.gate.tid2eid", token_id).long()
+        weights = scores[token, indices]
+        weights = weights / weights.sum() * 1.5
+        for coefficient, expert_id in zip(weights, indices):
+            ep = f"{prefix}.experts.{int(expert_id)}"
+            gate = quant_linear_batch(checkpoint, f"{ep}.w1", hidden[token], fp4=True).clamp(max=10)
+            up = quant_linear_batch(checkpoint, f"{ep}.w3", hidden[token], fp4=True).clamp(-10, 10)
+            output[token] += quant_linear_batch(
+                checkpoint, f"{ep}.w2", coefficient * F.silu(gate) * up, fp4=True
+            )
+        shared = f"{prefix}.shared_experts"
+        gate = quant_linear_batch(checkpoint, f"{shared}.w1", hidden[token]).clamp(max=10)
+        up = quant_linear_batch(checkpoint, f"{shared}.w3", hidden[token]).clamp(-10, 10)
+        output[token] += quant_linear_batch(checkpoint, f"{shared}.w2", F.silu(gate) * up)
+    return output
+
+
+def write_layers_0_2_oracle(model_dir, output_path, token_ids):
+    assert len(token_ids) == 4
+    torch.set_num_threads(8)
+    checkpoint = Checkpoint(model_dir)
+    streams = torch.stack([checkpoint.row("embed.weight", token).float() for token in token_ids])
+    streams = streams[:, None, :].repeat(1, 4, 1)
+    captures = {}
+    for layer in range(3):
+        captures[f"layer.{layer}.input"] = streams.clone()
+        collapsed, post, comb = hc_batch(checkpoint, layer, "attn", streams)
+        hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.attn_norm.weight"))
+        streams = hc_post_batch(attention_batch(checkpoint, layer, hidden, captures), streams, post, comb)
+        collapsed, post, comb = hc_batch(checkpoint, layer, "ffn", streams)
+        hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.ffn_norm.weight"))
+        streams = hc_post_batch(moe_batch(checkpoint, layer, hidden, token_ids), streams, post, comb)
+        captures[f"layer.{layer}.output"] = streams.clone()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
