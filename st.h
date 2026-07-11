@@ -229,6 +229,22 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
+/* Legge un intervallo di byte da un tensore raw-only senza materializzarlo tutto. */
+static void st_read_slice_raw(shards *S, const char *name, int64_t byte_off,
+                              int64_t nbytes, void *out, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
+    if (!out || byte_off < 0 || nbytes < 0 || byte_off > t->nbytes ||
+        nbytes > t->nbytes - byte_off) {
+        fprintf(stderr, "slice raw fuori range: %s off=%lld bytes=%lld size=%lld\n",
+                name, (long long)byte_off, (long long)nbytes, (long long)t->nbytes);
+        exit(1);
+    }
+    int64_t absolute = t->off + byte_off;
+    if (pread(t->fd, out, nbytes, absolute) != nbytes) { perror("pread raw slice"); exit(1); }
+    if (drop) posix_fadvise(t->fd, absolute, nbytes, POSIX_FADV_DONTNEED);
+}
+
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
  * Serve per gli expert fusi di GLM (un tensore = blocco [E, ...]): si legge il
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */

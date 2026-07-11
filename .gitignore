@@ -18,6 +18,7 @@ tests/test_v4_indexer_fixture
 tests/test_v4_kv_cache_fixture
 tests/test_st_probe
 tests/test_v4_quant
+tests/test_v4_native_quant
 tests/test_backend_metal
 tests/test_tok_moon
 tools/probe_safetensors

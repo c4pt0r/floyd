@@ -59,4 +59,57 @@ static inline void v4_fp8_dequant_matrix(float *out, const uint8_t *weights,
     }
 }
 
+static inline int v4_fp4_matmul_f32(float *output, const float *input,
+                                    int n_inputs, const uint8_t *weights,
+                                    const uint8_t *scales, int rows,
+                                    int columns) {
+    if (!output || !input || !weights || !scales || n_inputs <= 0 ||
+        rows <= 0 || columns <= 0 || columns % 32 != 0)
+        return 0;
+    int row_bytes = columns / 2;
+    int scale_columns = columns / 32;
+    for (int input_row = 0; input_row < n_inputs; input_row++) {
+        const float *x = input + (int64_t)input_row * columns;
+        for (int row = 0; row < rows; row++) {
+            const uint8_t *packed = weights + (int64_t)row * row_bytes;
+            const uint8_t *row_scales = scales + (int64_t)row * scale_columns;
+            float sum = 0.0f;
+            for (int column = 0; column < columns; column++) {
+                float scale = v4_e8m0_to_f32(row_scales[column / 32]);
+                float value = v4_fp4_packed_value(packed, column) * scale;
+                sum += x[column] * value;
+            }
+            output[(int64_t)input_row * rows + row] = sum;
+        }
+    }
+    return 1;
+}
+
+static inline int v4_fp8_matmul_f32(float *output, const float *input,
+                                    int n_inputs, const uint8_t *weights,
+                                    const uint8_t *scales, int rows,
+                                    int columns, int block_size) {
+    if (!output || !input || !weights || !scales || n_inputs <= 0 ||
+        rows <= 0 || columns <= 0 || block_size <= 0 ||
+        rows % block_size != 0 || columns % block_size != 0)
+        return 0;
+    int scale_columns = columns / block_size;
+    for (int input_row = 0; input_row < n_inputs; input_row++) {
+        const float *x = input + (int64_t)input_row * columns;
+        for (int row = 0; row < rows; row++) {
+            const uint8_t *weight = weights + (int64_t)row * columns;
+            const uint8_t *row_scales = scales
+                + (int64_t)(row / block_size) * scale_columns;
+            float sum = 0.0f;
+            for (int column = 0; column < columns; column++) {
+                float scale = v4_e8m0_to_f32(row_scales[column / block_size]);
+                float value = v4_e4m3_to_f32(weight[column]) * scale;
+                sum += x[column] * value;
+            }
+            output[(int64_t)input_row * rows + row] = sum;
+        }
+    }
+    return 1;
+}
+
 #endif

@@ -104,6 +104,13 @@ test-v4-kv-cache: tests/test_v4_kv_cache_fixture
 tests/test_v4_quant: tests/test_v4_quant.c v4_quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_v4_native_quant: tests/test_v4_native_quant.c v4_quant.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test-v4-native-quant: tests/test_v4_native_quant
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	./tests/test_v4_native_quant "$(DSPARK)"
+
 tests/test_st_probe: tests/test_st_probe.c st.h st_probe.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -122,6 +129,6 @@ test-v4-oracle:
 	PYTHONPATH=. $(PYTHON) tests/test_make_v4_oracle.py
 
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_v4_native_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
 
-.PHONY: all test-c test-tok test-v4-attention test-v4-compress test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-moe test-v4-oracle metal-test clean portable
+.PHONY: all test-c test-tok test-v4-attention test-v4-compress test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-moe test-v4-native-quant test-v4-oracle metal-test clean portable
