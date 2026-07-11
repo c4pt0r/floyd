@@ -30,18 +30,19 @@ static float max_error(const float *actual, const float *expected, int count) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
-        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle> <layers-3-4-oracle> <base-forward-oracle>\n", argv[0]);
+    if (argc != 8) {
+        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle> <layers-3-4-oracle> <base-forward-oracle> <dspark-oracle>\n", argv[0]);
         return 2;
     }
     enum { D = 4096, HC = 4, EXPERTS = 256, TOP_K = 6 };
-    shards model, oracle, oracle_0_2, oracle_3, oracle_3_4, oracle_base;
+    shards model, oracle, oracle_0_2, oracle_3, oracle_3_4, oracle_base, oracle_dspark;
     st_init(&model, argv[1]);
     st_init(&oracle, argv[2]);
     st_init(&oracle_0_2, argv[3]);
     st_init(&oracle_3, argv[4]);
     st_init(&oracle_3_4, argv[5]);
     st_init(&oracle_base, argv[6]);
+    st_init(&oracle_dspark, argv[7]);
     float input[HC * D], attn_post[HC], attn_comb[HC * HC], attn_collapsed[D];
     float attn_norm[D], attn_output[D], after_attn[HC * D];
     float ffn_post[HC], ffn_comb[HC * HC], ffn_collapsed[D], ffn_norm[D];
@@ -375,6 +376,59 @@ int main(int argc, char **argv) {
     CHECK(continuous_argmax == expected_argmax);
     free(head_input); free(head_hidden); free(head_norm); free(head_logits);
     free(expected_head_hidden); free(expected_head_norm); free(expected_head_logits);
+
+    float *dspark_main_x = load_f32(&oracle_dspark, "dspark.main_x", 4 * D);
+    float *dspark_prefill = malloc((size_t)3 * 4 * 512 * sizeof(float));
+    float *dspark_stages = malloc((size_t)3 * 5 * HC * D * sizeof(float));
+    float *dspark_hidden = malloc((size_t)5 * D * sizeof(float));
+    float dspark_confidence[5];
+    int64_t dspark_output_ids[6];
+    int64_t *expected_dspark_ids = malloc(6 * sizeof(int64_t));
+    CHECK(dspark_main_x && dspark_prefill && dspark_stages && dspark_hidden &&
+          expected_dspark_ids);
+    st_read_raw(&oracle_dspark, "dspark.output_ids", expected_dspark_ids, 0);
+    V4RealDSparkState dspark_state;
+    V4RealDSparkCapture dspark_capture = {
+        .prefill_kv = dspark_prefill,
+        .stage_outputs = dspark_stages,
+        .hidden = dspark_hidden,
+        .output_ids = dspark_output_ids,
+        .confidence = dspark_confidence,
+    };
+    CHECK(v4_real_dspark_state_init(&dspark_state));
+    CHECK(v4_real_dspark_forward(&model, dspark_main_x, 4,
+                                 (int)expected_dspark_ids[0],
+                                 &dspark_state, &dspark_capture));
+    float dspark_prefill_error = 0.0f, dspark_stage_errors[3];
+    for (int stage = 0; stage < 3; stage++) {
+        char name[64];
+        snprintf(name, sizeof(name), "dspark.prefill_kv.%d", stage);
+        float *expected_prefill = load_f32(&oracle_dspark, name, 4 * 512);
+        snprintf(name, sizeof(name), "dspark.stage.%d.output", stage);
+        float *expected_stage = load_f32(&oracle_dspark, name, 5 * HC * D);
+        CHECK(expected_prefill && expected_stage);
+        float error = max_error(dspark_prefill + (int64_t)stage * 4 * 512,
+                                expected_prefill, 4 * 512);
+        if (error > dspark_prefill_error) dspark_prefill_error = error;
+        dspark_stage_errors[stage] = max_error(
+            dspark_stages + (int64_t)stage * 5 * HC * D,
+            expected_stage, 5 * HC * D);
+        free(expected_prefill); free(expected_stage);
+    }
+    float *expected_confidence = load_f32(&oracle_dspark, "dspark.confidence", 5);
+    CHECK(expected_confidence);
+    float confidence_error = max_error(dspark_confidence, expected_confidence, 5);
+    int dspark_id_hits = 0;
+    for (int i = 0; i < 6; i++)
+        if (dspark_output_ids[i] == expected_dspark_ids[i]) dspark_id_hits++;
+    printf("v4 real DSpark: prefill=%.9g stage0=%.9g stage1=%.9g stage2=%.9g ids=%d/6 confidence=%.9g\n",
+           dspark_prefill_error, dspark_stage_errors[0], dspark_stage_errors[1],
+           dspark_stage_errors[2], dspark_id_hits, confidence_error);
+    CHECK(dspark_prefill_error < 3e-4f && dspark_stage_errors[0] < 3e-4f);
+    CHECK(dspark_id_hits == 6 && confidence_error < 3e-3f);
+    v4_real_dspark_state_free(&dspark_state);
+    free(dspark_main_x); free(dspark_prefill); free(dspark_stages); free(dspark_hidden);
+    free(expected_dspark_ids); free(expected_confidence);
     v4_real_model_state_free(&base_state);
     free(base_streams); free(base_checkpoints); free(base_targets); free(base_routes);
     puts("v4 real layer0 tests: ok");
