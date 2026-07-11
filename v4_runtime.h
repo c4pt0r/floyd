@@ -12,13 +12,23 @@
 typedef struct {
     shards model;
     V4RealModelState state;
+    V4RealDSparkState dspark_state;
     int max_context;
     int last_count;
+    int last_start_position;
+    int dspark_ready;
     float *streams;
     float *head_hidden;
     float *head_normalized;
     float *logits;
     float *target_means;
+    float *main_input;
+    float *main_x;
+    float *dspark_prefill_kv;
+    float *dspark_stage_outputs;
+    float *dspark_hidden;
+    float dspark_confidence[5];
+    int64_t dspark_output_ids[6];
     size_t token_capacity;
 } V4Runtime;
 
@@ -43,6 +53,18 @@ static inline int v4_runtime_resize(V4Runtime *runtime, int n_tokens) {
                              capacity * 3 * V4_REAL_D * sizeof(float));
     if (!targets) return 0;
     runtime->target_means = targets;
+    float *main_input = realloc(runtime->main_input,
+                                capacity * 3 * V4_REAL_D * sizeof(float));
+    if (!main_input) return 0;
+    runtime->main_input = main_input;
+    float *main_x = realloc(runtime->main_x,
+                            capacity * V4_REAL_D * sizeof(float));
+    if (!main_x) return 0;
+    runtime->main_x = main_x;
+    float *prefill_kv = realloc(runtime->dspark_prefill_kv,
+                                capacity * 3 * V4_REAL_HD * sizeof(float));
+    if (!prefill_kv) return 0;
+    runtime->dspark_prefill_kv = prefill_kv;
     runtime->token_capacity = capacity;
     return 1;
 }
@@ -53,13 +75,21 @@ static inline int v4_runtime_init(V4Runtime *runtime, const char *model_dir,
     memset(runtime, 0, sizeof(*runtime));
     runtime->max_context = max_context;
     st_init(&runtime->model, model_dir);
-    if (!v4_real_model_state_init(&runtime->state, max_context)) return 0;
+    if (!v4_real_model_state_init(&runtime->state, max_context) ||
+        !v4_real_dspark_state_init(&runtime->dspark_state)) return 0;
     runtime->logits = malloc((size_t)129280 * sizeof(float));
-    if (!runtime->logits || !v4_runtime_resize(runtime, 1)) {
+    runtime->dspark_stage_outputs = malloc(
+        (size_t)3 * 5 * V4_REAL_HC * V4_REAL_D * sizeof(float));
+    runtime->dspark_hidden = malloc((size_t)5 * V4_REAL_D * sizeof(float));
+    if (!runtime->logits || !runtime->dspark_stage_outputs ||
+        !runtime->dspark_hidden || !v4_runtime_resize(runtime, 1)) {
         v4_real_model_state_free(&runtime->state);
+        v4_real_dspark_state_free(&runtime->dspark_state);
         free(runtime->streams); free(runtime->head_hidden);
         free(runtime->head_normalized); free(runtime->logits);
-        free(runtime->target_means);
+        free(runtime->target_means); free(runtime->main_input);
+        free(runtime->main_x); free(runtime->dspark_prefill_kv);
+        free(runtime->dspark_stage_outputs); free(runtime->dspark_hidden);
         memset(runtime, 0, sizeof(*runtime));
         return 0;
     }
@@ -89,7 +119,30 @@ static inline void v4_runtime_reset(V4Runtime *runtime) {
                 state->index_gate_state[i] = -INFINITY;
         }
     }
+    memset(runtime->dspark_state.main_kv, 0,
+           (size_t)3 * 128 * V4_REAL_HD * sizeof(float));
+    runtime->dspark_state.next_position = 0;
+    runtime->dspark_ready = 0;
+    runtime->last_start_position = 0;
     runtime->last_count = 0;
+}
+
+static inline int v4_runtime_project_main(V4Runtime *runtime, int n_tokens) {
+    if (!runtime || n_tokens <= 0 || n_tokens > runtime->last_count) return 0;
+    for (int token = 0; token < n_tokens; token++)
+        for (int layer = 0; layer < 3; layer++)
+            memcpy(runtime->main_input
+                       + ((int64_t)token * 3 + layer) * V4_REAL_D,
+                   runtime->target_means
+                       + ((int64_t)layer * n_tokens + token) * V4_REAL_D,
+                   V4_REAL_D * sizeof(float));
+    if (!v4_real_fp8_batch(&runtime->model, "mtp.0.main_proj",
+                           runtime->main_input, n_tokens,
+                           V4_REAL_D, 3 * V4_REAL_D, runtime->main_x))
+        return 0;
+    return v4_real_norm_batch(&runtime->model, "mtp.0.main_norm.weight",
+                              runtime->main_x, n_tokens,
+                              V4_REAL_D, runtime->main_x);
 }
 
 static inline int v4_runtime_forward(V4Runtime *runtime, const int *token_ids,
@@ -98,6 +151,7 @@ static inline int v4_runtime_forward(V4Runtime *runtime, const int *token_ids,
         runtime->state.layers[0].next_position + n_tokens
             > runtime->max_context ||
         !v4_runtime_resize(runtime, n_tokens)) return 0;
+    int start_position = runtime->state.layers[0].next_position;
     V4RealBaseCapture base_capture = {
         .target_means = runtime->target_means,
     };
@@ -111,8 +165,56 @@ static inline int v4_runtime_forward(V4Runtime *runtime, const int *token_ids,
     };
     if (!v4_real_base_head_forward(&runtime->model, runtime->streams,
                                    n_tokens, &head_capture)) return 0;
+    runtime->last_start_position = start_position;
     runtime->last_count = n_tokens;
+    if (runtime->dspark_ready) {
+        if (!v4_runtime_project_main(runtime, n_tokens) ||
+            !v4_real_dspark_append_main(
+                &runtime->model, runtime->main_x, n_tokens, start_position,
+                &runtime->dspark_state, NULL)) return 0;
+    }
     if (logits) *logits = runtime->logits;
+    return 1;
+}
+
+static inline int v4_runtime_dspark_prefill(V4Runtime *runtime) {
+    if (!runtime || runtime->dspark_ready || runtime->last_count <= 0 ||
+        runtime->last_start_position != 0 ||
+        !v4_runtime_project_main(runtime, runtime->last_count)) return 0;
+    V4RealDSparkCapture capture = {
+        .prefill_kv = runtime->dspark_prefill_kv,
+        .stage_outputs = runtime->dspark_stage_outputs,
+        .hidden = runtime->dspark_hidden,
+        .output_ids = runtime->dspark_output_ids,
+        .confidence = runtime->dspark_confidence,
+    };
+    if (!v4_real_dspark_prefill(
+            &runtime->model, runtime->main_x, runtime->last_count,
+            &runtime->dspark_state, &capture)) return 0;
+    runtime->dspark_ready = 1;
+    return 1;
+}
+
+static inline int v4_runtime_dspark_propose(
+        V4Runtime *runtime, int input_id, int64_t output_ids[6],
+        float confidence[5]) {
+    if (!runtime || !runtime->dspark_ready || runtime->last_count != 1 ||
+        input_id < 0) return 0;
+    V4RealDSparkCapture capture = {
+        .prefill_kv = runtime->dspark_prefill_kv,
+        .stage_outputs = runtime->dspark_stage_outputs,
+        .hidden = runtime->dspark_hidden,
+        .output_ids = runtime->dspark_output_ids,
+        .confidence = runtime->dspark_confidence,
+    };
+    if (!v4_real_dspark_propose(
+            &runtime->model, runtime->main_x, runtime->last_start_position,
+            input_id, &runtime->dspark_state, &capture)) return 0;
+    if (output_ids)
+        memcpy(output_ids, runtime->dspark_output_ids,
+               6 * sizeof(int64_t));
+    if (confidence)
+        memcpy(confidence, runtime->dspark_confidence, 5 * sizeof(float));
     return 1;
 }
 
@@ -133,9 +235,12 @@ static inline int v4_runtime_argmax(const float *logits) {
 static inline void v4_runtime_free(V4Runtime *runtime) {
     if (!runtime) return;
     v4_real_model_state_free(&runtime->state);
+    v4_real_dspark_state_free(&runtime->dspark_state);
     free(runtime->streams); free(runtime->head_hidden);
     free(runtime->head_normalized); free(runtime->logits);
-    free(runtime->target_means);
+    free(runtime->target_means); free(runtime->main_input);
+    free(runtime->main_x); free(runtime->dspark_prefill_kv);
+    free(runtime->dspark_stage_outputs); free(runtime->dspark_hidden);
     memset(runtime, 0, sizeof(*runtime));
 }
 

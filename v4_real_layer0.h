@@ -1824,12 +1824,12 @@ static inline int v4_real_vocab_logits(shards *source, const float *input,
     return 1;
 }
 
-static inline int v4_real_dspark_prefill(
-        shards *source, const float *main_x, int n_main,
-        V4RealDSparkState *state, V4RealDSparkCapture *capture) {
+static inline int v4_real_dspark_append_main(
+        shards *source, const float *main_x, int n_main, int start_position,
+        V4RealDSparkState *state, float *capture_kv) {
     enum { STAGES = 3 };
     if (!source || !main_x || n_main <= 0 || !state || !state->main_kv ||
-        state->next_position != 0 || !capture || !capture->prefill_kv)
+        start_position < 0 || state->next_position != start_position)
         return 0;
     char name[128];
     float *projected = malloc((size_t)n_main * V4_REAL_HD * sizeof(float));
@@ -1843,16 +1843,17 @@ static inline int v4_real_dspark_prefill(
                                 V4_REAL_HD, projected)) goto fail;
         for (int token = 0; token < n_main; token++) {
             float *row = projected + (int64_t)token * V4_REAL_HD;
-            v4_real_rope(row, V4_REAL_HD, token, 0, 0);
+            int position = start_position + token;
+            v4_real_rope(row, V4_REAL_HD, position, 0, 0);
             memcpy(state->main_kv
-                       + ((int64_t)stage * 128 + token % 128) * V4_REAL_HD,
+                       + ((int64_t)stage * 128 + position % 128) * V4_REAL_HD,
                    row, V4_REAL_HD * sizeof(float));
         }
-        memcpy(capture->prefill_kv
-                   + (int64_t)stage * n_main * V4_REAL_HD,
-               projected, (size_t)n_main * V4_REAL_HD * sizeof(float));
+        if (capture_kv)
+            memcpy(capture_kv + (int64_t)stage * n_main * V4_REAL_HD,
+                   projected, (size_t)n_main * V4_REAL_HD * sizeof(float));
     }
-    state->next_position = n_main;
+    state->next_position = start_position + n_main;
     free(projected);
     return 1;
 fail:
@@ -1860,12 +1861,23 @@ fail:
     return 0;
 }
 
+static inline int v4_real_dspark_prefill(
+        shards *source, const float *main_x, int n_main,
+        V4RealDSparkState *state, V4RealDSparkCapture *capture) {
+    if (!capture || !capture->prefill_kv || !state || state->next_position != 0)
+        return 0;
+    return v4_real_dspark_append_main(
+        source, main_x, n_main, 0, state, capture->prefill_kv);
+}
+
 static inline int v4_real_dspark_propose(
         shards *source, const float *main_x, int start_position, int input_id,
         V4RealDSparkState *state, V4RealDSparkCapture *capture) {
     enum { STAGES = 3, DRAFT = 5, NOISE_ID = 128799, VOCAB = 129280 };
     if (!source || !main_x || start_position < 0 || input_id < 0 || !state ||
-        !state->main_kv || state->next_position != start_position || !capture ||
+        !state->main_kv ||
+        (state->next_position != start_position &&
+         state->next_position != start_position + 1) || !capture ||
         !capture->stage_outputs || !capture->hidden || !capture->output_ids ||
         !capture->confidence) return 0;
     char name[128];
@@ -1926,7 +1938,8 @@ static inline int v4_real_dspark_propose(
         for (int d = 0; d < 256; d++) sum += confidence_weight[V4_REAL_D + d] * embed[d];
         capture->confidence[position] = sum;
     }
-    state->next_position = start_position + 1;
+    if (state->next_position < start_position + 1)
+        state->next_position = start_position + 1;
     free(confidence_weight); free(markov_w2);
     free(streams); free(normalized); free(logits);
     return 1;
