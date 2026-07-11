@@ -159,7 +159,7 @@ test-v4-chat: fixture_dspark_chat/forward.safetensors v4_chat
 	PYTHON="$(PYTHON)" sh tests/test_v4_chat_cli.sh "$(DSPARK)" $<
 
 test-v4-chat-metal: fixture_dspark_chat/forward.safetensors v4_chat
-	FLOYD_METAL=1 FM_MIN_S=4 EXPECT_BACKEND=metal PYTHON="$(PYTHON)" \
+	FM_MIN_S=4 EXPECT_BACKEND=metal PYTHON="$(PYTHON)" \
 		sh tests/test_v4_chat_cli.sh "$(DSPARK)" $<
 
 test-v4-chat-backend: v4_chat
@@ -168,7 +168,7 @@ test-v4-chat-backend: v4_chat
 
 test-v4-chat-backend-metal: v4_chat
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
-	FLOYD_METAL=1 FM_MIN_S=4 sh tests/test_v4_chat_backend.sh "$(DSPARK)" metal
+	FM_MIN_S=4 sh tests/test_v4_chat_backend.sh "$(DSPARK)" metal
 
 test-v4-chat-spec: fixture_dspark_dspark_decode/oracle.safetensors v4_chat
 	sh tests/test_v4_chat_spec.sh "$(DSPARK)"
