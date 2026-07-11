@@ -30,16 +30,17 @@ static float max_error(const float *actual, const float *expected, int count) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle>\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle> <layers-3-4-oracle>\n", argv[0]);
         return 2;
     }
     enum { D = 4096, HC = 4, EXPERTS = 256, TOP_K = 6 };
-    shards model, oracle, oracle_0_2, oracle_3;
+    shards model, oracle, oracle_0_2, oracle_3, oracle_3_4;
     st_init(&model, argv[1]);
     st_init(&oracle, argv[2]);
     st_init(&oracle_0_2, argv[3]);
     st_init(&oracle_3, argv[4]);
+    st_init(&oracle_3_4, argv[5]);
     float input[HC * D], attn_post[HC], attn_comb[HC * HC], attn_collapsed[D];
     float attn_norm[D], attn_output[D], after_attn[HC * D];
     float ffn_post[HC], ffn_comb[HC * HC], ffn_collapsed[D], ffn_norm[D];
@@ -210,6 +211,66 @@ int main(int argc, char **argv) {
     free(expected_hca_kv); free(expected_hca_gate); free(expected_hca_output);
     free(expected_hca_scores); free(expected_hca_weights); free(expected_hca_indices);
     free(expected_hca_layer);
+
+    float *transition_streams = load_f32(&oracle_3_4, "layer.3.input", 4 * HC * D);
+    float transition_scores[4], transition_bias[4];
+    int64_t transition_ids[4], transition_routes[4 * TOP_K];
+    V4RealLayerCapture transition_capture = {
+        .index_scores = transition_scores,
+        .index_ids = transition_ids,
+        .block_bias = transition_bias,
+        .router_indices = transition_routes,
+    };
+    V4RealLayerState transition_hca, transition_csa;
+    CHECK(transition_streams);
+    CHECK(v4_real_layer_state_init(&transition_hca, 3, 4));
+    CHECK(v4_real_layer_forward_state(&model, 3, token_ids, 4,
+                                      transition_streams, &transition_hca, NULL));
+    float *expected_layer3 = load_f32(&oracle_3_4, "layer.3.output", 4 * HC * D);
+    CHECK(expected_layer3);
+    float transition_layer3_error = max_error(transition_streams, expected_layer3,
+                                              4 * HC * D);
+    CHECK(v4_kv_cache_count(&transition_hca.compressed) == 0);
+    CHECK(transition_hca.next_position == 4);
+    CHECK(v4_real_layer_state_init(&transition_csa, 4, 4));
+    CHECK(v4_real_layer_forward_state(&model, 4, token_ids, 4,
+                                      transition_streams, &transition_csa,
+                                      &transition_capture));
+    float *expected_layer4 = load_f32(&oracle_3_4, "layer.4.output", 4 * HC * D);
+    float *expected_layer4_kv = load_f32(&oracle_3_4, "layer.4.compressor.kv", 512);
+    float *expected_layer4_scores = load_f32(&oracle_3_4,
+                                             "layer.4.indexer.scores", 4);
+    int64_t expected_layer4_ids[4], expected_layer4_routes[4 * TOP_K];
+    st_read_raw(&oracle_3_4, "layer.4.indexer.indices", expected_layer4_ids, 0);
+    st_read_raw(&oracle_3_4, "layer.4.router.indices", expected_layer4_routes, 0);
+    CHECK(expected_layer4 && expected_layer4_kv && expected_layer4_scores);
+    float transition_layer4_error = max_error(transition_streams, expected_layer4,
+                                              4 * HC * D);
+    float transition_compress_error = max_error(
+        v4_kv_cache_key(&transition_csa.compressed, 0), expected_layer4_kv, 512);
+    float transition_index_error = max_error(transition_scores,
+                                             expected_layer4_scores, 4);
+    int transition_index_hits = 0, transition_route_hits = 0, transition_bias_hits = 0;
+    for (int i = 0; i < 4; i++) {
+        if (transition_ids[i] == expected_layer4_ids[i]) transition_index_hits++;
+        if ((transition_ids[i] >= 0 && transition_bias[i] == 0.0f) ||
+            (transition_ids[i] < 0 && isinf(transition_bias[i]) &&
+             transition_bias[i] < 0.0f)) transition_bias_hits++;
+    }
+    for (int i = 0; i < 4 * TOP_K; i++)
+        if (transition_routes[i] == expected_layer4_routes[i]) transition_route_hits++;
+    printf("v4 real layers 3-4: layer3=%.9g layer4=%.9g compress=%.9g indexer=%.9g indices=%d/4 bias=%d/4 routes=%d/24\n",
+           transition_layer3_error, transition_layer4_error,
+           transition_compress_error, transition_index_error,
+           transition_index_hits, transition_bias_hits, transition_route_hits);
+    CHECK(transition_layer3_error < 3e-4f && transition_layer4_error < 3e-4f);
+    CHECK(transition_compress_error < 3e-4f && transition_index_error < 3e-4f);
+    CHECK(transition_index_hits == 4 && transition_bias_hits == 4);
+    CHECK(transition_route_hits == 4 * TOP_K);
+    v4_real_layer_state_free(&transition_hca);
+    v4_real_layer_state_free(&transition_csa);
+    free(transition_streams); free(expected_layer3); free(expected_layer4);
+    free(expected_layer4_kv); free(expected_layer4_scores);
     puts("v4 real layer0 tests: ok");
     return 0;
 }
