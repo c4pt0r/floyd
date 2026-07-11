@@ -9,6 +9,7 @@ from tools.make_v4_real_layer0_oracle import (
     write_layer0_oracle,
     write_layer3_hca_oracle,
     write_layers_0_2_oracle,
+    write_layers_3_4_oracle,
 )
 
 
@@ -83,8 +84,27 @@ def test_real_layer3_hca_oracle():
                     assert torch.isfinite(tensor).all()
 
 
+def test_real_layers_3_4_oracle():
+    model_dir = os.environ["DSPARK"]
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp) / "layers_3_4.safetensors"
+        write_layers_3_4_oracle(model_dir, output, [3, 14, 15, 9])
+        with safe_open(output, framework="pt") as oracle:
+            for layer in (3, 4):
+                assert oracle.get_slice(f"layer.{layer}.input").get_shape() == [4, 4, 4096]
+                assert oracle.get_slice(f"layer.{layer}.output").get_shape() == [4, 4, 4096]
+            assert oracle.get_slice("layer.3.hca.kv").get_shape() == [4, 512]
+            assert oracle.get_slice("layer.3.hca.gate").get_shape() == [4, 512]
+            assert oracle.get_slice("layer.3.hca.output").get_shape() == [0, 512]
+            assert oracle.get_slice("layer.4.compressor.kv").get_shape() == [1, 512]
+            assert oracle.get_slice("layer.4.indexer.scores").get_shape() == [4, 1]
+            assert oracle.get_slice("layer.4.indexer.indices").get_shape() == [4, 1]
+            assert oracle.get_slice("layer.4.router.indices").get_shape() == [4, 6]
+
+
 if __name__ == "__main__":
     test_real_layer0_oracle()
     test_real_layers_0_2_oracle()
     test_real_layer3_hca_oracle()
+    test_real_layers_3_4_oracle()
     print("v4 real layer0 oracle tests: ok")
