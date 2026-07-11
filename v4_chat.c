@@ -11,6 +11,37 @@ static int v4_chat_trace_enabled(void) {
     return value && atoi(value) != 0;
 }
 
+static int v4_chat_backend_init(void) {
+    int requested = getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL")) != 0;
+#ifdef FLOYD_METAL
+    if (requested) {
+        int min_batch = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;
+        if (!v4_quant_backend_enable_metal(min_batch)) {
+            fprintf(stderr, "V4 Metal requested but unavailable or FM_MIN_S < 2\n");
+            return 0;
+        }
+        fprintf(stderr, "V4_BACKEND backend=metal device=%s min_batch=%d\n",
+                fm_device_name(), v4_quant_backend_min_batch());
+    } else {
+        fprintf(stderr, "V4_BACKEND backend=cpu\n");
+    }
+#else
+    if (requested) {
+        fprintf(stderr, "FLOYD_METAL requires: make METAL=1 v4_chat\n");
+        return 0;
+    }
+    fprintf(stderr, "V4_BACKEND backend=cpu\n");
+#endif
+    return 1;
+}
+
+static void v4_chat_print_backend_stats(V4QuantBackendStats before) {
+    V4QuantBackendStats after = v4_quant_backend_stats();
+    fprintf(stderr, "V4_MATMUL metal_calls=%llu cpu_fallbacks=%llu\n",
+            (unsigned long long)(after.metal_calls - before.metal_calls),
+            (unsigned long long)(after.cpu_fallbacks - before.cpu_fallbacks));
+}
+
 static int v4_chat_emit(Tok *tokenizer, int token_id) {
     char bytes[4096];
     int count = tok_decode(tokenizer, &token_id, 1, bytes, sizeof(bytes) - 1);
@@ -112,6 +143,7 @@ static int v4_chat_generate_spec(V4Runtime *runtime, Tok *tokenizer,
 static int v4_chat_turn(V4Runtime *runtime, Tok *tokenizer, const char *text,
                         int first_turn, int max_new_tokens, int close_turn,
                         int use_spec) {
+    V4QuantBackendStats stats_before = v4_quant_backend_stats();
     size_t text_size = strlen(text);
     size_t prompt_cap = text_size + 256;
     char *prompt = malloc(prompt_cap);
@@ -144,11 +176,13 @@ static int v4_chat_turn(V4Runtime *runtime, Tok *tokenizer, const char *text,
         if (max_new_tokens > available) max_new_tokens = available;
     }
     if (max_new_tokens <= 0) return -1;
-    return use_spec
+    int result = use_spec
          ? v4_chat_generate_spec(runtime, tokenizer, logits,
                                  max_new_tokens, close_turn)
          : v4_chat_generate(runtime, tokenizer, logits,
                             max_new_tokens, close_turn);
+    v4_chat_print_backend_stats(stats_before);
+    return result;
 }
 
 int main(int argc, char **argv) {
@@ -166,6 +200,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "max_context and max_new_tokens must be positive\n");
         return 2;
     }
+    if (!v4_chat_backend_init()) return 2;
 
     char tokenizer_path[2048];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", argv[1]);

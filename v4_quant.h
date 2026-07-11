@@ -19,7 +19,7 @@ static V4QuantBackendStats v4_quant_stats;
 
 static inline int v4_quant_backend_enable_metal(int min_batch) {
 #ifdef FLOYD_METAL
-    if (min_batch <= 0 || !fm_init()) return 0;
+    if (min_batch < 2 || !fm_init()) return 0;
     v4_quant_metal_min_batch = min_batch;
     v4_quant_metal_enabled = 1;
     return 1;
