@@ -44,11 +44,12 @@ softmax, sigmoid, and square-root-softplus expert affinity while keeping
 selection bias separate from mixture weights. Moonlight now uses this shared
 path without changing its routing results. `moe_exec.h` provides the F32
 reference execution path for learned and hash routing, clamped SwiGLU, and
-shared experts. `v4_hc.h` provides the F32 mHC/Sinkhorn reference. Attention,
-`v4_attention.h` provides the full-sequence F32 sliding-attention reference.
-KV cache and production weight loading remain architecture-specific; DeepSeek
-V4 CSA/HCA compressors and indexer, optimized FP4/FP8 kernels, and DSpark
-decoding are not yet implemented.
+shared experts. `v4_hc.h` provides the F32 mHC/Sinkhorn reference, and
+`v4_attention.h` provides full-sequence and cached sliding attention. The V4
+references also cover CSA/HCA compression, Lightning Indexer selection, native
+packed FP4/FP8 matmul, and official checkpoint manifest loading. The real
+layer-0 gate runs official attention, mHC, hash routing, routed FP4 experts, and
+the shared FP8 expert. Full 43-layer execution and DSpark decoding remain open.
 
 Generate the deterministic CPU-sized V4 architecture oracle with:
 
@@ -57,11 +58,19 @@ Generate the deterministic CPU-sized V4 architecture oracle with:
 make test-v4-moe
 make test-v4-hc
 make test-v4-attention
+
+# official checkpoint gates (model files remain external and ignored)
+DSPARK=/path/to/DeepSeek-V4-Flash-DSpark make test-v4-native-quant
+DSPARK=/path/to/DeepSeek-V4-Flash-DSpark make test-v4-model-manifest
+PYTHON=.venv/bin/python DSPARK=/path/to/DeepSeek-V4-Flash-DSpark \
+  make test-v4-real-layer0
 ```
 
 This creates ignored `fixture_tiny_v4/` and `ref_v4_tiny.json` artifacts. The
 fixture covers sliding/HCA/CSA attention, mHC, hash MoE, and learned
 sqrt-softplus routing; it is a correctness target, not a performance model.
+Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
+CSA/Lightning Indexer block integration point is layer 2.
 
 ## What's *not* here (scope)
 
