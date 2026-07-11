@@ -468,6 +468,50 @@ def write_layers_3_4_oracle(model_dir, output_path, token_ids):
     save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
 
 
+def write_base_forward_oracle(model_dir, output_path, token_ids):
+    assert len(token_ids) == 4
+    torch.set_num_threads(8)
+    checkpoint = Checkpoint(model_dir)
+    streams = torch.stack([checkpoint.row("embed.weight", token).float() for token in token_ids])
+    streams = streams[:, None, :].repeat(1, 4, 1)
+    captures = {}
+    capture_layers = {4, 20, 40, 41, 42}
+    for layer in range(43):
+        scratch = {}
+        collapsed, post, comb = hc_batch(checkpoint, layer, "attn", streams)
+        hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.attn_norm.weight"))
+        streams = hc_post_batch(
+            attention_batch(checkpoint, layer, hidden, scratch), streams, post, comb
+        )
+        collapsed, post, comb = hc_batch(checkpoint, layer, "ffn", streams)
+        hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.ffn_norm.weight"))
+        streams = hc_post_batch(
+            moe_batch(checkpoint, layer, hidden, token_ids), streams, post, comb
+        )
+        if layer in capture_layers:
+            captures[f"layer.{layer}.output"] = streams.clone()
+        if layer in (40, 41, 42):
+            captures[f"layer.{layer}.mean"] = streams.mean(1)
+
+    flat = streams.flatten(1).float()
+    normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+    mixes = F.linear(normalized, checkpoint.tensor("hc_head_fn").float())
+    pre = torch.sigmoid(
+        mixes * checkpoint.tensor("hc_head_scale").float()
+        + checkpoint.tensor("hc_head_base").float()
+    ) + 1e-6
+    final_hidden = (pre.unsqueeze(-1) * streams.float()).sum(1)
+    final_norm = norm_batch(final_hidden, checkpoint.tensor("norm.weight"))
+    logits = dense_linear(checkpoint, "head.weight", final_norm[-1])
+    captures["final.hidden"] = final_hidden
+    captures["final.norm"] = final_norm
+    captures["final.logits"] = logits
+    captures["final.argmax"] = logits.argmax().reshape(1)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -475,6 +519,7 @@ def main():
     parser.add_argument("--layers-0-2-output")
     parser.add_argument("--layer3-hca-output")
     parser.add_argument("--layers-3-4-output")
+    parser.add_argument("--base-forward-output")
     parser.add_argument("--token-id", type=int, default=3)
     args = parser.parse_args()
     write_layer0_oracle(args.model, args.output, args.token_id)
@@ -484,6 +529,8 @@ def main():
         write_layer3_hca_oracle(args.model, args.layer3_hca_output, [3] * 128)
     if args.layers_3_4_output:
         write_layers_3_4_oracle(args.model, args.layers_3_4_output, [3, 14, 15, 9])
+    if args.base_forward_output:
+        write_base_forward_oracle(args.model, args.base_forward_output, [3, 14, 15, 9])
     print(f"saved {args.output}")
 
 
