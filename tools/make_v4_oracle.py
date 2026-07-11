@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from transformers import DeepseekV4Config, DeepseekV4ForCausalLM
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb
 
 
 PROMPT_IDS = [3, 14, 15, 9, 26, 5, 35, 8]
@@ -225,6 +226,20 @@ def build_compressor_captures(model):
     return captures
 
 
+def build_sliding_key_capture(model, attention_input):
+    attention = model.model.layers[0].self_attn
+    hidden = attention_input.unsqueeze(0)
+    positions = torch.arange(hidden.shape[1], dtype=torch.long).unsqueeze(0)
+    with torch.no_grad():
+        key = attention.kv_norm(attention.kv_proj(hidden))
+        key = key.view(1, hidden.shape[1], -1, attention.head_dim).transpose(1, 2)
+        cosine, sine = model.model.rotary_emb(
+            hidden, position_ids=positions, layer_type="main"
+        )
+        key = apply_rotary_pos_emb(key, cosine, sine)
+    return key[0, 0].float().contiguous()
+
+
 def write_tiny(out_dir, ref_path, ngen=8):
     out_dir = Path(out_dir)
     ref_path = Path(ref_path)
@@ -247,6 +262,9 @@ def write_tiny(out_dir, ref_path, ngen=8):
         oracle[f"router.{i}"] = router.float().contiguous().clone()
     oracle.update(moe_captures)
     oracle.update(build_compressor_captures(model))
+    oracle["attn.0.keys"] = build_sliding_key_capture(
+        model, moe_captures["attn.0.input"]
+    )
     save_file(oracle, out_dir / "oracle.safetensors")
 
     reference = {
