@@ -7,6 +7,7 @@ from safetensors import safe_open
 
 from tools.make_v4_real_layer0_oracle import (
     write_layer0_oracle,
+    write_base_forward_oracle,
     write_layer3_hca_oracle,
     write_layers_0_2_oracle,
     write_layers_3_4_oracle,
@@ -102,9 +103,26 @@ def test_real_layers_3_4_oracle():
             assert oracle.get_slice("layer.4.router.indices").get_shape() == [4, 6]
 
 
+def test_real_base_forward_oracle():
+    model_dir = os.environ["DSPARK"]
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp) / "base_forward.safetensors"
+        write_base_forward_oracle(model_dir, output, [3, 14, 15, 9])
+        with safe_open(output, framework="pt") as oracle:
+            for layer in (4, 20, 40, 41, 42):
+                assert oracle.get_slice(f"layer.{layer}.output").get_shape() == [4, 4, 4096]
+            for layer in (40, 41, 42):
+                assert oracle.get_slice(f"layer.{layer}.mean").get_shape() == [4, 4096]
+            assert oracle.get_slice("final.hidden").get_shape() == [4, 4096]
+            assert oracle.get_slice("final.norm").get_shape() == [4, 4096]
+            assert oracle.get_slice("final.logits").get_shape() == [129280]
+            assert oracle.get_slice("final.argmax").get_shape() == [1]
+
+
 if __name__ == "__main__":
     test_real_layer0_oracle()
     test_real_layers_0_2_oracle()
     test_real_layer3_hca_oracle()
     test_real_layers_3_4_oracle()
+    test_real_base_forward_oracle()
     print("v4 real layer0 oracle tests: ok")
