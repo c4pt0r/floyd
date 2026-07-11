@@ -210,7 +210,7 @@ test-deepseek-v4-chat-backend: floyd
 
 test-deepseek-v4-chat-backend-metal: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
-	FM_MIN_S=4 sh tests/test_deepseek_v4_chat_backend.sh "$(DSPARK)" metal
+	sh tests/test_deepseek_v4_chat_backend.sh "$(DSPARK)" metal-ggml
 
 test-deepseek-v4-chat-spec: fixture_dspark_dspark_decode/oracle.safetensors floyd
 	sh tests/test_deepseek_v4_chat_spec.sh "$(DSPARK)"
