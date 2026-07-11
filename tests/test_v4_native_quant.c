@@ -53,7 +53,7 @@ static int top1(const float *values, int count) {
 }
 
 static int test_official_fp8(shards *source, float *max_abs, int *top1_matches) {
-    enum { ROWS = 256, COLUMNS = 256, BLOCK = 128, INPUTS = 2 };
+    enum { ROWS = 256, COLUMNS = 256, BLOCK = 128, INPUTS = 4 };
     const char *weight_name = "layers.0.attn.wq_a.weight";
     const char *scale_name = "layers.0.attn.wq_a.scale";
     st_tensor *weight_tensor = st_find(source, weight_name);
@@ -92,7 +92,7 @@ static int test_official_fp8(shards *source, float *max_abs, int *top1_matches) 
 }
 
 static int test_official_fp4(shards *source, float *max_abs, int *top1_matches) {
-    enum { ROWS = 16, COLUMNS = 256, SCALE_BLOCK = 32, INPUTS = 2 };
+    enum { ROWS = 16, COLUMNS = 256, SCALE_BLOCK = 32, INPUTS = 4 };
     const char *weight_name = "layers.0.ffn.experts.0.w1.weight";
     const char *scale_name = "layers.0.ffn.experts.0.w1.scale";
     st_tensor *weight_tensor = st_find(source, weight_name);
@@ -136,14 +136,26 @@ int main(int argc, char **argv) {
     }
     shards source;
     st_init(&source, argv[1]);
+#ifdef FLOYD_METAL
+    CHECK(v4_quant_backend_enable_metal(4));
+    v4_quant_backend_reset_stats();
+#endif
     float fp4_error, fp8_error;
     int fp4_top1, fp8_top1;
     CHECK(test_official_fp4(&source, &fp4_error, &fp4_top1) == 0);
     CHECK(test_official_fp8(&source, &fp8_error, &fp8_top1) == 0);
-    printf("v4 native FP4: max_abs=%.9g top1=%d/2\n", fp4_error, fp4_top1);
-    printf("v4 native FP8: max_abs=%.9g top1=%d/2\n", fp8_error, fp8_top1);
-    CHECK(fp4_error < 3e-5f && fp4_top1 == 2);
-    CHECK(fp8_error < 3e-5f && fp8_top1 == 2);
+    printf("v4 native FP4: max_abs=%.9g top1=%d/4\n", fp4_error, fp4_top1);
+    printf("v4 native FP8: max_abs=%.9g top1=%d/4\n", fp8_error, fp8_top1);
+    CHECK(fp4_error < 3e-5f && fp4_top1 == 4);
+    CHECK(fp8_error < 3e-5f && fp8_top1 == 4);
+#ifdef FLOYD_METAL
+    V4QuantBackendStats stats = v4_quant_backend_stats();
+    printf("v4 native Metal: calls=%llu cpu_fallbacks=%llu\n",
+           (unsigned long long)stats.metal_calls,
+           (unsigned long long)stats.cpu_fallbacks);
+    CHECK(stats.metal_calls == 2);
+    CHECK(stats.cpu_fallbacks == 0);
+#endif
     puts("v4 native quantized matmul tests: ok");
     return 0;
 }
