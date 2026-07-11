@@ -102,6 +102,30 @@ typedef struct {
     float *logits;
 } V4RealHeadCapture;
 
+typedef struct {
+    float *main_kv;
+} V4RealDSparkState;
+
+typedef struct {
+    float *prefill_kv;
+    float *stage_outputs;
+    float *hidden;
+    int64_t *output_ids;
+    float *confidence;
+} V4RealDSparkCapture;
+
+static inline int v4_real_dspark_state_init(V4RealDSparkState *state) {
+    if (!state) return 0;
+    state->main_kv = calloc((size_t)3 * 128 * V4_REAL_HD, sizeof(float));
+    return state->main_kv != NULL;
+}
+
+static inline void v4_real_dspark_state_free(V4RealDSparkState *state) {
+    if (!state) return;
+    free(state->main_kv);
+    memset(state, 0, sizeof(*state));
+}
+
 static inline int v4_real_layer_ratio(int layer) {
     if (layer < 0 || layer > 42) return -1;
     if (layer < 2) return 0;
@@ -1314,6 +1338,394 @@ static inline int v4_real_base_head_forward(shards *source,
     }
     free(raw);
     return 1;
+}
+
+static inline int v4_real_hc_named(shards *source, const char *prefix,
+                                    const char *site, const float *input,
+                                    int n_tokens, float *post, float *comb,
+                                    float *collapsed) {
+    char name[320];
+    snprintf(name, sizeof(name), "%s.hc_%s_fn", prefix, site);
+    float *fn = v4_real_read_f32(source, name);
+    snprintf(name, sizeof(name), "%s.hc_%s_base", prefix, site);
+    float *base = v4_real_read_f32(source, name);
+    snprintf(name, sizeof(name), "%s.hc_%s_scale", prefix, site);
+    float *scale = v4_real_read_f32(source, name);
+    if (!fn || !base || !scale) { free(fn); free(base); free(scale); return 0; }
+    V4HyperConnection model = {
+        .streams = V4_REAL_HC, .hidden = V4_REAL_D, .sinkhorn_iters = 20,
+        .norm_eps = 1e-6f, .hc_eps = 1e-6f, .fn = fn, .base = base, .scale = scale,
+    };
+    int ok = v4_hc_forward(&model, input, n_tokens, post, comb, collapsed);
+    free(fn); free(base); free(scale);
+    return ok;
+}
+
+static inline int v4_real_moe_named(shards *source, const char *prefix,
+                                     const float *hidden, int n_tokens,
+                                     float *output) {
+    char name[320], expert_prefix[320];
+    snprintf(name, sizeof(name), "%s.gate.weight", prefix);
+    float *router = v4_real_read_f32(source, name);
+    snprintf(name, sizeof(name), "%s.gate.bias", prefix);
+    float *bias = v4_real_read_f32(source, name);
+    float *expert_output = malloc(V4_REAL_D * sizeof(float));
+    if (!router || !bias || !expert_output) {
+        free(router); free(bias); free(expert_output); return 0;
+    }
+    for (int token = 0; token < n_tokens; token++) {
+        const float *input = hidden + (int64_t)token * V4_REAL_D;
+        float logits[V4_REAL_EXPERTS], scores[V4_REAL_EXPERTS];
+        float selection[V4_REAL_EXPERTS], weights[V4_REAL_TOPK];
+        int indices[V4_REAL_TOPK];
+        v4_real_matvec(logits, router, input, V4_REAL_EXPERTS, V4_REAL_D);
+        if (moe_route_select(logits, bias, V4_REAL_EXPERTS, V4_REAL_TOPK,
+                             MOE_SCORE_SQRT_SOFTPLUS, indices, weights,
+                             scores, selection) != V4_REAL_TOPK) goto fail;
+        moe_route_finalize(weights, V4_REAL_TOPK, 1, 1.5f);
+        float *token_output = output + (int64_t)token * V4_REAL_D;
+        memset(token_output, 0, V4_REAL_D * sizeof(float));
+        for (int k = 0; k < V4_REAL_TOPK; k++) {
+            snprintf(expert_prefix, sizeof(expert_prefix), "%s.experts.%d",
+                     prefix, indices[k]);
+            if (!v4_real_expert(source, expert_prefix, input, 1,
+                                weights[k], expert_output)) goto fail;
+            for (int d = 0; d < V4_REAL_D; d++) token_output[d] += expert_output[d];
+        }
+        snprintf(expert_prefix, sizeof(expert_prefix), "%s.shared_experts", prefix);
+        if (!v4_real_expert(source, expert_prefix, input, 0, 1.0f,
+                            expert_output)) goto fail;
+        for (int d = 0; d < V4_REAL_D; d++) token_output[d] += expert_output[d];
+    }
+    free(router); free(bias); free(expert_output);
+    return 1;
+fail:
+    free(router); free(bias); free(expert_output);
+    return 0;
+}
+
+static inline int v4_real_dspark_attention(
+        shards *source, int stage, const float *hidden, const float *main_x,
+        int start_position, V4RealDSparkState *state, float *output) {
+    enum { TOKENS = 5, KEYS = 10 };
+    char prefix[320], name[320];
+    snprintf(prefix, sizeof(prefix), "mtp.%d.attn", stage);
+    float *main_kv = state->main_kv + (int64_t)stage * 128 * V4_REAL_HD;
+    float decode_kv[V4_REAL_HD];
+    snprintf(name, sizeof(name), "%s.wkv", prefix);
+    if (!v4_real_fp8_batch(source, name, main_x, 1,
+                           V4_REAL_HD, V4_REAL_D, decode_kv)) return 0;
+    snprintf(name, sizeof(name), "%s.kv_norm.weight", prefix);
+    if (!v4_real_norm_batch(source, name, decode_kv, 1,
+                            V4_REAL_HD, decode_kv)) return 0;
+    v4_real_rope(decode_kv, V4_REAL_HD, start_position, 0, 0);
+    memcpy(main_kv + (int64_t)start_position * V4_REAL_HD,
+           decode_kv, V4_REAL_HD * sizeof(float));
+
+    float *q_a = malloc(TOKENS * V4_REAL_QR * sizeof(float));
+    float *q_norm = malloc(TOKENS * V4_REAL_QR * sizeof(float));
+    float *q = malloc((size_t)TOKENS * V4_REAL_HEADS * V4_REAL_HD * sizeof(float));
+    float *kv = malloc(TOKENS * V4_REAL_HD * sizeof(float));
+    float *keys = malloc(KEYS * V4_REAL_HD * sizeof(float));
+    float *context = malloc((size_t)TOKENS * V4_REAL_HEADS * V4_REAL_HD * sizeof(float));
+    float *group_input = malloc(TOKENS * 4096 * sizeof(float));
+    float *group_output = malloc(TOKENS * 1024 * sizeof(float));
+    float *grouped = malloc(TOKENS * 8192 * sizeof(float));
+    if (!q_a || !q_norm || !q || !kv || !keys || !context || !group_input ||
+        !group_output || !grouped) goto fail;
+    snprintf(name, sizeof(name), "%s.wq_a", prefix);
+    if (!v4_real_fp8_batch(source, name, hidden, TOKENS,
+                           V4_REAL_QR, V4_REAL_D, q_a)) goto fail;
+    snprintf(name, sizeof(name), "%s.q_norm.weight", prefix);
+    if (!v4_real_norm_batch(source, name, q_a, TOKENS,
+                            V4_REAL_QR, q_norm)) goto fail;
+    snprintf(name, sizeof(name), "%s.wq_b", prefix);
+    if (!v4_real_fp8_batch(source, name, q_norm, TOKENS,
+                           V4_REAL_HEADS * V4_REAL_HD, V4_REAL_QR, q)) goto fail;
+    snprintf(name, sizeof(name), "%s.wkv", prefix);
+    if (!v4_real_fp8_batch(source, name, hidden, TOKENS,
+                           V4_REAL_HD, V4_REAL_D, kv)) goto fail;
+    snprintf(name, sizeof(name), "%s.kv_norm.weight", prefix);
+    if (!v4_real_norm_batch(source, name, kv, TOKENS,
+                            V4_REAL_HD, kv)) goto fail;
+    for (int token = 0; token < TOKENS; token++) {
+        int position = start_position + 1 + token;
+        v4_real_rope(kv + (int64_t)token * V4_REAL_HD,
+                     V4_REAL_HD, position, 0, 0);
+        for (int head = 0; head < V4_REAL_HEADS; head++) {
+            float *query = q + ((int64_t)token * V4_REAL_HEADS + head)
+                             * V4_REAL_HD;
+            float mean_square = 0.0f;
+            for (int d = 0; d < V4_REAL_HD; d++) mean_square += query[d] * query[d];
+            float scale = 1.0f / sqrtf(mean_square / V4_REAL_HD + 1e-6f);
+            for (int d = 0; d < V4_REAL_HD; d++) query[d] *= scale;
+            v4_real_rope(query, V4_REAL_HD, position, 0, 0);
+        }
+    }
+    memcpy(keys, main_kv, (size_t)(start_position + 1) * V4_REAL_HD * sizeof(float));
+    memcpy(keys + (int64_t)(start_position + 1) * V4_REAL_HD, kv,
+           TOKENS * V4_REAL_HD * sizeof(float));
+    snprintf(name, sizeof(name), "%s.attn_sink", prefix);
+    float *sinks = v4_real_read_f32(source, name);
+    if (!sinks) goto fail;
+    float attention_scale = 1.0f / sqrtf((float)V4_REAL_HD);
+    for (int token = 0; token < TOKENS; token++)
+        for (int head = 0; head < V4_REAL_HEADS; head++) {
+            const float *query = q + ((int64_t)token * V4_REAL_HEADS + head)
+                                   * V4_REAL_HD;
+            float scores[KEYS], maximum = sinks[head];
+            for (int key = 0; key < KEYS; key++) {
+                float score = 0.0f;
+                for (int d = 0; d < V4_REAL_HD; d++)
+                    score += query[d] * keys[(int64_t)key * V4_REAL_HD + d];
+                scores[key] = score * attention_scale;
+                if (scores[key] > maximum) maximum = scores[key];
+            }
+            float denominator = expf(sinks[head] - maximum);
+            float *result = context
+                + ((int64_t)token * V4_REAL_HEADS + head) * V4_REAL_HD;
+            memset(result, 0, V4_REAL_HD * sizeof(float));
+            for (int key = 0; key < KEYS; key++) {
+                float probability = expf(scores[key] - maximum);
+                denominator += probability;
+                for (int d = 0; d < V4_REAL_HD; d++)
+                    result[d] += probability
+                               * keys[(int64_t)key * V4_REAL_HD + d];
+            }
+            for (int d = 0; d < V4_REAL_HD; d++) result[d] /= denominator;
+            v4_real_rope(result, V4_REAL_HD, start_position + 1 + token, 0, 1);
+        }
+    free(sinks);
+    snprintf(name, sizeof(name), "%s.wo_a.weight", prefix);
+    uint8_t *wo_a = v4_real_read_raw(source, name);
+    snprintf(name, sizeof(name), "%s.wo_a.scale", prefix);
+    uint8_t *wo_a_scale = v4_real_read_raw(source, name);
+    if (!wo_a || !wo_a_scale) { free(wo_a); free(wo_a_scale); goto fail; }
+    for (int group = 0; group < 8; group++) {
+        for (int token = 0; token < TOKENS; token++)
+            memcpy(group_input + (int64_t)token * 4096,
+                   context + ((int64_t)token * V4_REAL_HEADS + group * 8)
+                             * V4_REAL_HD, 4096 * sizeof(float));
+        if (!v4_fp8_matmul_f32(group_output, group_input, TOKENS,
+                wo_a + (int64_t)group * 1024 * 4096,
+                wo_a_scale + (int64_t)group * 8 * 32,
+                1024, 4096, 128)) {
+            free(wo_a); free(wo_a_scale); goto fail;
+        }
+        for (int token = 0; token < TOKENS; token++)
+            memcpy(grouped + (int64_t)token * 8192 + group * 1024,
+                   group_output + (int64_t)token * 1024, 1024 * sizeof(float));
+    }
+    free(wo_a); free(wo_a_scale);
+    snprintf(name, sizeof(name), "%s.wo_b", prefix);
+    int ok = v4_real_fp8_batch(source, name, grouped, TOKENS,
+                               V4_REAL_D, 8192, output);
+    free(q_a); free(q_norm); free(q); free(kv); free(keys); free(context);
+    free(group_input); free(group_output); free(grouped);
+    return ok;
+fail:
+    free(q_a); free(q_norm); free(q); free(kv); free(keys); free(context);
+    free(group_input); free(group_output); free(grouped);
+    return 0;
+}
+
+static inline int v4_real_dspark_stage(
+        shards *source, int stage, float *streams, const float *main_x,
+        V4RealDSparkState *state) {
+    enum { TOKENS = 5 };
+    char prefix[64], name[128];
+    snprintf(prefix, sizeof(prefix), "mtp.%d", stage);
+    float *post = malloc(TOKENS * V4_REAL_HC * sizeof(float));
+    float *comb = malloc(TOKENS * V4_REAL_HC * V4_REAL_HC * sizeof(float));
+    float *collapsed = malloc(TOKENS * V4_REAL_D * sizeof(float));
+    float *hidden = malloc(TOKENS * V4_REAL_D * sizeof(float));
+    float *block = malloc(TOKENS * V4_REAL_D * sizeof(float));
+    float *residual = malloc((size_t)TOKENS * V4_REAL_HC * V4_REAL_D * sizeof(float));
+    if (!post || !comb || !collapsed || !hidden || !block || !residual) goto fail;
+    if (!v4_real_hc_named(source, prefix, "attn", streams, TOKENS,
+                          post, comb, collapsed)) goto fail;
+    snprintf(name, sizeof(name), "%s.attn_norm.weight", prefix);
+    if (!v4_real_norm_batch(source, name, collapsed, TOKENS,
+                            V4_REAL_D, hidden)) goto fail;
+    if (!v4_real_dspark_attention(source, stage, hidden, main_x, 4,
+                                  state, block)) goto fail;
+    v4_real_hc_post_batch(residual, block, streams, post, comb, TOKENS);
+    if (!v4_real_hc_named(source, prefix, "ffn", residual, TOKENS,
+                          post, comb, collapsed)) goto fail;
+    snprintf(name, sizeof(name), "%s.ffn_norm.weight", prefix);
+    if (!v4_real_norm_batch(source, name, collapsed, TOKENS,
+                            V4_REAL_D, hidden)) goto fail;
+    snprintf(name, sizeof(name), "%s.ffn", prefix);
+    if (!v4_real_moe_named(source, name, hidden, TOKENS, block)) goto fail;
+    v4_real_hc_post_batch(streams, block, residual, post, comb, TOKENS);
+    free(post); free(comb); free(collapsed); free(hidden); free(block); free(residual);
+    return 1;
+fail:
+    free(post); free(comb); free(collapsed); free(hidden); free(block); free(residual);
+    return 0;
+}
+
+static inline int v4_real_hc_head_named(shards *source, const char *prefix,
+                                         const float *streams, int n_tokens,
+                                         float *hidden) {
+    char name[128];
+    snprintf(name, sizeof(name), "%s.hc_head_fn", prefix);
+    float *fn = v4_real_read_f32(source, name);
+    snprintf(name, sizeof(name), "%s.hc_head_base", prefix);
+    float *base = v4_real_read_f32(source, name);
+    snprintf(name, sizeof(name), "%s.hc_head_scale", prefix);
+    float *scale = v4_real_read_f32(source, name);
+    if (!fn || !base || !scale) { free(fn); free(base); free(scale); return 0; }
+    for (int token = 0; token < n_tokens; token++) {
+        const float *input = streams
+            + (int64_t)token * V4_REAL_HC * V4_REAL_D;
+        float mean_square = 0.0f;
+        for (int i = 0; i < V4_REAL_HC * V4_REAL_D; i++)
+            mean_square += input[i] * input[i];
+        float inv_rms = 1.0f / sqrtf(
+            mean_square / (V4_REAL_HC * V4_REAL_D) + 1e-6f);
+        float pre[V4_REAL_HC];
+        for (int row = 0; row < V4_REAL_HC; row++) {
+            float mix = 0.0f;
+            const float *weight = fn
+                + (int64_t)row * V4_REAL_HC * V4_REAL_D;
+            for (int i = 0; i < V4_REAL_HC * V4_REAL_D; i++)
+                mix += weight[i] * input[i];
+            pre[row] = v4_hc_sigmoid(mix * inv_rms * scale[0] + base[row])
+                     + 1e-6f;
+        }
+        float *out = hidden + (int64_t)token * V4_REAL_D;
+        for (int d = 0; d < V4_REAL_D; d++) {
+            float sum = 0.0f;
+            for (int stream = 0; stream < V4_REAL_HC; stream++)
+                sum += pre[stream] * input[(int64_t)stream * V4_REAL_D + d];
+            out[d] = sum;
+        }
+    }
+    free(fn); free(base); free(scale);
+    return 1;
+}
+
+static inline int v4_real_vocab_logits(shards *source, const float *input,
+                                        int n_tokens, float *logits) {
+    st_tensor *head = st_find(source, "head.weight");
+    if (!head || !input || !logits || n_tokens <= 0) return 0;
+    uint8_t *raw = v4_real_read_raw(source, "head.weight");
+    if (!raw) return 0;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int vocab = 0; vocab < 129280; vocab++) {
+        int64_t offset = (int64_t)vocab * V4_REAL_D;
+        for (int token = 0; token < n_tokens; token++) {
+            float sum = 0.0f;
+            const float *x = input + (int64_t)token * V4_REAL_D;
+            if (head->dtype == ST_DTYPE_BF16) {
+                const uint16_t *weight = (const uint16_t *)raw + offset;
+                for (int d = 0; d < V4_REAL_D; d++)
+                    sum += bf16_to_f32(weight[d]) * x[d];
+            } else if (head->dtype == ST_DTYPE_F16) {
+                const uint16_t *weight = (const uint16_t *)raw + offset;
+                for (int d = 0; d < V4_REAL_D; d++)
+                    sum += f16_to_f32(weight[d]) * x[d];
+            } else {
+                const float *weight = (const float *)raw + offset;
+                for (int d = 0; d < V4_REAL_D; d++) sum += weight[d] * x[d];
+            }
+            logits[(int64_t)token * 129280 + vocab] = sum;
+        }
+    }
+    free(raw);
+    return 1;
+}
+
+static inline int v4_real_dspark_forward(
+        shards *source, const float *main_x, int n_main, int input_id,
+        V4RealDSparkState *state, V4RealDSparkCapture *capture) {
+    enum { STAGES = 3, DRAFT = 5, NOISE_ID = 128799, VOCAB = 129280 };
+    if (!source || !main_x || n_main != 4 || input_id < 0 || !state ||
+        !state->main_kv || !capture || !capture->prefill_kv ||
+        !capture->stage_outputs || !capture->hidden || !capture->output_ids ||
+        !capture->confidence) return 0;
+    char name[128];
+    for (int stage = 0; stage < STAGES; stage++) {
+        float *cache = state->main_kv + (int64_t)stage * 128 * V4_REAL_HD;
+        snprintf(name, sizeof(name), "mtp.%d.attn.wkv", stage);
+        if (!v4_real_fp8_batch(source, name, main_x, n_main,
+                               V4_REAL_HD, V4_REAL_D, cache)) return 0;
+        snprintf(name, sizeof(name), "mtp.%d.attn.kv_norm.weight", stage);
+        if (!v4_real_norm_batch(source, name, cache, n_main,
+                                V4_REAL_HD, cache)) return 0;
+        for (int token = 0; token < n_main; token++)
+            v4_real_rope(cache + (int64_t)token * V4_REAL_HD,
+                         V4_REAL_HD, token, 0, 0);
+        memcpy(capture->prefill_kv + (int64_t)stage * n_main * V4_REAL_HD,
+               cache, (size_t)n_main * V4_REAL_HD * sizeof(float));
+    }
+    int ids[DRAFT] = {input_id, NOISE_ID, NOISE_ID, NOISE_ID, NOISE_ID};
+    float *streams = malloc((size_t)DRAFT * V4_REAL_HC * V4_REAL_D * sizeof(float));
+    float *normalized = malloc(DRAFT * V4_REAL_D * sizeof(float));
+    float *logits = malloc((size_t)DRAFT * VOCAB * sizeof(float));
+    float *markov_w2 = NULL;
+    if (!streams || !normalized || !logits) goto fail;
+    for (int token = 0; token < DRAFT; token++) {
+        float *embedding = streams
+            + (int64_t)token * V4_REAL_HC * V4_REAL_D;
+        st_read_slice_f32(source, "embed.weight", (int64_t)ids[token] * V4_REAL_D,
+                          V4_REAL_D, embedding, 0);
+        for (int stream = 1; stream < V4_REAL_HC; stream++)
+            memcpy(embedding + (int64_t)stream * V4_REAL_D,
+                   embedding, V4_REAL_D * sizeof(float));
+    }
+    const float *decode_main = main_x + (int64_t)(n_main - 1) * V4_REAL_D;
+    for (int stage = 0; stage < STAGES; stage++) {
+        if (!v4_real_dspark_stage(source, stage, streams,
+                                  decode_main, state)) goto fail;
+        memcpy(capture->stage_outputs
+                   + (int64_t)stage * DRAFT * V4_REAL_HC * V4_REAL_D,
+               streams, (size_t)DRAFT * V4_REAL_HC * V4_REAL_D * sizeof(float));
+    }
+    if (!v4_real_hc_head_named(source, "mtp.2", streams, DRAFT,
+                               capture->hidden)) goto fail;
+    if (!v4_real_norm_batch(source, "mtp.2.norm.weight", capture->hidden,
+                            DRAFT, V4_REAL_D, normalized)) goto fail;
+    if (!v4_real_vocab_logits(source, normalized, DRAFT, logits)) goto fail;
+    markov_w2 = v4_real_read_f32(source, "mtp.2.markov_head.markov_w2.weight");
+    if (!markov_w2) goto fail;
+    capture->output_ids[0] = input_id;
+    float markov_embeds[DRAFT * 256];
+    for (int position = 0; position < DRAFT; position++) {
+        float *embed = markov_embeds + position * 256;
+        st_read_slice_f32(source, "mtp.2.markov_head.markov_w1.weight",
+                          capture->output_ids[position] * 256, 256, embed, 0);
+        int best = 0;
+        for (int vocab = 0; vocab < VOCAB; vocab++) {
+            float bias = 0.0f;
+            const float *weight = markov_w2 + (int64_t)vocab * 256;
+            for (int d = 0; d < 256; d++) bias += weight[d] * embed[d];
+            float value = (logits[(int64_t)position * VOCAB + vocab] += bias);
+            if (vocab == 0 || value > logits[(int64_t)position * VOCAB + best])
+                best = vocab;
+        }
+        capture->output_ids[position + 1] = best;
+    }
+    snprintf(name, sizeof(name), "mtp.2.confidence_head.proj.weight");
+    float *confidence_weight = v4_real_read_f32(source, name);
+    if (!confidence_weight) goto fail;
+    for (int position = 0; position < DRAFT; position++) {
+        float sum = 0.0f;
+        const float *hidden = capture->hidden + (int64_t)position * V4_REAL_D;
+        const float *embed = markov_embeds + position * 256;
+        for (int d = 0; d < V4_REAL_D; d++) sum += confidence_weight[d] * hidden[d];
+        for (int d = 0; d < 256; d++) sum += confidence_weight[V4_REAL_D + d] * embed[d];
+        capture->confidence[position] = sum;
+    }
+    free(confidence_weight); free(markov_w2);
+    free(streams); free(normalized); free(logits);
+    return 1;
+fail:
+    free(markov_w2); free(streams); free(normalized); free(logits);
+    return 0;
 }
 
 static inline int v4_real_layers_forward(shards *source, const int *token_ids,
