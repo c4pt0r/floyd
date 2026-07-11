@@ -75,7 +75,7 @@ sqrt-softplus routing; it is a correctness target, not a performance model.
 Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
 CSA/Lightning Indexer block integration point is layer 2.
 
-Build and run the current greedy V4 chat path directly against the official
+Build and run the current greedy DeepSeek V4 chat path directly against the official
 checkpoint:
 
 ```bash
@@ -94,8 +94,9 @@ PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
   SNAP=/path/to/DeepSeek-V4-Flash-DSpark CHAT=1 CTX=64 ./floyd
 ```
 
-The executable implements the official V4 chat-mode prompt, incremental KV
-state, streaming decode, `/clear`, and `/exit`. `DSPARK_SPEC=1` enables the
+The built-in runtime implements the official DeepSeek V4 chat-mode prompt,
+incremental KV state, streaming decode, `:reset`, and `:exit` (`/clear` and
+`/exit` remain accepted aliases). `DSPARK_SPEC=1` enables the
 three speculative layers while retaining base-greedy token identity. Startup
 prints `DEEPSEEK_V4_BACKEND backend=cpu|metal`; each turn prints Metal call and CPU
 fallback counts. A Metal build enables the GPU path by default;
@@ -132,7 +133,9 @@ with no Python in the loop. See the Quickstart and CLI reference below.
 
 ## Quick start
 
-`floyd` opens `chat` (interactive multi-turn) by default. It also provides
+`floyd` inspects `config.json` and opens the matching Moonlight or DeepSeek V4
+`chat` runtime by default. Both use the same `›` input prompt, `◆` output
+prompt, `:reset`, and `:exit`. It also provides
 `run` (single-shot),
 `tf`/`gen` (teacher-forcing / greedy parity checks vs a Python oracle). Every
 command needs `--model DIR` pointing at a converted container or a raw HF
@@ -229,7 +232,7 @@ threshold kicks in on shapes other than chat decode.
 
 ```
 $ ./floyd help
-floyd — Moonlight-16B-A3B in pure C
+floyd — Moonlight and DeepSeek V4 inference in pure C
 uso: floyd --model DIR [flags] | floyd <comando> [flags]
       (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>
 
@@ -242,9 +245,11 @@ comandi:
 
 flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)
   --dbits 4|8|16 (8) | --ram GB | --metal
-chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)
-  --top-p P (0.90) | --system "..." | --prompt "..." (solo run) | --draft N
-chat:      --no-kvsave (disattiva persistenza KV su disco; solo chat, run non persiste mai)
+chat/run:  --ngen N (chat Moonlight:512, DeepSeek V4:16; run:256)
+  --ctx N (Moonlight:4096, DeepSeek V4:512) | --draft N
+Moonlight: --temp T (0.7) | --top-p P (0.90) | --system "..."
+run:       --prompt "..." (obbligatorio)
+chat:      --no-kvsave (Moonlight; DeepSeek V4 non persiste ancora la KV)
 tf/gen:    --ref FILE (obbligatorio)
 flag duplicati: l'ultima occorrenza vince
 

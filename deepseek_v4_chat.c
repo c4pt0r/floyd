@@ -51,7 +51,7 @@ static int deepseek_v4_chat_backend_init(void) {
     if (requested) {
         int min_batch = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;
         if (!deepseek_v4_quant_backend_enable_metal(min_batch)) {
-            fprintf(stderr, "V4 Metal requested but unavailable or FM_MIN_S < 2\n");
+            fprintf(stderr, "DeepSeek V4 Metal requested but unavailable or FM_MIN_S < 2\n");
             return 0;
         }
         fprintf(stderr, "DEEPSEEK_V4_BACKEND backend=metal device=%s min_batch=%d\n",
@@ -62,7 +62,7 @@ static int deepseek_v4_chat_backend_init(void) {
 #else
     int requested = metal_env && atoi(metal_env) != 0;
     if (requested) {
-        fprintf(stderr, "FLOYD_METAL requires: make METAL=1 deepseek_v4_chat\n");
+        fprintf(stderr, "FLOYD_METAL requires: make METAL=1 floyd\n");
         return 0;
     }
     fprintf(stderr, "DEEPSEEK_V4_BACKEND backend=cpu\n");
@@ -195,7 +195,7 @@ static int deepseek_v4_chat_turn(DeepSeekV4Runtime *runtime, Tok *tokenizer, con
                            ids, remaining + 1);
     free(prompt);
     if (count <= 0 || count > remaining) {
-        fprintf(stderr, "V4 chat context exhausted by prompt\n");
+        fprintf(stderr, "DeepSeek V4 chat context exhausted by prompt\n");
         free(ids);
         return -1;
     }
@@ -255,7 +255,7 @@ int deepseek_v4_chat_run(const DeepSeekV4ChatOptions *options) {
     size_t capacity = 0;
     int first_turn = 1, status = 0;
     for (;;) {
-        fputs("user> ", stdout);
+        fputs("\n› ", stdout);
         fflush(stdout);
         ssize_t size = getline(&line, &capacity, stdin);
         if (size < 0) break;
@@ -268,7 +268,7 @@ int deepseek_v4_chat_run(const DeepSeekV4ChatOptions *options) {
             continue;
         }
         if (!size) continue;
-        fputs("assistant> ", stdout);
+        fputs("◆ ", stdout);
         fflush(stdout);
         int result = deepseek_v4_chat_turn(&runtime, &tokenizer, line, first_turn,
                                   options->max_new_tokens, 1,

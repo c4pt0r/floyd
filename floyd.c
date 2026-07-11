@@ -2069,7 +2069,7 @@ static void run_chat(Model *m, const char *snap){
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     snprintf(g_kv_path,sizeof(g_kv_path),"%s/.coli_kv",snap);
     { int r=kv_disk_load(m,hist,maxctx); if(r>0) len=r; }
-    fprintf(stderr,"floyd chat — :reset azzera, :exit esce\n");
+    fprintf(stderr,"floyd chat [Moonlight] — :reset azzera, :exit esce\n");
     char *line=NULL; size_t cap=0; ssize_t nr;
     for(;;){
         fputs("\n\xe2\x80\xba ",stdout); fflush(stdout);
@@ -2504,7 +2504,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
  * che un utente normale deve toccare per usare chat/run/tf/gen. */
 static void usage(int code){
     fputs(
-"floyd — Moonlight-16B-A3B in pure C\n"
+"floyd — Moonlight and DeepSeek V4 inference in pure C\n"
 "uso: floyd --model DIR [flags] | floyd <comando> [flags]\n"
 "      (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>\n\n"
 "comandi:\n"
@@ -2515,9 +2515,11 @@ static void usage(int code){
 "  help   questo testo\n\n"
 "flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)\n"
 "  --dbits 4|8|16 (8) | --ram GB | --metal\n"
-"chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)\n"
-"  --top-p P (0.90) | --system \"...\" | --prompt \"...\" (solo run) | --draft N\n"
-"chat:      --no-kvsave (disattiva persistenza KV su disco; solo chat, run non persiste mai)\n"
+"chat/run:  --ngen N (chat Moonlight:512, DeepSeek V4:16; run:256)\n"
+"  --ctx N (Moonlight:4096, DeepSeek V4:512) | --draft N\n"
+"Moonlight: --temp T (0.7) | --top-p P (0.90) | --system \"...\"\n"
+"run:       --prompt \"...\" (obbligatorio)\n"
+"chat:      --no-kvsave (Moonlight; DeepSeek V4 non persiste ancora la KV)\n"
 "tf/gen:    --ref FILE (obbligatorio)\n"
 "flag duplicati: l'ultima occorrenza vince\n\n"
 "variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)\n",
@@ -2527,6 +2529,8 @@ static void usage(int code){
 /* Ritorna 1 per i cinque comandi espliciti o quando argv[1] e' un long flag:
  * in quest'ultimo caso chat e' il comando predefinito. Riempie cap/ebits/dbits
  * quando le rispettive flag sono presenti, altrimenti li lascia a -1. */
+static int g_cli_temp_set, g_cli_top_p_set, g_cli_system_set;
+
 static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
     if(argc<2) return 0;
     const char *cmd=argv[1];
@@ -2562,14 +2566,14 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
         } else if(!strcmp(a,"--temp")){
             if(++i>=argc) usage(2);
             double v=strtod(argv[i],&e); if(*e||v<0||v>2) usage(2);
-            setenv("TEMP",argv[i],1);
+            setenv("TEMP",argv[i],1); g_cli_temp_set=1;
         } else if(!strcmp(a,"--top-p")){
             if(++i>=argc) usage(2);
             double v=strtod(argv[i],&e); if(*e||v<=0||v>1) usage(2);
-            setenv("NUCLEUS",argv[i],1);
+            setenv("NUCLEUS",argv[i],1); g_cli_top_p_set=1;
         } else if(!strcmp(a,"--system")){
             if(++i>=argc) usage(2);
-            setenv("SYSTEM",argv[i],1);
+            setenv("SYSTEM",argv[i],1); g_cli_system_set=1;
         } else if(!strcmp(a,"--prompt")){
             if(++i>=argc) usage(2);
             if(strcmp(cmd,"run")){ fprintf(stderr,"--prompt e' solo per 'run'\n"); usage(2); }
@@ -2640,6 +2644,18 @@ int main(int argc, char **argv){
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     if(getenv("CHAT") && deepseek_v4_model_dir(snap)) {
+        if(g_cli_temp_set) {
+            fprintf(stderr,"DeepSeek V4 chat does not support --temp\n");
+            return 2;
+        }
+        if(g_cli_top_p_set) {
+            fprintf(stderr,"DeepSeek V4 chat does not support --top-p\n");
+            return 2;
+        }
+        if(g_cli_system_set) {
+            fprintf(stderr,"DeepSeek V4 chat does not support --system\n");
+            return 2;
+        }
         DeepSeekV4ChatOptions options = {
             .model_dir = snap,
             .max_context = getenv("CTX") ? atoi(getenv("CTX")) : 512,
