@@ -83,6 +83,19 @@ typedef struct {
     float *index_gate_state;
 } V4RealLayerState;
 
+typedef struct {
+    int max_context;
+    V4RealLayerState layers[43];
+} V4RealModelState;
+
+typedef struct {
+    const int *layer_ids;
+    int n_layer_ids;
+    float *layer_outputs;
+    float *target_means;
+    int64_t *router_indices;
+} V4RealBaseCapture;
+
 static inline int v4_real_layer_ratio(int layer) {
     if (layer < 0 || layer > 42) return -1;
     if (layer < 2) return 0;
@@ -146,6 +159,27 @@ static inline int v4_real_layer_state_init(V4RealLayerState *state, int layer,
 fail:
     v4_real_layer_state_free(state);
     return 0;
+}
+
+static inline void v4_real_model_state_free(V4RealModelState *state) {
+    if (!state) return;
+    for (int layer = 0; layer < 43; layer++)
+        v4_real_layer_state_free(&state->layers[layer]);
+    memset(state, 0, sizeof(*state));
+}
+
+static inline int v4_real_model_state_init(V4RealModelState *state,
+                                            int max_context) {
+    if (!state || max_context <= 0) return 0;
+    memset(state, 0, sizeof(*state));
+    state->max_context = max_context;
+    for (int layer = 0; layer < 43; layer++)
+        if (!v4_real_layer_state_init(&state->layers[layer], layer,
+                                      max_context)) {
+            v4_real_model_state_free(state);
+            return 0;
+        }
+    return 1;
 }
 
 static inline float *v4_real_read_f32(shards *source, const char *name) {
@@ -1115,6 +1149,91 @@ static inline int v4_real_layer_forward_state(
 fail:
     free(post); free(comb); free(collapsed); free(hidden); free(block); free(residual);
     return 0;
+}
+
+static inline void v4_real_base_capture_layer(
+        const V4RealBaseCapture *capture, int layer, const float *streams,
+        int n_tokens) {
+    if (!capture || !capture->layer_ids || !capture->layer_outputs) return;
+    size_t layer_size = (size_t)n_tokens * V4_REAL_HC * V4_REAL_D;
+    for (int index = 0; index < capture->n_layer_ids; index++)
+        if (capture->layer_ids[index] == layer)
+            memcpy(capture->layer_outputs + (size_t)index * layer_size,
+                   streams, layer_size * sizeof(float));
+}
+
+static inline int v4_real_base_layers_forward(
+        shards *source, const int *token_ids, int n_tokens,
+        V4RealModelState *state, float *streams, V4RealBaseCapture *capture) {
+    if (!source || !token_ids || !state || !streams || n_tokens != 4 ||
+        state->max_context < n_tokens) return 0;
+    for (int token = 0; token < n_tokens; token++) {
+        float *embedding = streams
+            + (int64_t)token * V4_REAL_HC * V4_REAL_D;
+        st_read_slice_f32(source, "embed.weight",
+                          (int64_t)token_ids[token] * V4_REAL_D,
+                          V4_REAL_D, embedding, 0);
+        for (int stream = 1; stream < V4_REAL_HC; stream++)
+            memcpy(embedding + (int64_t)stream * V4_REAL_D,
+                   embedding, V4_REAL_D * sizeof(float));
+    }
+
+    float layer2_kv[V4_REAL_HD], layer2_scores[4], layer2_bias[4];
+    int64_t layer2_ids[4];
+    V4RealLayer2CSACapture layer2_capture = {
+        .compressed_kv = layer2_kv, .index_scores = layer2_scores,
+        .index_ids = layer2_ids, .block_bias = layer2_bias,
+    };
+    for (int layer = 0; layer < 3; layer++) {
+        V4RealLayer2CSACapture *csa = layer == 2 ? &layer2_capture : NULL;
+        if (!v4_real_layer_forward(source, layer, token_ids, n_tokens,
+                                   streams, csa)) return 0;
+        v4_real_base_capture_layer(capture, layer, streams, n_tokens);
+    }
+
+    for (int layer = 3; layer < 43; layer++) {
+        V4RealLayerCapture layer_capture = {0};
+        float *index_scores = NULL, *block_bias = NULL;
+        int64_t *index_ids = NULL;
+        int entries = n_tokens / 4;
+        int top_k = entries < 512 ? entries : 512;
+        if (state->layers[layer].ratio == 4) {
+            index_scores = malloc((size_t)n_tokens * entries * sizeof(float));
+            index_ids = malloc((size_t)n_tokens * top_k * sizeof(int64_t));
+            block_bias = malloc((size_t)n_tokens * top_k * sizeof(float));
+            if (!index_scores || !index_ids || !block_bias) {
+                free(index_scores); free(index_ids); free(block_bias);
+                return 0;
+            }
+            layer_capture.index_scores = index_scores;
+            layer_capture.index_ids = index_ids;
+            layer_capture.block_bias = block_bias;
+        }
+        if (capture && capture->router_indices)
+            layer_capture.router_indices = capture->router_indices
+                + (int64_t)layer * n_tokens * V4_REAL_TOPK;
+        int ok = v4_real_layer_forward_state(
+            source, layer, token_ids, n_tokens, streams,
+            &state->layers[layer],
+            state->layers[layer].ratio == 4 ? &layer_capture : NULL);
+        free(index_scores); free(index_ids); free(block_bias);
+        if (!ok) return 0;
+        v4_real_base_capture_layer(capture, layer, streams, n_tokens);
+        if (capture && capture->target_means && layer >= 40) {
+            float *target = capture->target_means
+                + (int64_t)(layer - 40) * n_tokens * V4_REAL_D;
+            for (int token = 0; token < n_tokens; token++)
+                for (int d = 0; d < V4_REAL_D; d++) {
+                    float sum = 0.0f;
+                    for (int stream = 0; stream < V4_REAL_HC; stream++)
+                        sum += streams[((int64_t)token * V4_REAL_HC + stream)
+                                       * V4_REAL_D + d];
+                    target[(int64_t)token * V4_REAL_D + d]
+                        = sum / V4_REAL_HC;
+                }
+        }
+    }
+    return 1;
 }
 
 static inline int v4_real_layers_forward(shards *source, const int *token_ids,

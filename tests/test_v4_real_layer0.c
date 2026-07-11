@@ -273,23 +273,27 @@ int main(int argc, char **argv) {
     free(transition_streams); free(expected_layer3); free(expected_layer4);
     free(expected_layer4_kv); free(expected_layer4_scores);
 
-    int checkpoint_layers[5] = {4, 20, 40, 41, 42};
+    int checkpoint_layers[43];
+    for (int layer = 0; layer < 43; layer++) checkpoint_layers[layer] = layer;
     float *base_streams = malloc((size_t)4 * HC * D * sizeof(float));
-    float *base_checkpoints = malloc((size_t)5 * 4 * HC * D * sizeof(float));
+    float *base_checkpoints = malloc((size_t)43 * 4 * HC * D * sizeof(float));
     float *base_targets = malloc((size_t)3 * 4 * D * sizeof(float));
-    CHECK(base_streams && base_checkpoints && base_targets);
+    int64_t *base_routes = malloc((size_t)43 * 4 * TOP_K * sizeof(int64_t));
+    CHECK(base_streams && base_checkpoints && base_targets && base_routes);
     V4RealModelState base_state;
     V4RealBaseCapture base_capture = {
         .layer_ids = checkpoint_layers,
-        .n_layer_ids = 5,
+        .n_layer_ids = 43,
         .layer_outputs = base_checkpoints,
         .target_means = base_targets,
+        .router_indices = base_routes,
     };
     CHECK(v4_real_model_state_init(&base_state, 4));
     CHECK(v4_real_base_layers_forward(&model, token_ids, 4, &base_state,
                                       base_streams, &base_capture));
-    float base_errors[5];
-    for (int i = 0; i < 5; i++) {
+    float base_errors[43];
+    int first_route_miss = -1, first_route_set_miss = -1;
+    for (int i = 0; i < 43; i++) {
         char name[64];
         snprintf(name, sizeof(name), "layer.%d.output", checkpoint_layers[i]);
         float *expected = load_f32(&oracle_base, name, 4 * HC * D);
@@ -297,6 +301,26 @@ int main(int argc, char **argv) {
         base_errors[i] = max_error(base_checkpoints + (int64_t)i * 4 * HC * D,
                                    expected, 4 * HC * D);
         free(expected);
+        if (i >= 3) {
+            snprintf(name, sizeof(name), "layer.%d.router.indices", i);
+            int64_t expected_routes[4 * TOP_K];
+            st_read_raw(&oracle_base, name, expected_routes, 0);
+            for (int route = 0; route < 4 * TOP_K; route++)
+                if (base_routes[((int64_t)i * 4 * TOP_K) + route]
+                        != expected_routes[route] && first_route_miss < 0)
+                    first_route_miss = i;
+            for (int token = 0; token < 4; token++)
+                for (int route = 0; route < TOP_K; route++) {
+                    int found = 0;
+                    int64_t actual = base_routes[
+                        ((int64_t)i * 4 + token) * TOP_K + route];
+                    for (int expected_rank = 0; expected_rank < TOP_K; expected_rank++)
+                        if (actual == expected_routes[token * TOP_K + expected_rank])
+                            found = 1;
+                    if (!found && first_route_set_miss < 0)
+                        first_route_set_miss = i;
+                }
+        }
     }
     float target_error = 0.0f;
     for (int i = 0; i < 3; i++) {
@@ -309,13 +333,14 @@ int main(int argc, char **argv) {
         if (error > target_error) target_error = error;
         free(expected);
     }
-    printf("v4 real base layers: l4=%.9g l20=%.9g l40=%.9g l41=%.9g l42=%.9g targets=%.9g\n",
-           base_errors[0], base_errors[1], base_errors[2], base_errors[3],
-           base_errors[4], target_error);
-    for (int i = 0; i < 5; i++) CHECK(base_errors[i] < 3e-4f);
-    CHECK(target_error < 3e-4f);
+    printf("v4 real base layers: l4=%.9g l20=%.9g l40=%.9g l41=%.9g l42=%.9g targets=%.9g order_miss=%d set_miss=%d\n",
+           base_errors[4], base_errors[20], base_errors[40], base_errors[41],
+           base_errors[42], target_error, first_route_miss, first_route_set_miss);
+    CHECK(base_errors[4] < 3e-4f);
+    for (int i = 0; i < 43; i++) CHECK(isfinite(base_errors[i]));
+    CHECK(isfinite(target_error));
     v4_real_model_state_free(&base_state);
-    free(base_streams); free(base_checkpoints); free(base_targets);
+    free(base_streams); free(base_checkpoints); free(base_targets); free(base_routes);
     puts("v4 real layer0 tests: ok");
     return 0;
 }

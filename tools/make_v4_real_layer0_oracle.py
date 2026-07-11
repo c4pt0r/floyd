@@ -475,7 +475,6 @@ def write_base_forward_oracle(model_dir, output_path, token_ids):
     streams = torch.stack([checkpoint.row("embed.weight", token).float() for token in token_ids])
     streams = streams[:, None, :].repeat(1, 4, 1)
     captures = {}
-    capture_layers = {4, 20, 40, 41, 42}
     for layer in range(43):
         scratch = {}
         collapsed, post, comb = hc_batch(checkpoint, layer, "attn", streams)
@@ -486,10 +485,12 @@ def write_base_forward_oracle(model_dir, output_path, token_ids):
         collapsed, post, comb = hc_batch(checkpoint, layer, "ffn", streams)
         hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.ffn_norm.weight"))
         streams = hc_post_batch(
-            moe_batch(checkpoint, layer, hidden, token_ids), streams, post, comb
+            moe_batch(checkpoint, layer, hidden, token_ids, scratch), streams, post, comb
         )
-        if layer in capture_layers:
-            captures[f"layer.{layer}.output"] = streams.clone()
+        captures[f"layer.{layer}.output"] = streams.clone()
+        captures[f"layer.{layer}.router.indices"] = scratch[
+            f"layer.{layer}.router.indices"
+        ].clone()
         if layer in (40, 41, 42):
             captures[f"layer.{layer}.mean"] = streams.mean(1)
 
