@@ -30,17 +30,18 @@ static float max_error(const float *actual, const float *expected, int count) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle> <layers-3-4-oracle>\n", argv[0]);
+    if (argc != 7) {
+        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle> <layers-3-4-oracle> <base-forward-oracle>\n", argv[0]);
         return 2;
     }
     enum { D = 4096, HC = 4, EXPERTS = 256, TOP_K = 6 };
-    shards model, oracle, oracle_0_2, oracle_3, oracle_3_4;
+    shards model, oracle, oracle_0_2, oracle_3, oracle_3_4, oracle_base;
     st_init(&model, argv[1]);
     st_init(&oracle, argv[2]);
     st_init(&oracle_0_2, argv[3]);
     st_init(&oracle_3, argv[4]);
     st_init(&oracle_3_4, argv[5]);
+    st_init(&oracle_base, argv[6]);
     float input[HC * D], attn_post[HC], attn_comb[HC * HC], attn_collapsed[D];
     float attn_norm[D], attn_output[D], after_attn[HC * D];
     float ffn_post[HC], ffn_comb[HC * HC], ffn_collapsed[D], ffn_norm[D];
@@ -271,6 +272,50 @@ int main(int argc, char **argv) {
     v4_real_layer_state_free(&transition_csa);
     free(transition_streams); free(expected_layer3); free(expected_layer4);
     free(expected_layer4_kv); free(expected_layer4_scores);
+
+    int checkpoint_layers[5] = {4, 20, 40, 41, 42};
+    float *base_streams = malloc((size_t)4 * HC * D * sizeof(float));
+    float *base_checkpoints = malloc((size_t)5 * 4 * HC * D * sizeof(float));
+    float *base_targets = malloc((size_t)3 * 4 * D * sizeof(float));
+    CHECK(base_streams && base_checkpoints && base_targets);
+    V4RealModelState base_state;
+    V4RealBaseCapture base_capture = {
+        .layer_ids = checkpoint_layers,
+        .n_layer_ids = 5,
+        .layer_outputs = base_checkpoints,
+        .target_means = base_targets,
+    };
+    CHECK(v4_real_model_state_init(&base_state, 4));
+    CHECK(v4_real_base_layers_forward(&model, token_ids, 4, &base_state,
+                                      base_streams, &base_capture));
+    float base_errors[5];
+    for (int i = 0; i < 5; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "layer.%d.output", checkpoint_layers[i]);
+        float *expected = load_f32(&oracle_base, name, 4 * HC * D);
+        CHECK(expected);
+        base_errors[i] = max_error(base_checkpoints + (int64_t)i * 4 * HC * D,
+                                   expected, 4 * HC * D);
+        free(expected);
+    }
+    float target_error = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "layer.%d.mean", 40 + i);
+        float *expected = load_f32(&oracle_base, name, 4 * D);
+        CHECK(expected);
+        float error = max_error(base_targets + (int64_t)i * 4 * D,
+                                expected, 4 * D);
+        if (error > target_error) target_error = error;
+        free(expected);
+    }
+    printf("v4 real base layers: l4=%.9g l20=%.9g l40=%.9g l41=%.9g l42=%.9g targets=%.9g\n",
+           base_errors[0], base_errors[1], base_errors[2], base_errors[3],
+           base_errors[4], target_error);
+    for (int i = 0; i < 5; i++) CHECK(base_errors[i] < 3e-4f);
+    CHECK(target_error < 3e-4f);
+    v4_real_model_state_free(&base_state);
+    free(base_streams); free(base_checkpoints); free(base_targets);
     puts("v4 real layer0 tests: ok");
     return 0;
 }
