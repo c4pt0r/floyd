@@ -478,7 +478,7 @@ def write_layers_3_4_oracle(model_dir, output_path, token_ids):
 
 
 def write_base_forward_oracle(model_dir, output_path, token_ids):
-    assert len(token_ids) == 4
+    assert len(token_ids) >= 4
     torch.set_num_threads(8)
     checkpoint = Checkpoint(model_dir)
     streams = torch.stack([checkpoint.row("embed.weight", token).float() for token in token_ids])
@@ -689,6 +689,7 @@ def main():
     parser.add_argument("--layer3-hca-output")
     parser.add_argument("--layers-3-4-output")
     parser.add_argument("--base-forward-output")
+    parser.add_argument("--base-decode-output")
     parser.add_argument("--dspark-output")
     parser.add_argument("--token-id", type=int, default=3)
     args = parser.parse_args()
@@ -701,6 +702,8 @@ def main():
         write_layers_3_4_oracle(args.model, args.layers_3_4_output, [3, 14, 15, 9])
     if args.base_forward_output:
         write_base_forward_oracle(args.model, args.base_forward_output, [3, 14, 15, 9])
+    if args.base_decode_output:
+        write_base_forward_oracle(args.model, args.base_decode_output, [3, 14, 15, 9, 5])
     if args.dspark_output:
         write_dspark_oracle(args.model, args.dspark_output, [3, 14, 15, 9])
     print(f"saved {args.output}")
