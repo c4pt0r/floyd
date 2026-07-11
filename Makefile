@@ -77,7 +77,7 @@ tests/test_v4_hc_fixture: tests/test_v4_hc_fixture.c v4_hc.h st.h json.h compat.
 test-v4-hc: tests/test_v4_hc_fixture
 	./tests/test_v4_hc_fixture fixture_tiny_v4
 
-tests/test_v4_attention_fixture: tests/test_v4_attention_fixture.c v4_attention.h st.h json.h compat.h
+tests/test_v4_attention_fixture: tests/test_v4_attention_fixture.c v4_attention.h v4_kv_cache.h st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-v4-attention: tests/test_v4_attention_fixture
@@ -94,6 +94,12 @@ tests/test_v4_indexer_fixture: tests/test_v4_indexer_fixture.c v4_indexer.h st.h
 
 test-v4-indexer: tests/test_v4_indexer_fixture
 	./tests/test_v4_indexer_fixture fixture_tiny_v4
+
+tests/test_v4_kv_cache_fixture: tests/test_v4_kv_cache_fixture.c v4_kv_cache.h v4_attention.h v4_indexer.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test-v4-kv-cache: tests/test_v4_kv_cache_fixture
+	./tests/test_v4_kv_cache_fixture fixture_tiny_v4
 
 tests/test_v4_quant: tests/test_v4_quant.c v4_quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -116,6 +122,6 @@ test-v4-oracle:
 	PYTHONPATH=. $(PYTHON) tests/test_make_v4_oracle.py
 
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors
 
-.PHONY: all test-c test-tok test-v4-attention test-v4-compress test-v4-hc test-v4-indexer test-v4-moe test-v4-oracle metal-test clean portable
+.PHONY: all test-c test-tok test-v4-attention test-v4-compress test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-moe test-v4-oracle metal-test clean portable
