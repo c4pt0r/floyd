@@ -35,4 +35,3 @@ full output. A 128-token case exercises the first real HCA boundary. C tests fir
 fail on the unsupported layer/state API, then require exact expert IDs and
 `max_abs < 3e-4` for isolated layer-3 state and output. Existing layers 0-2 and all
 V4/Moonlight gates remain unchanged.
-

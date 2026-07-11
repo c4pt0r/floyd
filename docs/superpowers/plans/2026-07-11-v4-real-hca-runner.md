@@ -17,4 +17,3 @@ the state contract used by layers 3-42.
 5. Reuse the state API for representative CSA/HCA layers and then layers 3-42,
    preserving RED/GREEN commits for each boundary before adding final head and
    DSpark stages.
-
