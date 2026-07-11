@@ -32,6 +32,7 @@
 #include "st.h"
 #include "tok.h"
 #include "moe_route.h"
+#include "tok_moon.h"                              /* tokenizer moonshot (Chat-Task 4): mtok_*, template builders */
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -52,6 +53,12 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 #ifdef FLOYD_METAL
 #include "backend_metal.h"
 static int g_metal=0, g_metal_min_s=8;
+/* Osservabilita' (chat-patch): contatori a livello di matmul_qt, incrementati
+ * solo se g_metal e' attivo (un binario METAL=1 con FLOYD_METAL=0 a runtime
+ * non paga nulla). Interamente compilati fuori nelle build non-METAL. */
+static uint64_t g_metal_batch_calls=0;   /* S>=g_metal_min_s -> dispatch GPU */
+static uint64_t g_metal_small_calls=0;   /* g_metal_min_s <= S < 8 (S>=1 mentre g_metal e' attivo; possibile solo con FM_MIN_S abbassato) */
+static uint64_t g_metal_cpu_calls=0;     /* fallthrough su CPU mentre g_metal e' attivo */
 #endif
 
 typedef struct {
@@ -462,10 +469,24 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * viste/expert slab (slab_backed==1) vanno SEMPRE non cache-ate (cache=0) perche' il
      * puntatore e' stabile ma il contenuto viene riciclato tra load di eid diversi. */
     if(g_metal && S>=g_metal_min_s && (w->fmt==1 || w->fmt==2)){
+        /* 8 qui e' la soglia CANONICA (default FM_MIN_S), non g_metal_min_s: se l'utente
+         * abbassa FM_MIN_S sotto 8, questi S<8 finiscono comunque su GPU (sperimentale,
+         * vedi warning a startup) — li contiamo separatamente dal batch path normale. */
+        if(S>=8) {
+            #pragma omp atomic update
+            g_metal_batch_calls++;
+        } else {
+            #pragma omp atomic update
+            g_metal_small_calls++;
+        }
         int cache = !w->slab_backed;
         if(w->fmt==1) fm_matmul_q8(y,x,w->q8,w->s,w->O,w->I,S,cache);
         else          fm_matmul_q4(y,x,w->q4,w->s,w->O,w->I,S,cache);
         return;
+    }
+    if(g_metal) {
+        #pragma omp atomic update
+        g_metal_cpu_calls++;   /* fallthrough su CPU: gated su g_metal, zero costo se non attivo */
     }
 #endif
 #ifdef COLI_CUDA
@@ -1720,6 +1741,14 @@ static void profile_print(Model *m, double elapsed){
     printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
            "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+#ifdef FLOYD_METAL
+    /* punto unico di stampa (chat-patch): tutti gli exit path (tf/gen/run/chat/replay)
+     * passano da qui, quindi il riepilogo Metal si stampa una volta sola per chiamante. */
+    if(g_metal)
+        printf("[METAL] summary: %llu batch matmul su GPU, %llu S<soglia su GPU, %llu matmul su CPU\n",
+            (unsigned long long)g_metal_batch_calls, (unsigned long long)g_metal_small_calls,
+            (unsigned long long)g_metal_cpu_calls);
+#endif
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -1746,27 +1775,10 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #endif
 }
 
-/* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
- * detokenizza e stampa il testo in streaming. */
-static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
-    Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
-                                          * distribuzione int4 e' rumore di quantizzazione */
-    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
-    int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
-    if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
-    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
-    fputs(prompt,stdout); fflush(stdout);
-    kv_alloc(m, np+ngen+g_draft+2);
-    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
-    double t=now_s();
-    float *logit=step(m,pids,np,0);
-    EmitStream es={&T,m,t,0,0};
-    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
-    double dt=now_s()-t;
+/* coda di statistiche di fine generazione, condivisa dai due rami di run_text (GLM e
+ * moonshot, chat-task 5): tok/s, hit-rate expert, speculazione, profiling, LOOKAHEAD. */
+static void print_run_stats(Model *m, int produced, double dt){
+    Cfg *c=&m->c;
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\n%d token in %.2fs (%.2f tok/s) | hit-rate expert %.1f%% | RSS %.2f GB\n",
@@ -1788,6 +1800,40 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
+}
+
+/* ramo moonshot di run_text: definito piu' sotto (dopo emit_moon/MoonEmit, che riusa),
+ * dichiarato qui per poterlo chiamare da run_text. Chat-task 5. */
+static void run_text_moon(Model *m, const char *snap, const char *prompt, int ngen);
+
+/* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
+ * detokenizza e stampa il testo in streaming. */
+static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
+    /* rilevamento tokenizer: se <snap>/tiktoken.model esiste, il container e' Moonlight
+     * -> ramo chat_template moonshot (chat-task 5: 'run' deve funzionare anche li'). */
+    { char mkp[2048]; snprintf(mkp,sizeof(mkp),"%s/tiktoken.model",snap);
+      FILE *mp=fopen(mkp,"rb");
+      if(mp){ fclose(mp); run_text_moon(m,snap,prompt,ngen); return; }
+    }
+    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Tok T; tok_load(&T,tkp);
+    int eos=tok_id_of(&T,"<|endoftext|>");
+    stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
+                                          * distribuzione int4 e' rumore di quantizzazione */
+    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
+    int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
+    if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
+    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
+    fputs(prompt,stdout); fflush(stdout);
+    kv_alloc(m, np+ngen+g_draft+2);
+    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
+    double t=now_s();
+    float *logit=step(m,pids,np,0);
+    EmitStream es={&T,m,t,0,0};
+    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
+    double dt=now_s()-t;
+    print_run_stats(m, produced, dt);
     free(pids); free(all);
     usage_save(m);
 }
@@ -1924,6 +1970,130 @@ out:
     }
     g_kv_nrec=nrec;
     return nrec;
+}
+
+/* emit callback CHAT: detokenizza via mtok_decode e stampa in streaming (bytewise, l'UTF-8
+ * a cavallo di piu' token lo ricompone il terminale). Non stampa MAI lo stop token: spec_decode
+ * gia' non lo passa a emit() (si ferma prima), ma il controllo su e->eos resta come difesa
+ * in profondita' (nessun leak del marcatore letterale <|im_end|> in nessun percorso). */
+typedef struct { MTok *T; double t0; int count; int eos; } MoonEmit;
+static void emit_moon(int t, void *ud){
+    MoonEmit *e=(MoonEmit*)ud;
+    if(t==e->eos) return;
+    char dec[256];
+    int dn=mtok_decode(e->T,&t,1,dec,sizeof(dec)-1);
+    fwrite(dec,1,dn,stdout); fflush(stdout);
+    e->count++;
+}
+
+/* stop token moonshot: eos_token_id di generation_config.json (numero o array), fallback
+ * <|im_end|>. Condiviso da run_chat e dal ramo moonshot di run_text (chat-task 5: prima
+ * viveva solo dentro run_chat, fattorizzato qui per non duplicarlo). */
+static int moon_resolve_eos(MTok *T, const char *snap){
+    int eos=-1;
+    char gp[2048]; snprintf(gp,sizeof(gp),"%s/generation_config.json",snap[0]?snap:".");
+    FILE *gf=fopen(gp,"rb");
+    if(gf){
+        fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
+        char *gb=malloc(gn+1);
+        if(gb){
+            if(fread(gb,1,gn,gf)==(size_t)gn){
+                gb[gn]=0;
+                char *garena=NULL; jval *groot=json_parse(gb,&garena);
+                jval *ge=json_get(groot,"eos_token_id");
+                if(ge){
+                    if(ge->t==J_NUM) eos=(int)ge->num;
+                    else if(ge->t==J_ARR && ge->len>0 && ge->kids[0]->t==J_NUM) eos=(int)ge->kids[0]->num;
+                }
+            }
+            free(gb);
+        }
+        fclose(gf);
+    }
+    if(eos<0) eos = mtok_special(T, "<|im_end|>");
+    return eos;
+}
+
+/* ramo moonshot di run_text (chat-task 5): stessa semantica single-shot del ramo GLM
+ * (tokenizza, prefill + decode con stop su EOS, detokenizza in streaming), ma passando
+ * dal chat_template come run_chat fa per-turno (system + user + genprompt) — 'run' e'
+ * chat single-shot, non un completion grezzo. Attivato da run_text quando <snap>/tiktoken.model
+ * esiste (container Moonlight). */
+static void run_text_moon(Model *m, const char *snap, const char *prompt, int ngen){
+    MTok T; mtok_load(&T, snap[0]?snap:".");
+    int eos = moon_resolve_eos(&T, snap);
+    if(eos<0){ fprintf(stderr,"tokenizer senza <|im_end|>\n"); exit(1); }
+    stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=0.7f;  if(!getenv("NUCLEUS")) g_nuc=0.90f;
+    const char *systxt=getenv("SYSTEM")?getenv("SYSTEM"):"You are a helpful assistant";
+
+    /* buffer del template: system + user + marcatori di ruolo/genprompt (limite superiore
+     * largo — mtok_tmpl_* rifiuta il turno con -1 se anche cosi' non basta). */
+    int cap=(int)strlen(systxt)+(int)strlen(prompt)+64;
+    int *pids=malloc(cap*sizeof(int));
+    int no=mtok_tmpl_msg(&T,"system",systxt,pids,0,cap);
+    no=mtok_tmpl_msg(&T,"user",prompt,pids,no,cap);
+    no=mtok_tmpl_genprompt(&T,pids,no,cap);
+    if(no<1){ fprintf(stderr,"prompt vuoto/non valido dopo template chat\n"); free(pids); return; }
+    int np=no;
+
+    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
+    fputs(prompt,stdout); fflush(stdout);
+    kv_alloc(m, np+ngen+g_draft+2);
+    int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
+    double t=now_s();
+    float *logit=step(m,pids,np,0);
+    MoonEmit me={&T,t,0,eos};
+    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_moon,&me,NULL);
+    double dt=now_s()-t;
+    print_run_stats(m, produced, dt);
+    free(pids); free(all);
+    usage_save(m);
+}
+
+/* modalita' CHAT interattiva (moonshot chat_template): loop REPL a riga singola, KV-cache
+ * persistente tra i turni (in RAM E su disco via .coli_kv, come run_serve). Niente protocollo
+ * \x01/\x02: e' per un umano al terminale, non per la CLI 'coli'. */
+static void run_chat(Model *m, const char *snap){
+    MTok T; mtok_load(&T, snap[0]?snap:".");     /* --model directory e' la directory del modello */
+    int eos = moon_resolve_eos(&T, snap);
+    if(eos<0){ fprintf(stderr,"tokenizer senza <|im_end|>\n"); exit(1); }
+    stops_arm(&m->c, eos);
+    if(g_temp<0) g_temp=0.7f;  if(!getenv("NUCLEUS")) g_nuc=0.90f;
+    int ngen=getenv("NGEN")?atoi(getenv("NGEN")):512;
+    int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+    const char *systxt=getenv("SYSTEM")?getenv("SYSTEM"):"You are a helpful assistant";
+    kv_alloc(m,maxctx);
+    int len=0, *hist=malloc(maxctx*sizeof(int));
+    g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
+    snprintf(g_kv_path,sizeof(g_kv_path),"%s/.coli_kv",snap);
+    { int r=kv_disk_load(m,hist,maxctx); if(r>0) len=r; }
+    fprintf(stderr,"floyd chat — :reset azzera, :exit esce\n");
+    char *line=NULL; size_t cap=0; ssize_t nr;
+    for(;;){
+        fputs("\n\xe2\x80\xba ",stdout); fflush(stdout);
+        if((nr=getline(&line,&cap,stdin))<=0) break;
+        if(line[nr-1]=='\n') line[--nr]=0;
+        if(!strcmp(line,":exit")) break;
+        if(!strcmp(line,":reset")){ len=0; kv_disk_reset(); puts("(reset)"); continue; }
+        if(!nr) continue;
+        int no=len;
+        if(len==0) no=mtok_tmpl_msg(&T,"system",systxt,hist,no,maxctx);
+        no=mtok_tmpl_msg(&T,"user",line,hist,no,maxctx);
+        no=mtok_tmpl_genprompt(&T,hist,no,maxctx);
+        if(no+ngen+g_draft+2>=maxctx || no<0){ fprintf(stderr,"(contesto pieno: :reset)\n"); continue; }
+        int k=no-len;
+        float *logit=step(m,hist+len,k,len); len=no;
+        fputs("\xe2\x97\x86 ",stdout);
+        MoonEmit me={&T,now_s(),0,eos};
+        int prod=spec_decode(m,hist,len,ngen,eos,logit,emit_moon,&me,&len);
+        double dt=now_s()-me.t0;
+        fprintf(stderr,"\n[%d tok, %.2f tok/s | ctx %d/%d | RSS %.2f GB]\n",prod,prod/dt,len,maxctx,rss_gb());
+        kv_disk_append(m,hist,len);
+    }
+    usage_save(m);
+    free(hist);
+    free(line);
 }
 
 static void run_serve(Model *m, const char *snap){
@@ -2325,7 +2495,141 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
 }
 
+/* ---- CLI: floyd <comando> [flags] --------------------------------------
+ * Adapter sottile: traduce flags in setenv() PRIMA di tutto il resto, cosi'
+ * il vecchio corpo di main() (che legge solo getenv + argv[1..3] posizionali)
+ * resta identico. Le variabili d'ambiente restano l'interfaccia legacy/debug
+ * (IDOT, DSA, MTP, PILOT, STATS, ...): questo strato copre solo le manopole
+ * che un utente normale deve toccare per usare chat/run/tf/gen. */
+static void usage(int code){
+    fputs(
+"floyd — Moonlight-16B-A3B in pure C\n"
+"uso: floyd <comando> [flags] | (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>\n\n"
+"comandi:\n"
+"  chat   conversazione interattiva     floyd chat --model DIR\n"
+"  run    generazione singola           floyd run  --model DIR --prompt \"...\"\n"
+"  tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json\n"
+"  gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json\n"
+"  help   questo testo\n\n"
+"flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)\n"
+"  --dbits 4|8|16 (8) | --ram GB | --metal\n"
+"chat/run:  --ngen N (chat:512, run:256) | --ctx N (4096) | --temp T (0.7)\n"
+"  --top-p P (0.90) | --system \"...\" | --prompt \"...\" (solo run) | --draft N\n"
+"chat:      --no-kvsave (disattiva persistenza KV su disco; solo chat, run non persiste mai)\n"
+"tf/gen:    --ref FILE (obbligatorio)\n"
+"flag duplicati: l'ultima occorrenza vince\n\n"
+"variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)\n",
+    code?stderr:stdout); exit(code);
+}
+
+/* ritorna 1 se argv[1] e' uno dei 5 comandi nuovi (allora la chiamante ha gia'
+ * fatto setenv/validazione e questa funzione ha riempito cap, ebits, dbits
+ * (via puntatore) quando --cap/--ebits/--dbits erano presenti, altrimenti
+ * li lascia a -1). */
+static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
+    if(argc<2) return 0;
+    const char *cmd=argv[1];
+    if(!strcmp(cmd,"--help") || !strcmp(cmd,"-h")) usage(0);   /* CLI polish: alias di 'help' */
+    if(strcmp(cmd,"chat") && strcmp(cmd,"run") && strcmp(cmd,"tf") &&
+       strcmp(cmd,"gen") && strcmp(cmd,"help")) return 0;
+    if(!strcmp(cmd,"help")) usage(0);
+
+    int have_model=0, have_ref=0, have_prompt=0, have_ngen=0;
+    *cap=-1; *ebits=-1; *dbits=-1;
+    for(int i=2;i<argc;i++){
+        const char *a=argv[i];
+        char *e;
+        if(!strcmp(a,"--model")){
+            if(++i>=argc) usage(2);
+            setenv("SNAP",argv[i],1); have_model=1;
+        } else if(!strcmp(a,"--ref")){
+            if(++i>=argc) usage(2);
+            setenv("REF",argv[i],1); have_ref=1;
+        } else if(!strcmp(a,"--ngen")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<1) usage(2);
+            setenv("NGEN",argv[i],1); have_ngen=1;
+        } else if(!strcmp(a,"--ctx")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<1) usage(2);
+            setenv("CTX",argv[i],1);
+        } else if(!strcmp(a,"--temp")){
+            if(++i>=argc) usage(2);
+            double v=strtod(argv[i],&e); if(*e||v<0||v>2) usage(2);
+            setenv("TEMP",argv[i],1);
+        } else if(!strcmp(a,"--top-p")){
+            if(++i>=argc) usage(2);
+            double v=strtod(argv[i],&e); if(*e||v<=0||v>1) usage(2);
+            setenv("NUCLEUS",argv[i],1);
+        } else if(!strcmp(a,"--system")){
+            if(++i>=argc) usage(2);
+            setenv("SYSTEM",argv[i],1);
+        } else if(!strcmp(a,"--prompt")){
+            if(++i>=argc) usage(2);
+            if(strcmp(cmd,"run")){ fprintf(stderr,"--prompt e' solo per 'run'\n"); usage(2); }
+            setenv("PROMPT",argv[i],1); have_prompt=1;
+        } else if(!strcmp(a,"--draft")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<0) usage(2);
+            setenv("DRAFT",argv[i],1);
+        } else if(!strcmp(a,"--ram")){
+            if(++i>=argc) usage(2);
+            double v=strtod(argv[i],&e); if(*e||v<=0) usage(2);
+            setenv("RAM_GB",argv[i],1);
+        } else if(!strcmp(a,"--no-kvsave")){
+            setenv("KVSAVE","0",1);
+        } else if(!strcmp(a,"--metal")){
+            setenv("FLOYD_METAL","1",1);
+        } else if(!strcmp(a,"--cap")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<1||v>4096) usage(2);
+            *cap=(int)v;
+        } else if(!strcmp(a,"--ebits")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||(v!=4&&v!=8&&v!=16)) usage(2);
+            *ebits=(int)v;
+        } else if(!strcmp(a,"--dbits")){
+            if(++i>=argc) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||(v!=4&&v!=8&&v!=16)) usage(2);
+            *dbits=(int)v;
+        } else {
+            fprintf(stderr,"flag sconosciuto: %s\n",a); usage(2);
+        }
+    }
+    if(!have_model){ fprintf(stderr,"manca --model\n"); usage(2); }
+    /* Isolamento modo (new-style): un env di modo ereditato dalla shell (PROMPT=,
+     * SERVE=1, CHAT=1, ...) puo' anticipare il dispatch di main() rispetto al
+     * comando appena scelto (main() controlla SCORE/SERVE/PROMPT/CHAT/REPLAY/TF
+     * in quest'ordine prima del default gen/tf). Ripuliamo qui, dopo aver gia'
+     * fatto setenv() del modo scelto sopra, tutte le env di modo che main()
+     * controllerebbe PRIMA di quella del comando scelto — cosi' l'invocazione
+     * new-style e' isolata dall'ambiente ereditato. Path legacy (niente
+     * subcommand): non tocca nulla, cli_adapt torna 0 subito. */
+    if(!strcmp(cmd,"chat")){
+        setenv("CHAT","1",1);
+        unsetenv("PROMPT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
+    } else if(!strcmp(cmd,"run")){
+        if(!have_prompt){ fprintf(stderr,"run richiede --prompt\n"); usage(2); }
+        if(!have_ngen) setenv("NGEN","256",0);   /* run_text legge NGEN con default 64: alziamolo qui,
+                                                   * ma senza sovrascrivere un NGEN ereditato esplicito */
+        unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
+    } else if(!strcmp(cmd,"tf")){
+        if(!have_ref){ fprintf(stderr,"tf richiede --ref\n"); usage(2); }
+        setenv("TF","1",1);
+        unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY");
+    } else if(!strcmp(cmd,"gen")){
+        if(!have_ref){ fprintf(stderr,"gen richiede --ref\n"); usage(2); }
+        unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
+    }
+    return 1;
+}
+
 int main(int argc, char **argv){
+    /* flags -> setenv, solo se argv[1] e' chat/run/tf/gen/help. Legacy path
+     * (argv[1] numerico o assente) resta invariato: cli_adapt torna 0 subito. */
+    int flag_cap=-1, flag_ebits=-1, flag_dbits=-1;
+    int newstyle = cli_adapt(argc, argv, &flag_cap, &flag_ebits, &flag_dbits);
+
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
@@ -2335,6 +2639,14 @@ int main(int argc, char **argv){
     if(g_metal){
         if(!fm_init()){ fprintf(stderr,"[METAL] richiesto ma non disponibile\n"); return 2; }
         fprintf(stderr,"[METAL] attivo: %s (batch S>=%d)\n", fm_device_name(), g_metal_min_s);
+        /* policy hardening (chat-patch): il default FM_MIN_S=8 tiene il decode (S=1) su CPU
+         * di proposito — il wrapper Metal generico (buffer x/y transienti + waitUntilCompleted
+         * per chiamata) e' sperimentale e piu' lento del CPU path per S piccoli (misurato:
+         * 1.66 tok/s vs 5.93 tok/s CPU forzando FM_MIN_S=1 su M3 Ultra). Chi abbassa la soglia
+         * sotto 8 lo sta facendo consapevolmente: avvisiamo forte, ma non tocchiamo il default. */
+        if(g_metal_min_s<8)
+            fprintf(stderr,"[METAL] FM_MIN_S=%d: S<8 (decode) su Metal e' SPERIMENTALE e piu' LENTO "
+                           "del CPU path nel backend attuale — sconsigliato per chat tok/s\n", g_metal_min_s);
     }
 #else
     if(getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))){
@@ -2362,9 +2674,9 @@ int main(int argc, char **argv){
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
-    int cap  = argc>1?atoi(argv[1]):64;
-    int ebits= argc>2?atoi(argv[2]):8;
-    int dbits= argc>3?atoi(argv[3]):ebits;
+    int cap  = newstyle ? (flag_cap  >=0?flag_cap  :64) : (argc>1?atoi(argv[1]):64);
+    int ebits= newstyle ? (flag_ebits>=0?flag_ebits:8)  : (argc>2?atoi(argv[2]):8);
+    int dbits= newstyle ? (flag_dbits>=0?flag_dbits:ebits) : (argc>3?atoi(argv[3]):ebits);
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
@@ -2390,6 +2702,11 @@ int main(int argc, char **argv){
         fprintf(stderr,"CUDA richiesto ma questo binario e' CPU-only; ricompila con: make CUDA=1\n");
         return 2;
     }
+#endif
+#ifdef FLOYD_METAL
+    if(g_metal)
+        printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | backend: " IDOT_KERNEL "+metal(batch>=%d) ==\n", cap, ebits, dbits, g_metal_min_s);
+    else
 #endif
     printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
@@ -2442,6 +2759,9 @@ int main(int argc, char **argv){
         if(stats) stats_dump(&m,stats);
         return 0;
     }
+
+    /* modo chat interattiva (moonshot chat_template, tokenizer tiktoken): CHAT=1 */
+    if(getenv("CHAT")){ run_chat(&m,snap); if(stats) stats_dump(&m,stats); return 0; }
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";

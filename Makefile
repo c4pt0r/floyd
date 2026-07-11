@@ -36,7 +36,7 @@ TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_ex
 
 all: floyd
 
-floyd: floyd.c st.h json.h tok.h tok_unicode.h moe_route.h compat.h $(METAL_OBJ)
+floyd: floyd.c st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) floyd.c $(METAL_OBJ) -o floyd $(LDFLAGS)
 
 v4_chat: v4_chat.c v4_runtime.h v4_chat_format.h v4_real_layer0.h v4_quant.h v4_hc.h v4_kv_cache.h v4_compress.h v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h $(METAL_OBJ)
