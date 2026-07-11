@@ -30,6 +30,28 @@ static int deepseek_v4_ggml_copy(char *destination, size_t capacity,
     return count >= 0 && (size_t)count < capacity;
 }
 
+static const char *deepseek_v4_ggml_llama_revision =
+    "19b63dc368dfef6db6783e5ba3143927b7ed1c96";
+
+static int deepseek_v4_ggml_revision_matches(const char *model_path) {
+    char manifest[4096];
+    int count = snprintf(manifest, sizeof(manifest), "%s", model_path);
+    if (count < 0 || (size_t)count >= sizeof(manifest)) return 0;
+    char *separator = strrchr(manifest, '/');
+    if (!separator) return 0;
+    snprintf(separator + 1, sizeof(manifest) - (size_t)(separator + 1 - manifest),
+             "llama.cpp-revision.txt");
+
+    FILE *file = fopen(manifest, "rb");
+    if (!file) return 0;
+    char revision[128];
+    int ok = fgets(revision, sizeof(revision), file) != NULL;
+    fclose(file);
+    if (!ok) return 0;
+    revision[strcspn(revision, "\r\n")] = 0;
+    return strcmp(revision, deepseek_v4_ggml_llama_revision) == 0;
+}
+
 static void deepseek_v4_ggml_error(char *error, size_t capacity,
                                    const char *format, const char *value) {
     if (error && capacity) snprintf(error, capacity, format, value ? value : "");
@@ -78,6 +100,14 @@ int deepseek_v4_ggml_find_model(const char *checkpoint_dir,
         int result = glob(pattern, 0, NULL, &matches);
         if (result == 0 && matches.gl_pathc > 0 &&
             deepseek_v4_ggml_regular_file(matches.gl_pathv[0])) {
+            if (!deepseek_v4_ggml_revision_matches(matches.gl_pathv[0])) {
+                deepseek_v4_ggml_error(
+                    error, error_size,
+                    "incompatible prepared GGUF; rerun make prepare-deepseek-v4-gguf DSPARK=%s",
+                    checkpoint_dir);
+                globfree(&matches);
+                return 0;
+            }
             int copied = deepseek_v4_ggml_copy(model_path, model_path_size,
                                                matches.gl_pathv[0]);
             globfree(&matches);

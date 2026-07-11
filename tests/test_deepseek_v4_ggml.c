@@ -20,22 +20,35 @@ static int touch_file(const char *path) {
     return fclose(file) == 0;
 }
 
+static int write_text(const char *path, const char *text) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    fputs(text, file);
+    return fclose(file) == 0;
+}
+
 int main(void) {
     char root[] = "/tmp/floyd-dsv4-ggml.XXXXXX";
     CHECK(mkdtemp(root) != NULL);
 
-    char checkpoint[1024], prepared[1024], shard[1024], override[1024];
+    char checkpoint[1024], prepared[1024], shard[1024], manifest[1024], override[1024];
     snprintf(checkpoint, sizeof(checkpoint), "%s/checkpoint", root);
     snprintf(prepared, sizeof(prepared), "%s-GGUF", checkpoint);
     snprintf(shard, sizeof(shard), "%s/model-mxfp4_moe-00001-of-00004.gguf", prepared);
+    snprintf(manifest, sizeof(manifest), "%s/llama.cpp-revision.txt", prepared);
     snprintf(override, sizeof(override), "%s/override.gguf", root);
     CHECK(mkdir(checkpoint, 0700) == 0);
     CHECK(mkdir(prepared, 0700) == 0);
     CHECK(touch_file(shard));
+    CHECK(write_text(manifest, "incompatible-revision\n"));
     CHECK(touch_file(override));
 
     char found[2048], error[2048];
     unsetenv("FLOYD_DEEPSEEK_V4_GGUF");
+    CHECK(!deepseek_v4_ggml_find_model(checkpoint, found, sizeof(found),
+                                       error, sizeof(error)));
+    CHECK(strstr(error, "incompatible prepared GGUF") != NULL);
+    CHECK(write_text(manifest, "19b63dc368dfef6db6783e5ba3143927b7ed1c96\n"));
     CHECK(deepseek_v4_ggml_find_model(checkpoint, found, sizeof(found),
                                       error, sizeof(error)));
     CHECK(strcmp(found, shard) == 0);
@@ -53,6 +66,7 @@ int main(void) {
 
     unsetenv("FLOYD_DEEPSEEK_V4_GGUF");
     CHECK(unlink(shard) == 0);
+    CHECK(unlink(manifest) == 0);
     CHECK(!deepseek_v4_ggml_find_model(checkpoint, found, sizeof(found),
                                        error, sizeof(error)));
     CHECK(strstr(error, "make prepare-deepseek-v4-gguf") != NULL);
