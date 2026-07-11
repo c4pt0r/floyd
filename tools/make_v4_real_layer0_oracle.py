@@ -495,8 +495,8 @@ def write_base_forward_oracle(model_dir, output_path, token_ids):
             captures[f"layer.{layer}.mean"] = streams.mean(1)
 
     flat = streams.flatten(1).float()
-    normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
-    mixes = F.linear(normalized, checkpoint.tensor("hc_head_fn").float())
+    inv_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+    mixes = F.linear(flat, checkpoint.tensor("hc_head_fn").float()) * inv_rms
     pre = torch.sigmoid(
         mixes * checkpoint.tensor("hc_head_scale").float()
         + checkpoint.tensor("hc_head_base").float()

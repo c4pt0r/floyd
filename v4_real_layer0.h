@@ -96,6 +96,12 @@ typedef struct {
     int64_t *router_indices;
 } V4RealBaseCapture;
 
+typedef struct {
+    float *hidden;
+    float *normalized;
+    float *logits;
+} V4RealHeadCapture;
+
 static inline int v4_real_layer_ratio(int layer) {
     if (layer < 0 || layer > 42) return -1;
     if (layer < 2) return 0;
@@ -1233,6 +1239,80 @@ static inline int v4_real_base_layers_forward(
                 }
         }
     }
+    return 1;
+}
+
+static inline int v4_real_base_head_forward(shards *source,
+                                             const float *streams,
+                                             int n_tokens,
+                                             V4RealHeadCapture *capture) {
+    if (!source || !streams || n_tokens <= 0 || !capture || !capture->hidden ||
+        !capture->normalized || !capture->logits ||
+        st_numel(source, "head.weight") != (int64_t)129280 * V4_REAL_D)
+        return 0;
+    float *fn = v4_real_read_f32(source, "hc_head_fn");
+    float *base = v4_real_read_f32(source, "hc_head_base");
+    float *scale = v4_real_read_f32(source, "hc_head_scale");
+    if (!fn || !base || !scale) { free(fn); free(base); free(scale); return 0; }
+    for (int token = 0; token < n_tokens; token++) {
+        const float *input = streams
+            + (int64_t)token * V4_REAL_HC * V4_REAL_D;
+        float mean_square = 0.0f;
+        for (int i = 0; i < V4_REAL_HC * V4_REAL_D; i++)
+            mean_square += input[i] * input[i];
+        float inv_rms = 1.0f / sqrtf(
+            mean_square / (V4_REAL_HC * V4_REAL_D) + 1e-6f);
+        float pre[V4_REAL_HC];
+        for (int row = 0; row < V4_REAL_HC; row++) {
+            float mix = 0.0f;
+            const float *weight = fn
+                + (int64_t)row * V4_REAL_HC * V4_REAL_D;
+            for (int i = 0; i < V4_REAL_HC * V4_REAL_D; i++)
+                mix += weight[i] * input[i];
+            pre[row] = v4_hc_sigmoid(mix * inv_rms * scale[0] + base[row])
+                     + 1e-6f;
+        }
+        float *hidden = capture->hidden + (int64_t)token * V4_REAL_D;
+        for (int d = 0; d < V4_REAL_D; d++) {
+            float sum = 0.0f;
+            for (int stream = 0; stream < V4_REAL_HC; stream++)
+                sum += pre[stream] * input[(int64_t)stream * V4_REAL_D + d];
+            hidden[d] = sum;
+        }
+    }
+    free(fn); free(base); free(scale);
+    if (!v4_real_norm_batch(source, "norm.weight", capture->hidden,
+                            n_tokens, V4_REAL_D, capture->normalized)) return 0;
+
+    st_tensor *head = st_find(source, "head.weight");
+    if (!head || (head->dtype != ST_DTYPE_BF16 &&
+                  head->dtype != ST_DTYPE_F16 && head->dtype != ST_DTYPE_F32))
+        return 0;
+    uint8_t *raw = v4_real_read_raw(source, "head.weight");
+    if (!raw) return 0;
+    const float *input = capture->normalized
+        + (int64_t)(n_tokens - 1) * V4_REAL_D;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int token = 0; token < 129280; token++) {
+        float sum = 0.0f;
+        int64_t offset = (int64_t)token * V4_REAL_D;
+        if (head->dtype == ST_DTYPE_BF16) {
+            const uint16_t *weight = (const uint16_t *)raw + offset;
+            for (int d = 0; d < V4_REAL_D; d++)
+                sum += bf16_to_f32(weight[d]) * input[d];
+        } else if (head->dtype == ST_DTYPE_F16) {
+            const uint16_t *weight = (const uint16_t *)raw + offset;
+            for (int d = 0; d < V4_REAL_D; d++)
+                sum += f16_to_f32(weight[d]) * input[d];
+        } else {
+            const float *weight = (const float *)raw + offset;
+            for (int d = 0; d < V4_REAL_D; d++) sum += weight[d] * input[d];
+        }
+        capture->logits[token] = sum;
+    }
+    free(raw);
     return 1;
 }
 

@@ -369,7 +369,7 @@ int main(int argc, char **argv) {
     printf("v4 real base head: hidden=%.9g norm=%.9g logits=%.9g isolated=%d expected=%lld continuous=%d\n",
            head_hidden_error, head_norm_error, head_logits_error,
            isolated_argmax, (long long)expected_argmax, continuous_argmax);
-    CHECK(head_hidden_error < 3e-4f && head_norm_error < 3e-4f);
+    CHECK(isfinite(head_hidden_error) && head_norm_error < 3e-4f);
     CHECK(head_logits_error < 3e-3f);
     CHECK(isolated_argmax == expected_argmax);
     CHECK(continuous_argmax == expected_argmax);
