@@ -12,8 +12,9 @@ static int v4_chat_trace_enabled(void) {
 }
 
 static int v4_chat_backend_init(void) {
-    int requested = getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL")) != 0;
+    const char *metal_env = getenv("FLOYD_METAL");
 #ifdef FLOYD_METAL
+    int requested = !metal_env || atoi(metal_env) != 0;
     if (requested) {
         int min_batch = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;
         if (!v4_quant_backend_enable_metal(min_batch)) {
@@ -26,6 +27,7 @@ static int v4_chat_backend_init(void) {
         fprintf(stderr, "V4_BACKEND backend=cpu\n");
     }
 #else
+    int requested = metal_env && atoi(metal_env) != 0;
     if (requested) {
         fprintf(stderr, "FLOYD_METAL requires: make METAL=1 v4_chat\n");
         return 0;

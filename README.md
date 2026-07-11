@@ -84,7 +84,7 @@ make v4_chat
 
 # optional batch FP8/FP4 Metal path (macOS)
 make METAL=1 v4_chat
-FLOYD_METAL=1 ./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
 
 # enable lossless three-stage DSpark proposals
 DSPARK_SPEC=1 ./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
@@ -98,8 +98,9 @@ The executable implements the official V4 chat-mode prompt, incremental KV
 state, streaming decode, `/clear`, and `/exit`. `DSPARK_SPEC=1` enables the
 three speculative layers while retaining base-greedy token identity. Startup
 prints `V4_BACKEND backend=cpu|metal`; each turn prints Metal call and CPU
-fallback counts. A Metal build still defaults to CPU unless `FLOYD_METAL=1` is
-set. `FM_MIN_S` controls the minimum batch size (default 8, minimum 2).
+fallback counts. A Metal build enables the GPU path by default;
+`FLOYD_METAL=0` explicitly selects CPU instead. `FM_MIN_S` controls the minimum
+batch size (default 8, minimum 2).
 
 The Metal path currently covers native DSpark FP8 (E4M3 with 128x128 E8M0
 scales) and FP4 (model codebook with per-32-column E8M0 scales) batch matmul.
