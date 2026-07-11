@@ -35,3 +35,4 @@ fixture_dspark*/
 *.log
 tok_cases.json
 .worktrees/
+.deps/

@@ -38,7 +38,8 @@ after=$(find "$MODEL" -type f -print | sort)
 test "$before" = "$after"
 test -f "$OUTPUT/model-mxfp4_moe-00001-of-00004.gguf"
 test "$(cat "$OUTPUT/llama.cpp-revision.txt")" = "test-revision"
-grep -Fx -- "$MODEL" "$TMP/args"
+MODEL_REAL=$(CDPATH= cd -- "$MODEL" && pwd -P)
+grep -Fx -- "$MODEL_REAL" "$TMP/args"
 grep -Fx -- "--outtype" "$TMP/args"
 grep -Fx -- "auto" "$TMP/args"
 grep -Fx -- "--split-max-size" "$TMP/args"
@@ -55,6 +56,7 @@ grep -F "output directory must not be inside the checkpoint" "$TMP/stderr"
 BAD="$TMP/not-deepseek"
 mkdir -p "$BAD"
 printf '%s\n' '{"model_type":"other"}' > "$BAD/config.json"
+printf '%s\n' '{}' > "$BAD/model.safetensors.index.json"
 if LLAMA_CPP_DIR="$LLAMA" LLAMA_CPP_SKIP_REV_CHECK=1 \
     "$PREPARE" "$BAD" "$TMP/bad-output" >"$TMP/stdout" 2>"$TMP/stderr"; then
     echo "expected non-DeepSeek checkpoint to fail" >&2

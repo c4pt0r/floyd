@@ -149,6 +149,11 @@ test-deepseek-v4-naming:
 test-prepare-deepseek-v4-gguf:
 	sh tests/test_prepare_deepseek_v4_gguf.sh
 
+prepare-deepseek-v4-gguf:
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	PYTHON="$(PYTHON)" tools/prepare_deepseek_v4_gguf.sh "$(DSPARK)" \
+		"$(if $(DEEPSEEK_V4_GGUF),$(DEEPSEEK_V4_GGUF),$(DSPARK)-GGUF)"
+
 test-deepseek-v4-chat-dispatch: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	sh tests/test_deepseek_v4_chat_dispatch.sh "$(DSPARK)"
