@@ -146,6 +146,9 @@ test-cli-default-chat: floyd
 test-deepseek-v4-naming:
 	sh tests/test_deepseek_v4_naming.sh
 
+test-prepare-deepseek-v4-gguf:
+	sh tests/test_prepare_deepseek_v4_gguf.sh
+
 test-deepseek-v4-chat-dispatch: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	sh tests/test_deepseek_v4_chat_dispatch.sh "$(DSPARK)"
