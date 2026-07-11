@@ -126,13 +126,14 @@ colibrì unused, and Python did tokenization for the oracle only). A later
 chat phase closed that gap: `tok_moon.h` is a from-scratch C implementation
 of the moonshot tokenizer (raw-byte-rank BPE + moonshot pre-tokenizer,
 independently gated at 52/52 cases vs the `tiktoken` oracle — see
-[`docs/chat-report.md`](docs/chat-report.md)), and `./floyd chat`/`./floyd run`
+[`docs/chat-report.md`](docs/chat-report.md)), and `./floyd --model DIR`/`./floyd run`
 now do the whole prompt → tokenize → generate → detokenize loop natively,
 with no Python in the loop. See the Quickstart and CLI reference below.
 
 ## Quick start
 
-`floyd` has a CLI: `chat` (interactive multi-turn), `run` (single-shot),
+`floyd` opens `chat` (interactive multi-turn) by default. It also provides
+`run` (single-shot),
 `tf`/`gen` (teacher-forcing / greedy parity checks vs a Python oracle). Every
 command needs `--model DIR` pointing at a converted container or a raw HF
 checkpoint directory.
@@ -174,7 +175,7 @@ make
 
 # interactive multi-turn chat (moonshot chat_template, KV-cache persists across turns
 # and across process restarts unless --no-kvsave)
-./floyd chat --model models/moonlight_i8
+./floyd --model models/moonlight_i8
 
 # single-shot generation
 ./floyd run --model models/moonlight_i8 --prompt "What is the capital of France? Answer in one word."
@@ -229,10 +230,11 @@ threshold kicks in on shapes other than chat decode.
 ```
 $ ./floyd help
 floyd — Moonlight-16B-A3B in pure C
-uso: floyd <comando> [flags] | (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>
+uso: floyd --model DIR [flags] | floyd <comando> [flags]
+      (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>
 
 comandi:
-  chat   conversazione interattiva     floyd chat --model DIR
+  chat   conversazione interattiva     floyd --model DIR (predefinito)
   run    generazione singola           floyd run  --model DIR --prompt "..."
   tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json
   gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json
@@ -260,10 +262,11 @@ oracle reference JSON, required by `tf`/`gen` and rejected (exit 2) for
 `run` is single-shot and never persists KV, with or without the flag. If a
 flag is repeated, the last occurrence wins.)
 
-`chat` starts a REPL (`:reset` clears context, `:exit` quits) that keeps its
+The default command, `chat`, starts a REPL (`:reset` clears context, `:exit`
+quits) that keeps its
 KV-cache warm across turns **and** across process restarts — `<model-dir>/.coli_kv`
 is loaded on startup and appended to after every turn, so re-running
-`./floyd chat --model DIR` on the same conversation resumes instantly with no
+`./floyd --model DIR` on the same conversation resumes instantly with no
 re-prefill (see `docs/chat-report.md` for measured evidence: a 61-token
 conversation resumed in 0.0s). Pass `--no-kvsave` to keep everything
 in-memory only.
@@ -281,7 +284,7 @@ per-run detail. Machine: Apple M3 Ultra, 32 cores, 512 GB RAM, macOS 15.5.
 | Moonlight-16B-A3B-Instruct | int8 | 48/52 · 29/30 | 16/24* | 13.2 |
 | Moonlight-16B-A3B-Instruct | int4 | 46/52 · 24/30 | 16/24* | 18.1 |
 | Moonlight tokenizer (`tok_moon.h` vs `tiktoken`/oracle) | — | **52/52** cases · **42/42** chat-template ids | — | — |
-| Moonlight chat E2E (`./floyd chat`, int8, real weights) | int8 | — | 2-turn memory check: correct "Paris" + correct recall of prior question | 6.7-7.4 tok/s |
+| Moonlight chat E2E (`./floyd --model DIR`, int8, real weights) | int8 | — | 2-turn memory check: correct "Paris" + correct recall of prior question | 6.7-7.4 tok/s |
 
 \* Both int8 and int4 greedy runs match the oracle for the first 16 of 24
 tokens, then emit one spurious extra token at position 17; int8's tail then

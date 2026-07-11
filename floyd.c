@@ -2495,7 +2495,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
 }
 
-/* ---- CLI: floyd <comando> [flags] --------------------------------------
+/* ---- CLI: floyd [comando] [flags] --------------------------------------
  * Adapter sottile: traduce flags in setenv() PRIMA di tutto il resto, cosi'
  * il vecchio corpo di main() (che legge solo getenv + argv[1..3] posizionali)
  * resta identico. Le variabili d'ambiente restano l'interfaccia legacy/debug
@@ -2504,9 +2504,10 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
 static void usage(int code){
     fputs(
 "floyd — Moonlight-16B-A3B in pure C\n"
-"uso: floyd <comando> [flags] | (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>\n\n"
+"uso: floyd --model DIR [flags] | floyd <comando> [flags]\n"
+"      (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>\n\n"
 "comandi:\n"
-"  chat   conversazione interattiva     floyd chat --model DIR\n"
+"  chat   conversazione interattiva     floyd --model DIR (predefinito)\n"
 "  run    generazione singola           floyd run  --model DIR --prompt \"...\"\n"
 "  tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json\n"
 "  gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json\n"
@@ -2522,21 +2523,25 @@ static void usage(int code){
     code?stderr:stdout); exit(code);
 }
 
-/* ritorna 1 se argv[1] e' uno dei 5 comandi nuovi (allora la chiamante ha gia'
- * fatto setenv/validazione e questa funzione ha riempito cap, ebits, dbits
- * (via puntatore) quando --cap/--ebits/--dbits erano presenti, altrimenti
- * li lascia a -1). */
+/* Ritorna 1 per i cinque comandi espliciti o quando argv[1] e' un long flag:
+ * in quest'ultimo caso chat e' il comando predefinito. Riempie cap/ebits/dbits
+ * quando le rispettive flag sono presenti, altrimenti li lascia a -1. */
 static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
     if(argc<2) return 0;
     const char *cmd=argv[1];
+    int first_flag=2;
     if(!strcmp(cmd,"--help") || !strcmp(cmd,"-h")) usage(0);   /* CLI polish: alias di 'help' */
     if(strcmp(cmd,"chat") && strcmp(cmd,"run") && strcmp(cmd,"tf") &&
-       strcmp(cmd,"gen") && strcmp(cmd,"help")) return 0;
+       strcmp(cmd,"gen") && strcmp(cmd,"help")) {
+        if(strncmp(cmd,"--",2)) return 0;
+        cmd="chat";
+        first_flag=1;
+    }
     if(!strcmp(cmd,"help")) usage(0);
 
     int have_model=0, have_ref=0, have_prompt=0, have_ngen=0;
     *cap=-1; *ebits=-1; *dbits=-1;
-    for(int i=2;i<argc;i++){
+    for(int i=first_flag;i<argc;i++){
         const char *a=argv[i];
         char *e;
         if(!strcmp(a,"--model")){
@@ -2625,7 +2630,7 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
 }
 
 int main(int argc, char **argv){
-    /* flags -> setenv, solo se argv[1] e' chat/run/tf/gen/help. Legacy path
+    /* Flags -> setenv per chat implicito o comando esplicito. Il path legacy
      * (argv[1] numerico o assente) resta invariato: cli_adapt torna 0 subito. */
     int flag_cap=-1, flag_ebits=-1, flag_dbits=-1;
     int newstyle = cli_adapt(argc, argv, &flag_cap, &flag_ebits, &flag_dbits);
