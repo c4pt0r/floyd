@@ -41,6 +41,12 @@ int main(int argc, char **argv) {
            first, input, hits);
     CHECK(proposals[0] == v4_runtime_argmax(logits));
     CHECK(hits == 6);
+    int accepted = 0;
+    int chosen = v4_runtime_verify_token(logits, proposals[0], &accepted);
+    CHECK(accepted == 1 && chosen == input);
+    int64_t wrong = proposals[0] == 0 ? 1 : 0;
+    chosen = v4_runtime_verify_token(logits, wrong, &accepted);
+    CHECK(accepted == 0 && chosen == input);
     v4_runtime_free(&runtime);
     return 0;
 }

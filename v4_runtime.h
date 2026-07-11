@@ -198,8 +198,12 @@ static inline int v4_runtime_dspark_prefill(V4Runtime *runtime) {
 static inline int v4_runtime_dspark_propose(
         V4Runtime *runtime, int input_id, int64_t output_ids[6],
         float confidence[5]) {
-    if (!runtime || !runtime->dspark_ready || runtime->last_count != 1 ||
+    if (!runtime || !runtime->dspark_ready || runtime->last_count <= 0 ||
         input_id < 0) return 0;
+    int current_position = runtime->last_start_position
+                         + runtime->last_count - 1;
+    const float *current_main = runtime->main_x
+                              + (int64_t)(runtime->last_count - 1) * V4_REAL_D;
     V4RealDSparkCapture capture = {
         .prefill_kv = runtime->dspark_prefill_kv,
         .stage_outputs = runtime->dspark_stage_outputs,
@@ -208,7 +212,7 @@ static inline int v4_runtime_dspark_propose(
         .confidence = runtime->dspark_confidence,
     };
     if (!v4_real_dspark_propose(
-            &runtime->model, runtime->main_x, runtime->last_start_position,
+            &runtime->model, current_main, current_position,
             input_id, &runtime->dspark_state, &capture)) return 0;
     if (output_ids)
         memcpy(output_ids, runtime->dspark_output_ids,
@@ -230,6 +234,13 @@ static inline int v4_runtime_argmax(const float *logits) {
     for (int token = 1; token < 129280; token++)
         if (logits[token] > logits[best]) best = token;
     return best;
+}
+
+static inline int v4_runtime_verify_token(const float *logits,
+                                          int64_t proposal, int *accepted) {
+    int base = v4_runtime_argmax(logits);
+    if (accepted) *accepted = base >= 0 && proposal == base;
+    return base;
 }
 
 static inline void v4_runtime_free(V4Runtime *runtime) {

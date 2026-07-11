@@ -51,8 +51,67 @@ static int v4_chat_generate(V4Runtime *runtime, Tok *tokenizer,
     return emitted;
 }
 
+static int v4_chat_generate_spec(V4Runtime *runtime, Tok *tokenizer,
+                                 const float *logits, int max_new_tokens,
+                                 int close_turn) {
+    int eos = tok_id_of(tokenizer, "<｜end▁of▁sentence｜>");
+    if (eos < 0 || !logits || max_new_tokens <= 0) return 0;
+    int emitted = 0, accepted = 0, proposed = 0;
+    int pending = -1, ended = 0;
+
+    int token = v4_runtime_argmax(logits);
+    if (token < 0) return -1;
+    if (v4_chat_trace_enabled()) fprintf(stderr, "V4_TOKEN %d\n", token);
+    if (token == eos) {
+        ended = 1;
+    } else {
+        if (!v4_chat_emit(tokenizer, token)) return -1;
+        emitted++;
+        pending = token;
+    }
+
+    while (!ended && emitted < max_new_tokens) {
+        if (!v4_runtime_forward(runtime, &pending, 1, &logits)) return -1;
+        pending = -1;
+        int input_id = v4_runtime_argmax(logits);
+        int64_t proposals[6];
+        float confidence[5];
+        if (!v4_runtime_dspark_propose(
+                runtime, input_id, proposals, confidence)) return -1;
+        for (int rank = 0; rank < 6 && emitted < max_new_tokens; rank++) {
+            int match = 0;
+            int base = v4_runtime_verify_token(logits, proposals[rank], &match);
+            if (base < 0) return -1;
+            proposed++;
+            if (match) accepted++;
+            if (v4_chat_trace_enabled())
+                fprintf(stderr, "V4_TOKEN %d\n", base);
+            if (base == eos) {
+                ended = 1;
+                break;
+            }
+            if (!v4_chat_emit(tokenizer, base)) return -1;
+            emitted++;
+            pending = base;
+            if (!match || emitted == max_new_tokens) break;
+            if (rank + 1 < 6) {
+                if (!v4_runtime_forward(runtime, &pending, 1, &logits)) return -1;
+                pending = -1;
+            }
+        }
+    }
+    fprintf(stderr, "V4_SPEC %d/%d\n", accepted, proposed);
+    if (close_turn) {
+        if (pending >= 0 &&
+            !v4_runtime_forward(runtime, &pending, 1, &logits)) return -1;
+        if (!v4_runtime_forward(runtime, &eos, 1, &logits)) return -1;
+    }
+    return emitted;
+}
+
 static int v4_chat_turn(V4Runtime *runtime, Tok *tokenizer, const char *text,
-                        int first_turn, int max_new_tokens, int close_turn) {
+                        int first_turn, int max_new_tokens, int close_turn,
+                        int use_spec) {
     size_t text_size = strlen(text);
     size_t prompt_cap = text_size + 256;
     char *prompt = malloc(prompt_cap);
@@ -77,13 +136,18 @@ static int v4_chat_turn(V4Runtime *runtime, Tok *tokenizer, const char *text,
     int ok = v4_runtime_forward(runtime, ids, count, &logits);
     free(ids);
     if (!ok) return -1;
+    if (use_spec && !runtime->dspark_ready &&
+        !v4_runtime_dspark_prefill(runtime)) return -1;
     if (close_turn) {
         int available = runtime->max_context
                       - runtime->state.layers[0].next_position - 1;
         if (max_new_tokens > available) max_new_tokens = available;
     }
     if (max_new_tokens <= 0) return -1;
-    return v4_chat_generate(runtime, tokenizer, logits,
+    return use_spec
+         ? v4_chat_generate_spec(runtime, tokenizer, logits,
+                                 max_new_tokens, close_turn)
+         : v4_chat_generate(runtime, tokenizer, logits,
                             max_new_tokens, close_turn);
 }
 
@@ -97,6 +161,7 @@ int main(int argc, char **argv) {
     int max_context = argc >= 3 ? atoi(argv[2]) : 512;
     int max_new_tokens = argc >= 4 ? atoi(argv[3]) : 16;
     if (getenv("NGEN")) max_new_tokens = atoi(getenv("NGEN"));
+    int use_spec = getenv("DSPARK_SPEC") && atoi(getenv("DSPARK_SPEC")) != 0;
     if (max_context <= 0 || max_new_tokens <= 0) {
         fprintf(stderr, "max_context and max_new_tokens must be positive\n");
         return 2;
@@ -115,7 +180,7 @@ int main(int argc, char **argv) {
     const char *one_shot = getenv("PROMPT");
     if (one_shot) {
         int result = v4_chat_turn(&runtime, &tokenizer, one_shot, 1,
-                                  max_new_tokens, 0);
+                                  max_new_tokens, 0, use_spec);
         if (result >= 0) putchar('\n');
         v4_runtime_free(&runtime);
         return result < 0;
@@ -142,7 +207,7 @@ int main(int argc, char **argv) {
         fputs("assistant> ", stdout);
         fflush(stdout);
         int result = v4_chat_turn(&runtime, &tokenizer, line, first_turn,
-                                  max_new_tokens, 1);
+                                  max_new_tokens, 1, use_spec);
         putchar('\n');
         if (result < 0) { status = 1; break; }
         first_turn = 0;
