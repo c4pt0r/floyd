@@ -104,6 +104,7 @@ typedef struct {
 
 typedef struct {
     float *main_kv;
+    int next_position;
 } V4RealDSparkState;
 
 typedef struct {
@@ -116,6 +117,7 @@ typedef struct {
 
 static inline int v4_real_dspark_state_init(V4RealDSparkState *state) {
     if (!state) return 0;
+    memset(state, 0, sizeof(*state));
     state->main_kv = calloc((size_t)3 * 128 * V4_REAL_HD, sizeof(float));
     return state->main_kv != NULL;
 }
@@ -1583,7 +1585,10 @@ fail:
 static inline int v4_real_dspark_attention(
         shards *source, int stage, const float *hidden, const float *main_x,
         int start_position, V4RealDSparkState *state, float *output) {
-    enum { TOKENS = 5, KEYS = 10 };
+    enum { TOKENS = 5, MAX_KEYS = 133 };
+    if (!source || stage < 0 || stage >= 3 || !hidden || !main_x ||
+        start_position < 0 || !state || !state->main_kv || !output)
+        return 0;
     char prefix[320], name[320];
     snprintf(prefix, sizeof(prefix), "mtp.%d.attn", stage);
     float *main_kv = state->main_kv + (int64_t)stage * 128 * V4_REAL_HD;
@@ -1595,14 +1600,18 @@ static inline int v4_real_dspark_attention(
     if (!v4_real_norm_batch(source, name, decode_kv, 1,
                             V4_REAL_HD, decode_kv)) return 0;
     v4_real_rope(decode_kv, V4_REAL_HD, start_position, 0, 0);
-    memcpy(main_kv + (int64_t)start_position * V4_REAL_HD,
+    memcpy(main_kv + (int64_t)(start_position % 128) * V4_REAL_HD,
            decode_kv, V4_REAL_HD * sizeof(float));
+
+    int history = start_position + 1;
+    if (history > 128) history = 128;
+    int n_keys = history + TOKENS;
 
     float *q_a = malloc(TOKENS * V4_REAL_QR * sizeof(float));
     float *q_norm = malloc(TOKENS * V4_REAL_QR * sizeof(float));
     float *q = malloc((size_t)TOKENS * V4_REAL_HEADS * V4_REAL_HD * sizeof(float));
     float *kv = malloc(TOKENS * V4_REAL_HD * sizeof(float));
-    float *keys = malloc(KEYS * V4_REAL_HD * sizeof(float));
+    float *keys = malloc((size_t)n_keys * V4_REAL_HD * sizeof(float));
     float *context = malloc((size_t)TOKENS * V4_REAL_HEADS * V4_REAL_HD * sizeof(float));
     float *group_input = malloc(TOKENS * 4096 * sizeof(float));
     float *group_output = malloc(TOKENS * 1024 * sizeof(float));
@@ -1638,8 +1647,8 @@ static inline int v4_real_dspark_attention(
             v4_real_rope(query, V4_REAL_HD, position, 0, 0);
         }
     }
-    memcpy(keys, main_kv, (size_t)(start_position + 1) * V4_REAL_HD * sizeof(float));
-    memcpy(keys + (int64_t)(start_position + 1) * V4_REAL_HD, kv,
+    memcpy(keys, main_kv, (size_t)history * V4_REAL_HD * sizeof(float));
+    memcpy(keys + (int64_t)history * V4_REAL_HD, kv,
            TOKENS * V4_REAL_HD * sizeof(float));
     snprintf(name, sizeof(name), "%s.attn_sink", prefix);
     float *sinks = v4_real_read_f32(source, name);
@@ -1649,8 +1658,8 @@ static inline int v4_real_dspark_attention(
         for (int head = 0; head < V4_REAL_HEADS; head++) {
             const float *query = q + ((int64_t)token * V4_REAL_HEADS + head)
                                    * V4_REAL_HD;
-            float scores[KEYS], maximum = sinks[head];
-            for (int key = 0; key < KEYS; key++) {
+            float scores[MAX_KEYS], maximum = sinks[head];
+            for (int key = 0; key < n_keys; key++) {
                 float score = 0.0f;
                 for (int d = 0; d < V4_REAL_HD; d++)
                     score += query[d] * keys[(int64_t)key * V4_REAL_HD + d];
@@ -1661,7 +1670,7 @@ static inline int v4_real_dspark_attention(
             float *result = context
                 + ((int64_t)token * V4_REAL_HEADS + head) * V4_REAL_HD;
             memset(result, 0, V4_REAL_HD * sizeof(float));
-            for (int key = 0; key < KEYS; key++) {
+            for (int key = 0; key < n_keys; key++) {
                 float probability = expf(scores[key] - maximum);
                 denominator += probability;
                 for (int d = 0; d < V4_REAL_HD; d++)
@@ -1707,7 +1716,7 @@ fail:
 
 static inline int v4_real_dspark_stage(
         shards *source, int stage, float *streams, const float *main_x,
-        V4RealDSparkState *state) {
+        int start_position, V4RealDSparkState *state) {
     enum { TOKENS = 5 };
     char prefix[64], name[128];
     snprintf(prefix, sizeof(prefix), "mtp.%d", stage);
@@ -1723,7 +1732,7 @@ static inline int v4_real_dspark_stage(
     snprintf(name, sizeof(name), "%s.attn_norm.weight", prefix);
     if (!v4_real_norm_batch(source, name, collapsed, TOKENS,
                             V4_REAL_D, hidden)) goto fail;
-    if (!v4_real_dspark_attention(source, stage, hidden, main_x, 4,
+    if (!v4_real_dspark_attention(source, stage, hidden, main_x, start_position,
                                   state, block)) goto fail;
     v4_real_hc_post_batch(residual, block, streams, post, comb, TOKENS);
     if (!v4_real_hc_named(source, prefix, "ffn", residual, TOKENS,
@@ -1815,29 +1824,51 @@ static inline int v4_real_vocab_logits(shards *source, const float *input,
     return 1;
 }
 
-static inline int v4_real_dspark_forward(
-        shards *source, const float *main_x, int n_main, int input_id,
+static inline int v4_real_dspark_prefill(
+        shards *source, const float *main_x, int n_main,
+        V4RealDSparkState *state, V4RealDSparkCapture *capture) {
+    enum { STAGES = 3 };
+    if (!source || !main_x || n_main <= 0 || !state || !state->main_kv ||
+        state->next_position != 0 || !capture || !capture->prefill_kv)
+        return 0;
+    char name[128];
+    float *projected = malloc((size_t)n_main * V4_REAL_HD * sizeof(float));
+    if (!projected) return 0;
+    for (int stage = 0; stage < STAGES; stage++) {
+        snprintf(name, sizeof(name), "mtp.%d.attn.wkv", stage);
+        if (!v4_real_fp8_batch(source, name, main_x, n_main,
+                               V4_REAL_HD, V4_REAL_D, projected)) goto fail;
+        snprintf(name, sizeof(name), "mtp.%d.attn.kv_norm.weight", stage);
+        if (!v4_real_norm_batch(source, name, projected, n_main,
+                                V4_REAL_HD, projected)) goto fail;
+        for (int token = 0; token < n_main; token++) {
+            float *row = projected + (int64_t)token * V4_REAL_HD;
+            v4_real_rope(row, V4_REAL_HD, token, 0, 0);
+            memcpy(state->main_kv
+                       + ((int64_t)stage * 128 + token % 128) * V4_REAL_HD,
+                   row, V4_REAL_HD * sizeof(float));
+        }
+        memcpy(capture->prefill_kv
+                   + (int64_t)stage * n_main * V4_REAL_HD,
+               projected, (size_t)n_main * V4_REAL_HD * sizeof(float));
+    }
+    state->next_position = n_main;
+    free(projected);
+    return 1;
+fail:
+    free(projected);
+    return 0;
+}
+
+static inline int v4_real_dspark_propose(
+        shards *source, const float *main_x, int start_position, int input_id,
         V4RealDSparkState *state, V4RealDSparkCapture *capture) {
     enum { STAGES = 3, DRAFT = 5, NOISE_ID = 128799, VOCAB = 129280 };
-    if (!source || !main_x || n_main != 4 || input_id < 0 || !state ||
-        !state->main_kv || !capture || !capture->prefill_kv ||
+    if (!source || !main_x || start_position < 0 || input_id < 0 || !state ||
+        !state->main_kv || state->next_position != start_position || !capture ||
         !capture->stage_outputs || !capture->hidden || !capture->output_ids ||
         !capture->confidence) return 0;
     char name[128];
-    for (int stage = 0; stage < STAGES; stage++) {
-        float *cache = state->main_kv + (int64_t)stage * 128 * V4_REAL_HD;
-        snprintf(name, sizeof(name), "mtp.%d.attn.wkv", stage);
-        if (!v4_real_fp8_batch(source, name, main_x, n_main,
-                               V4_REAL_HD, V4_REAL_D, cache)) return 0;
-        snprintf(name, sizeof(name), "mtp.%d.attn.kv_norm.weight", stage);
-        if (!v4_real_norm_batch(source, name, cache, n_main,
-                                V4_REAL_HD, cache)) return 0;
-        for (int token = 0; token < n_main; token++)
-            v4_real_rope(cache + (int64_t)token * V4_REAL_HD,
-                         V4_REAL_HD, token, 0, 0);
-        memcpy(capture->prefill_kv + (int64_t)stage * n_main * V4_REAL_HD,
-               cache, (size_t)n_main * V4_REAL_HD * sizeof(float));
-    }
     int ids[DRAFT] = {input_id, NOISE_ID, NOISE_ID, NOISE_ID, NOISE_ID};
     float *streams = malloc((size_t)DRAFT * V4_REAL_HC * V4_REAL_D * sizeof(float));
     float *normalized = malloc(DRAFT * V4_REAL_D * sizeof(float));
@@ -1853,10 +1884,9 @@ static inline int v4_real_dspark_forward(
             memcpy(embedding + (int64_t)stream * V4_REAL_D,
                    embedding, V4_REAL_D * sizeof(float));
     }
-    const float *decode_main = main_x + (int64_t)(n_main - 1) * V4_REAL_D;
     for (int stage = 0; stage < STAGES; stage++) {
         if (!v4_real_dspark_stage(source, stage, streams,
-                                  decode_main, state)) goto fail;
+                                  main_x, start_position, state)) goto fail;
         memcpy(capture->stage_outputs
                    + (int64_t)stage * DRAFT * V4_REAL_HC * V4_REAL_D,
                streams, (size_t)DRAFT * V4_REAL_HC * V4_REAL_D * sizeof(float));
@@ -1896,12 +1926,24 @@ static inline int v4_real_dspark_forward(
         for (int d = 0; d < 256; d++) sum += confidence_weight[V4_REAL_D + d] * embed[d];
         capture->confidence[position] = sum;
     }
+    state->next_position = start_position + 1;
     free(confidence_weight); free(markov_w2);
     free(streams); free(normalized); free(logits);
     return 1;
 fail:
     free(markov_w2); free(streams); free(normalized); free(logits);
     return 0;
+}
+
+static inline int v4_real_dspark_forward(
+        shards *source, const float *main_x, int n_main, int input_id,
+        V4RealDSparkState *state, V4RealDSparkCapture *capture) {
+    if (!source || !main_x || n_main != 4 || !state || !capture) return 0;
+    if (!v4_real_dspark_prefill(source, main_x, n_main, state, capture))
+        return 0;
+    return v4_real_dspark_propose(
+        source, main_x + (int64_t)(n_main - 1) * V4_REAL_D,
+        n_main, input_id, state, capture);
 }
 
 static inline int v4_real_layers_forward(shards *source, const int *token_ids,
