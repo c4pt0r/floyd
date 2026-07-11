@@ -9,7 +9,9 @@
 
 #include "moe_route.h"
 #include "st.h"
+#include "v4_compress.h"
 #include "v4_hc.h"
+#include "v4_indexer.h"
 #include "v4_quant.h"
 
 enum {
@@ -41,6 +43,13 @@ typedef struct {
     float *moe_output;
     float *output;
 } V4RealLayer0Capture;
+
+typedef struct {
+    float *compressed_kv;
+    float *index_scores;
+    int64_t *index_ids;
+    float *block_bias;
+} V4RealLayer2CSACapture;
 
 static inline float *v4_real_read_f32(shards *source, const char *name) {
     int64_t count = st_numel(source, name);
@@ -110,23 +119,29 @@ static inline int v4_real_norm(shards *source, const char *name,
     return 1;
 }
 
-static inline int v4_real_hc(shards *source, const char *site, const float *input,
-                             float *post, float *comb, float *collapsed) {
+static inline int v4_real_hc_layer(shards *source, int layer, const char *site,
+                                   const float *input, int n_tokens,
+                                   float *post, float *comb, float *collapsed) {
     char name[320];
-    snprintf(name, sizeof(name), "layers.0.hc_%s_fn", site);
+    snprintf(name, sizeof(name), "layers.%d.hc_%s_fn", layer, site);
     float *fn = v4_real_read_f32(source, name);
-    snprintf(name, sizeof(name), "layers.0.hc_%s_base", site);
+    snprintf(name, sizeof(name), "layers.%d.hc_%s_base", layer, site);
     float *base = v4_real_read_f32(source, name);
-    snprintf(name, sizeof(name), "layers.0.hc_%s_scale", site);
+    snprintf(name, sizeof(name), "layers.%d.hc_%s_scale", layer, site);
     float *scale = v4_real_read_f32(source, name);
     if (!fn || !base || !scale) { free(fn); free(base); free(scale); return 0; }
     V4HyperConnection model = {
         .streams = V4_REAL_HC, .hidden = V4_REAL_D, .sinkhorn_iters = 20,
         .norm_eps = 1e-6f, .hc_eps = 1e-6f, .fn = fn, .base = base, .scale = scale,
     };
-    int ok = v4_hc_forward(&model, input, 1, post, comb, collapsed);
+    int ok = v4_hc_forward(&model, input, n_tokens, post, comb, collapsed);
     free(fn); free(base); free(scale);
     return ok;
+}
+
+static inline int v4_real_hc(shards *source, const char *site, const float *input,
+                             float *post, float *comb, float *collapsed) {
+    return v4_real_hc_layer(source, 0, site, input, 1, post, comb, collapsed);
 }
 
 static inline void v4_real_hc_post(float *output, const float *block,
@@ -271,6 +286,169 @@ static inline int v4_real_moe(shards *source, const float *input, int token_id,
     for (int d = 0; d < V4_REAL_D; d++) capture->moe_output[d] += expert_output[d];
     free(expert_output);
     return 1;
+}
+
+static inline int v4_real_fp8_batch(shards *source, const char *prefix,
+                                    const float *input, int n_inputs,
+                                    int rows, int columns, float *output) {
+    char name[320];
+    snprintf(name, sizeof(name), "%s.weight", prefix);
+    uint8_t *weight = v4_real_read_raw(source, name);
+    snprintf(name, sizeof(name), "%s.scale", prefix);
+    uint8_t *scale = v4_real_read_raw(source, name);
+    if (!weight || !scale) { free(weight); free(scale); return 0; }
+    int ok = v4_fp8_matmul_f32(output, input, n_inputs, weight, scale,
+                               rows, columns, 128);
+    free(weight); free(scale);
+    return ok;
+}
+
+static inline int v4_real_dense_batch(shards *source, const char *name,
+                                      const float *input, int n_inputs,
+                                      int rows, int columns, float *output) {
+    float *weight = v4_real_read_f32(source, name);
+    if (!weight) return 0;
+    for (int token = 0; token < n_inputs; token++)
+        v4_real_matvec(output + (int64_t)token * rows, weight,
+                       input + (int64_t)token * columns, rows, columns);
+    free(weight);
+    return 1;
+}
+
+static inline int v4_real_norm_batch(shards *source, const char *name,
+                                     const float *input, int n_inputs,
+                                     int count, float *output) {
+    float *weight = v4_real_read_f32(source, name);
+    if (!weight) return 0;
+    for (int token = 0; token < n_inputs; token++) {
+        const float *x = input + (int64_t)token * count;
+        float *y = output + (int64_t)token * count;
+        float mean_square = 0.0f;
+        for (int i = 0; i < count; i++) mean_square += x[i] * x[i];
+        float scale = 1.0f / sqrtf(mean_square / count + 1e-6f);
+        for (int i = 0; i < count; i++) y[i] = x[i] * scale * weight[i];
+    }
+    free(weight);
+    return 1;
+}
+
+static inline float v4_real_compress_frequency(int pair) {
+    const int dim = 64;
+    const float base = 160000.0f;
+    float frequency = powf(base, -(2.0f * pair) / dim);
+    float low_value = dim * logf(65536.0f / (32.0f * 2.0f * (float)M_PI))
+                    / (2.0f * logf(base));
+    float high_value = dim * logf(65536.0f / (1.0f * 2.0f * (float)M_PI))
+                     / (2.0f * logf(base));
+    int low = (int)floorf(low_value); if (low < 0) low = 0;
+    int high = (int)ceilf(high_value); if (high > dim - 1) high = dim - 1;
+    float ramp = ((float)pair - low) / (high - low);
+    if (ramp < 0.0f) ramp = 0.0f; if (ramp > 1.0f) ramp = 1.0f;
+    float smooth = 1.0f - ramp;
+    return frequency / 16.0f * (1.0f - smooth) + frequency * smooth;
+}
+
+static inline void v4_real_compress_rope(float *vector, int width,
+                                         int64_t position) {
+    int start = width - 64;
+    for (int pair = 0; pair < 32; pair++) {
+        float angle = (float)position * v4_real_compress_frequency(pair);
+        float cosine = cosf(angle), sine = sinf(angle);
+        int index = start + pair * 2;
+        float first = vector[index], second = vector[index + 1];
+        vector[index] = first * cosine - second * sine;
+        vector[index + 1] = second * cosine + first * sine;
+    }
+}
+
+static inline int v4_real_layer2_csa_forward(shards *source, const float *streams,
+                                             V4RealLayer2CSACapture *capture) {
+    if (!source || !streams || !capture || !capture->compressed_kv ||
+        !capture->index_scores || !capture->index_ids || !capture->block_bias) return 0;
+    enum { TOKENS = 4 };
+    float *post = malloc(TOKENS * V4_REAL_HC * sizeof(float));
+    float *comb = malloc(TOKENS * V4_REAL_HC * V4_REAL_HC * sizeof(float));
+    float *collapsed = malloc(TOKENS * V4_REAL_D * sizeof(float));
+    float *hidden = malloc(TOKENS * V4_REAL_D * sizeof(float));
+    float *q_a = malloc(TOKENS * V4_REAL_QR * sizeof(float));
+    float *q_norm = malloc(TOKENS * V4_REAL_QR * sizeof(float));
+    if (!post || !comb || !collapsed || !hidden || !q_a || !q_norm) goto fail;
+    if (!v4_real_hc_layer(source, 2, "attn", streams, TOKENS,
+                          post, comb, collapsed)) goto fail;
+    if (!v4_real_norm_batch(source, "layers.2.attn_norm.weight", collapsed,
+                            TOKENS, V4_REAL_D, hidden)) goto fail;
+    if (!v4_real_fp8_batch(source, "layers.2.attn.wq_a", hidden, TOKENS,
+                           V4_REAL_QR, V4_REAL_D, q_a)) goto fail;
+    if (!v4_real_norm_batch(source, "layers.2.attn.q_norm.weight", q_a,
+                            TOKENS, V4_REAL_QR, q_norm)) goto fail;
+
+    float *outer_kv = malloc(TOKENS * 1024 * sizeof(float));
+    float *outer_gate = malloc(TOKENS * 1024 * sizeof(float));
+    float *inner_kv = malloc(TOKENS * 256 * sizeof(float));
+    float *inner_gate = malloc(TOKENS * 256 * sizeof(float));
+    if (!outer_kv || !outer_gate || !inner_kv || !inner_gate) goto fail2;
+    if (!v4_real_dense_batch(source, "layers.2.attn.compressor.wkv.weight",
+                             hidden, TOKENS, 1024, V4_REAL_D, outer_kv) ||
+        !v4_real_dense_batch(source, "layers.2.attn.compressor.wgate.weight",
+                             hidden, TOKENS, 1024, V4_REAL_D, outer_gate) ||
+        !v4_real_dense_batch(source, "layers.2.attn.indexer.compressor.wkv.weight",
+                             hidden, TOKENS, 256, V4_REAL_D, inner_kv) ||
+        !v4_real_dense_batch(source, "layers.2.attn.indexer.compressor.wgate.weight",
+                             hidden, TOKENS, 256, V4_REAL_D, inner_gate)) goto fail2;
+    float *outer_ape = v4_real_read_f32(source, "layers.2.attn.compressor.ape");
+    float *outer_norm = v4_real_read_f32(source, "layers.2.attn.compressor.norm.weight");
+    float *inner_ape = v4_real_read_f32(source, "layers.2.attn.indexer.compressor.ape");
+    float *inner_norm = v4_real_read_f32(source, "layers.2.attn.indexer.compressor.norm.weight");
+    float index_kv[128];
+    if (!outer_ape || !outer_norm || !inner_ape || !inner_norm) goto fail3;
+    V4PrefillCompressorF32 outer = {
+        .ratio = 4, .head_dim = 512, .rope_dim = 64, .overlap = 1,
+        .norm_eps = 1e-6f, .rope_theta = 160000.0f,
+        .position_bias = outer_ape, .norm_weight = outer_norm,
+    };
+    V4PrefillCompressorF32 inner = {
+        .ratio = 4, .head_dim = 128, .rope_dim = 64, .overlap = 1,
+        .norm_eps = 1e-6f, .rope_theta = 160000.0f,
+        .position_bias = inner_ape, .norm_weight = inner_norm,
+    };
+    if (!v4_compress_prefill_f32(&outer, outer_kv, outer_gate, TOKENS,
+                                  capture->compressed_kv) ||
+        !v4_compress_prefill_f32(&inner, inner_kv, inner_gate, TOKENS, index_kv)) goto fail3;
+
+    float *queries = malloc(TOKENS * 64 * 128 * sizeof(float));
+    float *head_weights = malloc(TOKENS * 64 * sizeof(float));
+    if (!queries || !head_weights) { free(queries); free(head_weights); goto fail3; }
+    if (!v4_real_fp8_batch(source, "layers.2.attn.indexer.wq_b", q_norm,
+                           TOKENS, 64 * 128, V4_REAL_QR, queries) ||
+        !v4_real_dense_batch(source, "layers.2.attn.indexer.weights_proj.weight",
+                             hidden, TOKENS, 64, V4_REAL_D, head_weights)) {
+        free(queries); free(head_weights); goto fail3;
+    }
+    for (int token = 0; token < TOKENS; token++)
+        for (int head = 0; head < 64; head++)
+            v4_real_compress_rope(queries + ((int64_t)token * 64 + head) * 128,
+                                  128, token);
+    int64_t positions[4] = {0, 1, 2, 3};
+    V4LightningIndexerF32 indexer = {
+        .n_heads = 64, .head_dim = 128, .ratio = 4, .top_k = 1,
+    };
+    int ok = v4_indexer_forward_f32(&indexer, queries, index_kv, head_weights,
+                                    positions, TOKENS, 1, capture->index_scores,
+                                    capture->index_ids);
+    for (int token = 0; token < TOKENS; token++)
+        capture->block_bias[token] = capture->index_ids[token] >= 0 ? 0.0f : -INFINITY;
+    free(queries); free(head_weights);
+    free(outer_ape); free(outer_norm); free(inner_ape); free(inner_norm);
+    free(outer_kv); free(outer_gate); free(inner_kv); free(inner_gate);
+    free(post); free(comb); free(collapsed); free(hidden); free(q_a); free(q_norm);
+    return ok;
+fail3:
+    free(outer_ape); free(outer_norm); free(inner_ape); free(inner_norm);
+fail2:
+    free(outer_kv); free(outer_gate); free(inner_kv); free(inner_gate);
+fail:
+    free(post); free(comb); free(collapsed); free(hidden); free(q_a); free(q_norm);
+    return 0;
 }
 
 static inline int v4_real_layer0_forward(shards *source, int token_id,

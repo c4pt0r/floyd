@@ -30,14 +30,15 @@ static float max_error(const float *actual, const float *expected, int count) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <oracle-dir>\n", argv[0]);
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle>\n", argv[0]);
         return 2;
     }
     enum { D = 4096, HC = 4, EXPERTS = 256, TOP_K = 6 };
-    shards model, oracle;
+    shards model, oracle, oracle_0_2;
     st_init(&model, argv[1]);
     st_init(&oracle, argv[2]);
+    st_init(&oracle_0_2, argv[3]);
     float input[HC * D], attn_post[HC], attn_comb[HC * HC], attn_collapsed[D];
     float attn_norm[D], attn_output[D], after_attn[HC * D];
     float ffn_post[HC], ffn_comb[HC * HC], ffn_collapsed[D], ffn_norm[D];
@@ -86,6 +87,31 @@ int main(int argc, char **argv) {
            attn_error, ffn_error, router_error, weight_error, route_hits, TOP_K);
     CHECK(attn_error < 3e-4f && ffn_error < 3e-4f && router_error < 3e-4f);
     CHECK(weight_error < 3e-5f && route_hits == TOP_K);
+
+    float *layer2_input = load_f32(&oracle_0_2, "layer.2.input", 4 * HC * D);
+    float csa_kv[512], index_scores[4], block_bias[4];
+    int64_t index_ids[4];
+    V4RealLayer2CSACapture csa = {
+        .compressed_kv = csa_kv, .index_scores = index_scores,
+        .index_ids = index_ids, .block_bias = block_bias,
+    };
+    CHECK(layer2_input && v4_real_layer2_csa_forward(&model, layer2_input, &csa));
+    float *expected_kv = load_f32(&oracle_0_2, "layer.2.compressor.kv", 512);
+    float *expected_index_scores = load_f32(&oracle_0_2, "layer.2.indexer.scores", 4);
+    int64_t expected_index_ids[4];
+    st_read_raw(&oracle_0_2, "layer.2.indexer.indices", expected_index_ids, 0);
+    float csa_error = max_error(csa_kv, expected_kv, 512);
+    float index_error = max_error(index_scores, expected_index_scores, 4);
+    int index_hits = 0, bias_hits = 0;
+    for (int i = 0; i < 4; i++) {
+        if (index_ids[i] == expected_index_ids[i]) index_hits++;
+        if ((index_ids[i] >= 0 && block_bias[i] == 0.0f) ||
+            (index_ids[i] < 0 && isinf(block_bias[i]) && block_bias[i] < 0.0f)) bias_hits++;
+    }
+    printf("v4 real layer2 CSA: compressor=%.9g indexer=%.9g indices=%d/4 bias=%d/4\n",
+           csa_error, index_error, index_hits, bias_hits);
+    CHECK(csa_error < 3e-4f && index_error < 3e-4f);
+    CHECK(index_hits == 4 && bias_hits == 4);
     puts("v4 real layer0 tests: ok");
     return 0;
 }

@@ -371,9 +371,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--layers-0-2-output")
     parser.add_argument("--token-id", type=int, default=3)
     args = parser.parse_args()
     write_layer0_oracle(args.model, args.output, args.token_id)
+    if args.layers_0_2_output:
+        write_layers_0_2_oracle(args.model, args.layers_0_2_output, [3, 14, 15, 9])
     print(f"saved {args.output}")
 
 
