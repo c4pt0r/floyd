@@ -256,10 +256,12 @@ def rope_batch(x, positions, compressed, inverse=False):
 def compressor_batch(checkpoint, prefix, hidden, head_dim, ratio):
     projected_kv = F.linear(hidden.float(), checkpoint.tensor(f"{prefix}.wkv.weight").float())
     projected_gate = F.linear(hidden.float(), checkpoint.tensor(f"{prefix}.wgate.weight").float())
-    assert hidden.shape[0] % ratio == 0
     blocks = hidden.shape[0] // ratio
-    kv = projected_kv.reshape(blocks, ratio, -1)
-    gate = projected_gate.reshape(blocks, ratio, -1)
+    if blocks == 0:
+        return projected_kv.new_empty((0, head_dim)), projected_kv, projected_gate
+    cutoff = blocks * ratio
+    kv = projected_kv[:cutoff].reshape(blocks, ratio, -1)
+    gate = projected_gate[:cutoff].reshape(blocks, ratio, -1)
     gate = gate + checkpoint.tensor(f"{prefix}.ape").float()
     if ratio == 4:
         pooled_blocks = []
@@ -438,12 +440,41 @@ def write_layer3_hca_oracle(model_dir, output_path, token_ids):
     save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
 
 
+def write_layers_3_4_oracle(model_dir, output_path, token_ids):
+    assert len(token_ids) == 4
+    torch.set_num_threads(8)
+    checkpoint = Checkpoint(model_dir)
+    streams = torch.stack([checkpoint.row("embed.weight", token).float() for token in token_ids])
+    streams = streams[:, None, :].repeat(1, 4, 1)
+    captures = {}
+    for layer in range(5):
+        layer_captures = captures if layer >= 3 else {}
+        if layer >= 3:
+            captures[f"layer.{layer}.input"] = streams.clone()
+        collapsed, post, comb = hc_batch(checkpoint, layer, "attn", streams)
+        hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.attn_norm.weight"))
+        streams = hc_post_batch(
+            attention_batch(checkpoint, layer, hidden, layer_captures), streams, post, comb
+        )
+        collapsed, post, comb = hc_batch(checkpoint, layer, "ffn", streams)
+        hidden = norm_batch(collapsed, checkpoint.tensor(f"layers.{layer}.ffn_norm.weight"))
+        streams = hc_post_batch(
+            moe_batch(checkpoint, layer, hidden, token_ids, layer_captures), streams, post, comb
+        )
+        if layer >= 3:
+            captures[f"layer.{layer}.output"] = streams.clone()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--layers-0-2-output")
     parser.add_argument("--layer3-hca-output")
+    parser.add_argument("--layers-3-4-output")
     parser.add_argument("--token-id", type=int, default=3)
     args = parser.parse_args()
     write_layer0_oracle(args.model, args.output, args.token_id)
@@ -451,6 +482,8 @@ def main():
         write_layers_0_2_oracle(args.model, args.layers_0_2_output, [3, 14, 15, 9])
     if args.layer3_hca_output:
         write_layer3_hca_oracle(args.model, args.layer3_hca_output, [3] * 128)
+    if args.layers_3_4_output:
+        write_layers_3_4_oracle(args.model, args.layers_3_4_output, [3, 14, 15, 9])
     print(f"saved {args.output}")
 
 
