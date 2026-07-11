@@ -12,6 +12,7 @@
 #include "v4_compress.h"
 #include "v4_hc.h"
 #include "v4_indexer.h"
+#include "v4_kv_cache.h"
 #include "v4_quant.h"
 
 enum {
@@ -50,6 +51,99 @@ typedef struct {
     int64_t *index_ids;
     float *block_bias;
 } V4RealLayer2CSACapture;
+
+typedef struct {
+    float *projected_kv;
+    float *projected_gate;
+    float *router_scores;
+    float *router_weights;
+    int64_t *router_indices;
+} V4RealLayerCapture;
+
+typedef struct {
+    int layer;
+    int ratio;
+    int max_context;
+    int next_position;
+    V4KVCacheF32 window;
+    V4KVCacheF32 compressed;
+    V4KVCacheF32 index;
+    float *window_keys;
+    int64_t *window_positions;
+    float *compressed_keys;
+    int64_t *compressed_positions;
+    float *index_keys;
+    int64_t *index_positions;
+    float *compressor_kv_state;
+    float *compressor_gate_state;
+    float *index_kv_state;
+    float *index_gate_state;
+} V4RealLayerState;
+
+static inline int v4_real_layer_ratio(int layer) {
+    if (layer < 0 || layer > 42) return -1;
+    if (layer < 2) return 0;
+    return (layer & 1) ? 128 : 4;
+}
+
+static inline void v4_real_layer_state_free(V4RealLayerState *state) {
+    if (!state) return;
+    free(state->window_keys); free(state->window_positions);
+    free(state->compressed_keys); free(state->compressed_positions);
+    free(state->index_keys); free(state->index_positions);
+    free(state->compressor_kv_state); free(state->compressor_gate_state);
+    free(state->index_kv_state); free(state->index_gate_state);
+    memset(state, 0, sizeof(*state));
+}
+
+static inline int v4_real_layer_state_init(V4RealLayerState *state, int layer,
+                                            int max_context) {
+    if (!state || max_context <= 0) return 0;
+    int ratio = v4_real_layer_ratio(layer);
+    if (ratio < 0) return 0;
+    memset(state, 0, sizeof(*state));
+    state->layer = layer;
+    state->ratio = ratio;
+    state->max_context = max_context;
+    int compressed_capacity = ratio ? (max_context + ratio - 1) / ratio : 1;
+    state->window_keys = malloc((size_t)128 * V4_REAL_HD * sizeof(float));
+    state->window_positions = malloc(128 * sizeof(int64_t));
+    state->compressed_keys = malloc((size_t)compressed_capacity * V4_REAL_HD * sizeof(float));
+    state->compressed_positions = malloc((size_t)compressed_capacity * sizeof(int64_t));
+    if (!state->window_keys || !state->window_positions ||
+        !state->compressed_keys || !state->compressed_positions) goto fail;
+    if (!v4_kv_cache_init(&state->window, V4_KV_CACHE_RING, 128, V4_REAL_HD,
+                          state->window_keys, state->window_positions) ||
+        !v4_kv_cache_init(&state->compressed, V4_KV_CACHE_APPEND,
+                          compressed_capacity, V4_REAL_HD,
+                          state->compressed_keys, state->compressed_positions)) goto fail;
+    if (ratio) {
+        int overlap = ratio == 4;
+        int rows = (1 + overlap) * ratio;
+        int width = (1 + overlap) * V4_REAL_HD;
+        state->compressor_kv_state = calloc((size_t)rows * width, sizeof(float));
+        state->compressor_gate_state = malloc((size_t)rows * width * sizeof(float));
+        if (!state->compressor_kv_state || !state->compressor_gate_state) goto fail;
+        for (int64_t i = 0; i < (int64_t)rows * width; i++)
+            state->compressor_gate_state[i] = -INFINITY;
+    }
+    if (ratio == 4) {
+        state->index_keys = malloc((size_t)compressed_capacity * 128 * sizeof(float));
+        state->index_positions = malloc((size_t)compressed_capacity * sizeof(int64_t));
+        state->index_kv_state = calloc((size_t)8 * 256, sizeof(float));
+        state->index_gate_state = malloc((size_t)8 * 256 * sizeof(float));
+        if (!state->index_keys || !state->index_positions ||
+            !state->index_kv_state || !state->index_gate_state) goto fail;
+        for (int i = 0; i < 8 * 256; i++) state->index_gate_state[i] = -INFINITY;
+        if (!v4_kv_cache_init(&state->index, V4_KV_CACHE_APPEND,
+                              compressed_capacity, 128,
+                              state->index_keys, state->index_positions)) goto fail;
+    }
+    return 1;
+fail:
+    v4_real_layer_state_free(state);
+    return 0;
+}
 
 static inline float *v4_real_read_f32(shards *source, const char *name) {
     int64_t count = st_numel(source, name);
@@ -451,6 +545,58 @@ fail:
     return 0;
 }
 
+static inline int v4_real_compress_layer_prefill(
+        shards *source, int layer, const float *hidden, int n_tokens,
+        V4RealLayerState *state, V4RealLayerCapture *capture) {
+    if (!source || !hidden || !state || state->layer != layer ||
+        state->ratio <= 0 || state->next_position != 0 || n_tokens <= 0 ||
+        n_tokens % state->ratio != 0) return 0;
+    int overlap = state->ratio == 4;
+    int width = (1 + overlap) * V4_REAL_HD;
+    int n_entries = n_tokens / state->ratio;
+    float *kv = malloc((size_t)n_tokens * width * sizeof(float));
+    float *gate = malloc((size_t)n_tokens * width * sizeof(float));
+    float *compressed = malloc((size_t)n_entries * V4_REAL_HD * sizeof(float));
+    char name[320];
+    if (!kv || !gate || !compressed) goto fail;
+    snprintf(name, sizeof(name), "layers.%d.attn.compressor.wkv.weight", layer);
+    if (!v4_real_dense_batch(source, name, hidden, n_tokens,
+                             width, V4_REAL_D, kv)) goto fail;
+    snprintf(name, sizeof(name), "layers.%d.attn.compressor.wgate.weight", layer);
+    if (!v4_real_dense_batch(source, name, hidden, n_tokens,
+                             width, V4_REAL_D, gate)) goto fail;
+    if (capture && capture->projected_kv)
+        memcpy(capture->projected_kv, kv,
+               (size_t)n_tokens * width * sizeof(float));
+    if (capture && capture->projected_gate)
+        memcpy(capture->projected_gate, gate,
+               (size_t)n_tokens * width * sizeof(float));
+    snprintf(name, sizeof(name), "layers.%d.attn.compressor.ape", layer);
+    float *ape = v4_real_read_f32(source, name);
+    snprintf(name, sizeof(name), "layers.%d.attn.compressor.norm.weight", layer);
+    float *norm = v4_real_read_f32(source, name);
+    if (!ape || !norm) { free(ape); free(norm); goto fail; }
+    V4PrefillCompressorF32 model = {
+        .ratio = state->ratio, .head_dim = V4_REAL_HD, .rope_dim = 64,
+        .overlap = overlap, .norm_eps = 1e-6f, .rope_theta = 160000.0f,
+        .position_bias = ape, .norm_weight = norm,
+    };
+    int ok = v4_compress_prefill_f32(&model, kv, gate, n_tokens, compressed);
+    free(ape); free(norm);
+    if (!ok) goto fail;
+    for (int entry = 0; entry < n_entries; entry++) {
+        int64_t position = (int64_t)entry * state->ratio;
+        if (!v4_kv_cache_append(&state->compressed,
+                                compressed + (int64_t)entry * V4_REAL_HD,
+                                position)) goto fail;
+    }
+    free(kv); free(gate); free(compressed);
+    return 1;
+fail:
+    free(kv); free(gate); free(compressed);
+    return 0;
+}
+
 static inline float v4_real_rope_frequency(int pair, int compressed) {
     if (compressed) return v4_real_compress_frequency(pair);
     return powf(10000.0f, -(2.0f * pair) / 64.0f);
@@ -495,6 +641,7 @@ static inline void v4_real_hc_post_batch(float *output, const float *block,
 static inline int v4_real_attention_batch(shards *source, int layer,
                                            const float *hidden, int n_tokens,
                                            const V4RealLayer2CSACapture *csa,
+                                           V4RealLayerState *state,
                                            float *output) {
     char prefix[320], name[320];
     snprintf(prefix, sizeof(prefix), "layers.%d.attn", layer);
@@ -526,9 +673,11 @@ static inline int v4_real_attention_batch(shards *source, int layer,
                             V4_REAL_HD, kv)) goto fail;
 
     int compressed = layer >= 2;
+    int start_position = state ? state->next_position : 0;
     for (int token = 0; token < n_tokens; token++) {
+        int64_t position = start_position + token;
         v4_real_rope(kv + (int64_t)token * V4_REAL_HD,
-                     V4_REAL_HD, token, compressed, 0);
+                     V4_REAL_HD, position, compressed, 0);
         for (int head = 0; head < V4_REAL_HEADS; head++) {
             float *query = q + ((int64_t)token * V4_REAL_HEADS + head)
                              * V4_REAL_HD;
@@ -537,7 +686,7 @@ static inline int v4_real_attention_batch(shards *source, int layer,
                 mean_square += query[d] * query[d];
             float scale = 1.0f / sqrtf(mean_square / V4_REAL_HD + 1e-6f);
             for (int d = 0; d < V4_REAL_HD; d++) query[d] *= scale;
-            v4_real_rope(query, V4_REAL_HD, token, compressed, 0);
+            v4_real_rope(query, V4_REAL_HD, position, compressed, 0);
         }
     }
 
@@ -546,12 +695,14 @@ static inline int v4_real_attention_batch(shards *source, int layer,
     if (!sinks) goto fail;
     float attention_scale = 1.0f / sqrtf((float)V4_REAL_HD);
     for (int token = 0; token < n_tokens; token++) {
+        int64_t position = start_position + token;
+        int local_start = token >= 127 ? token - 127 : 0;
         int use_compressed = layer == 2 && csa && csa->index_ids[token] >= 0;
         for (int head = 0; head < V4_REAL_HEADS; head++) {
             const float *query = q + ((int64_t)token * V4_REAL_HEADS + head)
                                    * V4_REAL_HD;
             float maximum = sinks[head];
-            for (int key = 0; key <= token; key++) {
+            for (int key = local_start; key <= token; key++) {
                 const float *key_vector = kv + (int64_t)key * V4_REAL_HD;
                 float score = 0.0f;
                 for (int d = 0; d < V4_REAL_HD; d++)
@@ -567,11 +718,23 @@ static inline int v4_real_attention_batch(shards *source, int layer,
                 compressed_score *= attention_scale;
                 if (compressed_score > maximum) maximum = compressed_score;
             }
+            if (state && state->ratio == 128) {
+                for (int entry = 0; entry < state->compressed.count; entry++) {
+                    if (v4_kv_cache_position(&state->compressed, entry)
+                            + state->ratio > position + 1) continue;
+                    const float *key_vector = v4_kv_cache_key(&state->compressed, entry);
+                    float score = 0.0f;
+                    for (int d = 0; d < V4_REAL_HD; d++)
+                        score += query[d] * key_vector[d];
+                    score *= attention_scale;
+                    if (score > maximum) maximum = score;
+                }
+            }
             float denominator = expf(sinks[head] - maximum);
             float *result = context
                 + ((int64_t)token * V4_REAL_HEADS + head) * V4_REAL_HD;
             memset(result, 0, V4_REAL_HD * sizeof(float));
-            for (int key = 0; key <= token; key++) {
+            for (int key = local_start; key <= token; key++) {
                 const float *key_vector = kv + (int64_t)key * V4_REAL_HD;
                 float score = 0.0f;
                 for (int d = 0; d < V4_REAL_HD; d++)
@@ -587,11 +750,30 @@ static inline int v4_real_attention_batch(shards *source, int layer,
                 for (int d = 0; d < V4_REAL_HD; d++)
                     result[d] += probability * csa->compressed_kv[d];
             }
+            if (state && state->ratio == 128) {
+                for (int entry = 0; entry < state->compressed.count; entry++) {
+                    if (v4_kv_cache_position(&state->compressed, entry)
+                            + state->ratio > position + 1) continue;
+                    const float *key_vector = v4_kv_cache_key(&state->compressed, entry);
+                    float score = 0.0f;
+                    for (int d = 0; d < V4_REAL_HD; d++)
+                        score += query[d] * key_vector[d];
+                    float probability = expf(score * attention_scale - maximum);
+                    denominator += probability;
+                    for (int d = 0; d < V4_REAL_HD; d++)
+                        result[d] += probability * key_vector[d];
+                }
+            }
             for (int d = 0; d < V4_REAL_HD; d++) result[d] /= denominator;
-            v4_real_rope(result, V4_REAL_HD, token, compressed, 1);
+            v4_real_rope(result, V4_REAL_HD, position, compressed, 1);
         }
     }
     free(sinks);
+    if (state)
+        for (int token = 0; token < n_tokens; token++)
+            if (!v4_kv_cache_append(&state->window,
+                                    kv + (int64_t)token * V4_REAL_HD,
+                                    start_position + token)) goto fail;
 
     snprintf(name, sizeof(name), "%s.wo_a.weight", prefix);
     uint8_t *wo_a = v4_real_read_raw(source, name);
@@ -630,12 +812,20 @@ fail:
 
 static inline int v4_real_moe_batch(shards *source, int layer,
                                      const float *hidden, const int *token_ids,
-                                     int n_tokens, float *output) {
+                                     int n_tokens, V4RealLayerCapture *capture,
+                                     float *output) {
     char name[320], prefix[320];
     snprintf(name, sizeof(name), "layers.%d.ffn.gate.weight", layer);
     float *router = v4_real_read_f32(source, name);
+    float *bias = NULL;
+    if (layer >= 3) {
+        snprintf(name, sizeof(name), "layers.%d.ffn.gate.bias", layer);
+        bias = v4_real_read_f32(source, name);
+    }
     float *expert_output = malloc(V4_REAL_D * sizeof(float));
-    if (!router || !expert_output) { free(router); free(expert_output); return 0; }
+    if (!router || (layer >= 3 && !bias) || !expert_output) {
+        free(router); free(bias); free(expert_output); return 0;
+    }
     for (int token = 0; token < n_tokens; token++) {
         const float *input = hidden + (int64_t)token * V4_REAL_D;
         float logits[V4_REAL_EXPERTS], scores[V4_REAL_EXPERTS];
@@ -643,15 +833,34 @@ static inline int v4_real_moe_batch(shards *source, int layer,
         int indices[V4_REAL_TOPK];
         int64_t stored_indices[V4_REAL_TOPK];
         v4_real_matvec(logits, router, input, V4_REAL_EXPERTS, V4_REAL_D);
-        snprintf(name, sizeof(name), "layers.%d.ffn.gate.tid2eid", layer);
-        st_read_slice_raw(source, name,
-                          (int64_t)token_ids[token] * V4_REAL_TOPK * sizeof(int64_t),
-                          V4_REAL_TOPK * sizeof(int64_t), stored_indices, 0);
-        for (int k = 0; k < V4_REAL_TOPK; k++) indices[k] = (int)stored_indices[k];
-        if (moe_route_fixed(logits, V4_REAL_EXPERTS, indices, V4_REAL_TOPK,
-                            MOE_SCORE_SQRT_SOFTPLUS, weights, scores)
-            != V4_REAL_TOPK) goto fail;
+        if (layer < 3) {
+            snprintf(name, sizeof(name), "layers.%d.ffn.gate.tid2eid", layer);
+            st_read_slice_raw(source, name,
+                              (int64_t)token_ids[token] * V4_REAL_TOPK * sizeof(int64_t),
+                              V4_REAL_TOPK * sizeof(int64_t), stored_indices, 0);
+            for (int k = 0; k < V4_REAL_TOPK; k++) indices[k] = (int)stored_indices[k];
+            if (moe_route_fixed(logits, V4_REAL_EXPERTS, indices, V4_REAL_TOPK,
+                                MOE_SCORE_SQRT_SOFTPLUS, weights, scores)
+                != V4_REAL_TOPK) goto fail;
+        } else {
+            float selection_scores[V4_REAL_EXPERTS];
+            if (moe_route_select(logits, bias, V4_REAL_EXPERTS, V4_REAL_TOPK,
+                                 MOE_SCORE_SQRT_SOFTPLUS, indices, weights,
+                                 scores, selection_scores) != V4_REAL_TOPK) goto fail;
+        }
         moe_route_finalize(weights, V4_REAL_TOPK, 1, 1.5f);
+        if (capture) {
+            if (capture->router_scores)
+                memcpy(capture->router_scores + (int64_t)token * V4_REAL_EXPERTS,
+                       scores, V4_REAL_EXPERTS * sizeof(float));
+            if (capture->router_weights)
+                memcpy(capture->router_weights + (int64_t)token * V4_REAL_TOPK,
+                       weights, V4_REAL_TOPK * sizeof(float));
+            if (capture->router_indices)
+                for (int k = 0; k < V4_REAL_TOPK; k++)
+                    capture->router_indices[(int64_t)token * V4_REAL_TOPK + k]
+                        = indices[k];
+        }
         float *token_output = output + (int64_t)token * V4_REAL_D;
         memset(token_output, 0, V4_REAL_D * sizeof(float));
         for (int k = 0; k < V4_REAL_TOPK; k++) {
@@ -666,10 +875,10 @@ static inline int v4_real_moe_batch(shards *source, int layer,
                             expert_output)) goto fail;
         for (int d = 0; d < V4_REAL_D; d++) token_output[d] += expert_output[d];
     }
-    free(router); free(expert_output);
+    free(router); free(bias); free(expert_output);
     return 1;
 fail:
-    free(router); free(expert_output);
+    free(router); free(bias); free(expert_output);
     return 0;
 }
 
@@ -694,7 +903,8 @@ static inline int v4_real_layer_forward(shards *source, int layer,
     if (!v4_real_norm_batch(source, name, collapsed, n_tokens,
                             V4_REAL_D, hidden)) goto fail;
     if (layer == 2 && !v4_real_layer2_csa_forward(source, streams, csa)) goto fail;
-    if (!v4_real_attention_batch(source, layer, hidden, n_tokens, csa, block)) goto fail;
+    if (!v4_real_attention_batch(source, layer, hidden, n_tokens,
+                                 csa, NULL, block)) goto fail;
     v4_real_hc_post_batch(residual, block, streams, post, comb, n_tokens);
 
     if (!v4_real_hc_layer(source, layer, "ffn", residual, n_tokens,
@@ -702,8 +912,52 @@ static inline int v4_real_layer_forward(shards *source, int layer,
     snprintf(name, sizeof(name), "layers.%d.ffn_norm.weight", layer);
     if (!v4_real_norm_batch(source, name, collapsed, n_tokens,
                             V4_REAL_D, hidden)) goto fail;
-    if (!v4_real_moe_batch(source, layer, hidden, token_ids, n_tokens, block)) goto fail;
+    if (!v4_real_moe_batch(source, layer, hidden, token_ids, n_tokens,
+                           NULL, block)) goto fail;
     v4_real_hc_post_batch(streams, block, residual, post, comb, n_tokens);
+    free(post); free(comb); free(collapsed); free(hidden); free(block); free(residual);
+    return 1;
+fail:
+    free(post); free(comb); free(collapsed); free(hidden); free(block); free(residual);
+    return 0;
+}
+
+static inline int v4_real_layer_forward_state(
+        shards *source, int layer, const int *token_ids, int n_tokens,
+        float *streams, V4RealLayerState *state, V4RealLayerCapture *capture) {
+    if (!source || !token_ids || !streams || !state || state->layer != layer ||
+        layer < 3 || layer > 42 || state->ratio != 128 ||
+        state->next_position != 0 || n_tokens <= 0 ||
+        n_tokens % state->ratio != 0) return 0;
+    size_t streams_count = (size_t)n_tokens * V4_REAL_HC * V4_REAL_D;
+    float *post = malloc((size_t)n_tokens * V4_REAL_HC * sizeof(float));
+    float *comb = malloc((size_t)n_tokens * V4_REAL_HC * V4_REAL_HC * sizeof(float));
+    float *collapsed = malloc((size_t)n_tokens * V4_REAL_D * sizeof(float));
+    float *hidden = malloc((size_t)n_tokens * V4_REAL_D * sizeof(float));
+    float *block = malloc((size_t)n_tokens * V4_REAL_D * sizeof(float));
+    float *residual = malloc(streams_count * sizeof(float));
+    if (!post || !comb || !collapsed || !hidden || !block || !residual) goto fail;
+    if (!v4_real_hc_layer(source, layer, "attn", streams, n_tokens,
+                          post, comb, collapsed)) goto fail;
+    char name[320];
+    snprintf(name, sizeof(name), "layers.%d.attn_norm.weight", layer);
+    if (!v4_real_norm_batch(source, name, collapsed, n_tokens,
+                            V4_REAL_D, hidden)) goto fail;
+    if (!v4_real_compress_layer_prefill(source, layer, hidden, n_tokens,
+                                        state, capture)) goto fail;
+    if (!v4_real_attention_batch(source, layer, hidden, n_tokens,
+                                 NULL, state, block)) goto fail;
+    v4_real_hc_post_batch(residual, block, streams, post, comb, n_tokens);
+
+    if (!v4_real_hc_layer(source, layer, "ffn", residual, n_tokens,
+                          post, comb, collapsed)) goto fail;
+    snprintf(name, sizeof(name), "layers.%d.ffn_norm.weight", layer);
+    if (!v4_real_norm_batch(source, name, collapsed, n_tokens,
+                            V4_REAL_D, hidden)) goto fail;
+    if (!v4_real_moe_batch(source, layer, hidden, token_ids, n_tokens,
+                           capture, block)) goto fail;
+    v4_real_hc_post_batch(streams, block, residual, post, comb, n_tokens);
+    state->next_position += n_tokens;
     free(post); free(comb); free(collapsed); free(hidden); free(block); free(residual);
     return 1;
 fail:

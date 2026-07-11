@@ -153,7 +153,7 @@ fixture_dspark_layer3_hca/oracle.safetensors: tools/make_v4_real_layer0_oracle.p
 	$(PYTHON) tools/make_v4_real_layer0_oracle.py --model "$(DSPARK)" \
 	  --output fixture_dspark_layer0/oracle.safetensors --layer3-hca-output $@
 
-tests/test_v4_real_layer0: tests/test_v4_real_layer0.c v4_real_layer0.h v4_quant.h v4_hc.h moe_route.h st.h json.h compat.h
+tests/test_v4_real_layer0: tests/test_v4_real_layer0.c v4_real_layer0.h v4_quant.h v4_hc.h v4_kv_cache.h moe_route.h st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-v4-real-layer0: fixture_dspark_layer0/oracle.safetensors fixture_dspark_layers_0_2/oracle.safetensors fixture_dspark_layer3_hca/oracle.safetensors tests/test_v4_real_layer0
