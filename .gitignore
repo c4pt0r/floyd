@@ -14,6 +14,7 @@ tests/test_v4_hc
 tests/test_v4_hc_fixture
 tests/test_v4_attention_fixture
 tests/test_v4_compress_fixture
+tests/test_v4_indexer_fixture
 tests/test_st_probe
 tests/test_v4_quant
 tests/test_backend_metal
