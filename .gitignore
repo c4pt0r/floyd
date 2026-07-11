@@ -23,6 +23,7 @@ tests/test_v4_model_manifest
 tests/test_v4_real_layer0
 tests/test_backend_metal
 tests/test_tok_moon
+tests/test_v4_chat_format
 tools/probe_safetensors
 kernels_metal.h
 fixture_tiny*/
