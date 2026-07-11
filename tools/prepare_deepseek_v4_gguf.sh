@@ -7,7 +7,10 @@ LLAMA_CPP_REV=${LLAMA_CPP_REV:-19b63dc368dfef6db6783e5ba3143927b7ed1c96}
 LLAMA_CPP_DIR=${LLAMA_CPP_DIR:-"$ROOT/.deps/llama.cpp"}
 PYTHON=${PYTHON:-python3}
 DEEPSEEK_V4_EXPERT_WORKERS=${DEEPSEEK_V4_EXPERT_WORKERS:-8}
-CONVERTER_PATCH="$ROOT/patches/llama.cpp/deepseek-v4-native-mxfp4-converter.patch"
+LLAMA_PATCHES="
+$ROOT/patches/llama.cpp/deepseek-v4-native-mxfp4-converter.patch
+$ROOT/patches/llama.cpp/deepseek-v4-context-reserve.patch
+"
 
 usage() {
     echo "usage: $0 <DeepSeek-V4-checkpoint> [output-directory]" >&2
@@ -63,14 +66,16 @@ if test "${LLAMA_CPP_SKIP_REV_CHECK:-0}" != 1; then
         echo "llama.cpp revision mismatch: expected $LLAMA_CPP_REV, got $current" >&2
         exit 2
     }
-    if git -C "$LLAMA_CPP_DIR" apply --reverse --check "$CONVERTER_PATCH" 2>/dev/null; then
-        :
-    elif git -C "$LLAMA_CPP_DIR" apply --check "$CONVERTER_PATCH"; then
-        git -C "$LLAMA_CPP_DIR" apply "$CONVERTER_PATCH"
-    else
-        echo "llama.cpp converter patch does not apply: $CONVERTER_PATCH" >&2
-        exit 2
-    fi
+    for patch in $LLAMA_PATCHES; do
+        if git -C "$LLAMA_CPP_DIR" apply --reverse --check "$patch" 2>/dev/null; then
+            :
+        elif git -C "$LLAMA_CPP_DIR" apply --check "$patch"; then
+            git -C "$LLAMA_CPP_DIR" apply "$patch"
+        else
+            echo "llama.cpp patch does not apply: $patch" >&2
+            exit 2
+        fi
+    done
 fi
 
 set -- "$MODEL_REAL" \

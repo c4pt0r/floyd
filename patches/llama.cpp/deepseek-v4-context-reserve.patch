@@ -1,0 +1,13 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5558335b..e20d0f3c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -579,7 +579,7 @@ void llama_context::sched_reserve() {
+     // graph, which is larger than the position-zero prefill graph.
+     if (model.arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 1) {
+         const llama_pos reserve_pos0 = std::min<llama_pos>(
+-                cparams.n_ctx > n_tokens ? cparams.n_ctx - n_tokens : n_tokens,
++                cparams.n_ctx > n_tokens ? cparams.n_ctx - n_tokens : 0,
+                 std::max<uint32_t>(cparams.n_batch, 8u*n_tokens));
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
+                 model.hparams.no_alloc, nullptr, reserve_pos0);

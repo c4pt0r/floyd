@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
 
     char error[2048];
     DeepSeekV4GgmlSession *session = deepseek_v4_ggml_open(
-        argv[1], 64, error, sizeof(error));
+        argv[1], 512, error, sizeof(error));
     CHECK(session != NULL);
 
     Capture capture = {.first_token = -1};

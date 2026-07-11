@@ -60,6 +60,7 @@ PATCH="$ROOT/patches/llama.cpp/deepseek-v4-native-mxfp4-converter.patch"
 test -f "$PATCH"
 grep -F '"mxfp4": gguf.GGMLQuantizationType.MXFP4' "$PATCH"
 grep -F 'self.hparams.update(json.load(handle))' "$PATCH"
+test -f "$ROOT/patches/llama.cpp/deepseek-v4-context-reserve.patch"
 
 mkdir -p "$MODEL/nested-output"
 if LLAMA_CPP_DIR="$LLAMA" LLAMA_CPP_SKIP_REV_CHECK=1 \

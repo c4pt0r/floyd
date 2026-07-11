@@ -29,6 +29,8 @@ LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
 LLAMA_CPP_REPO ?= https://github.com/cchuter/llama.cpp.git
 LLAMA_CPP_REV ?= 19b63dc368dfef6db6783e5ba3143927b7ed1c96
+LLAMA_PATCHES = patches/llama.cpp/deepseek-v4-native-mxfp4-converter.patch \
+	patches/llama.cpp/deepseek-v4-context-reserve.patch
 LLAMA_REV_STAMP = $(LLAMA_CPP_DIR)/.floyd-revision-$(LLAMA_CPP_REV)
 LLAMA_INCLUDES = -I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
 LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
@@ -66,7 +68,7 @@ floyd.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_mo
 deepseek_v4_chat.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(LLAMA_REV_STAMP):
+$(LLAMA_REV_STAMP): $(LLAMA_PATCHES)
 	@test -f "$(LLAMA_CPP_DIR)/CMakeLists.txt" || \
 		git clone --filter=blob:none "$(LLAMA_CPP_REPO)" "$(LLAMA_CPP_DIR)"
 	@current=$$(git -C "$(LLAMA_CPP_DIR)" rev-parse HEAD); \
@@ -74,6 +76,13 @@ $(LLAMA_REV_STAMP):
 			git -C "$(LLAMA_CPP_DIR)" fetch --depth 1 "$(LLAMA_CPP_REPO)" "$(LLAMA_CPP_REV)"; \
 			git -C "$(LLAMA_CPP_DIR)" checkout --detach "$(LLAMA_CPP_REV)"; \
 		fi
+	@for patch in $(LLAMA_PATCHES); do \
+		if git -C "$(LLAMA_CPP_DIR)" apply --reverse --check "$(CURDIR)/$$patch" 2>/dev/null; then \
+			:; \
+		else \
+			git -C "$(LLAMA_CPP_DIR)" apply "$(CURDIR)/$$patch"; \
+		fi; \
+	done
 	@touch "$@"
 
 $(LLAMA_BUILD_DIR)/src/libllama.a: $(LLAMA_REV_STAMP)
