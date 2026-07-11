@@ -71,7 +71,7 @@ $(LLAMA_REV_STAMP):
 		git clone --filter=blob:none "$(LLAMA_CPP_REPO)" "$(LLAMA_CPP_DIR)"
 	@current=$$(git -C "$(LLAMA_CPP_DIR)" rev-parse HEAD); \
 		if test "$$current" != "$(LLAMA_CPP_REV)"; then \
-			git -C "$(LLAMA_CPP_DIR)" fetch --depth 1 origin "$(LLAMA_CPP_REV)"; \
+			git -C "$(LLAMA_CPP_DIR)" fetch --depth 1 "$(LLAMA_CPP_REPO)" "$(LLAMA_CPP_REV)"; \
 			git -C "$(LLAMA_CPP_DIR)" checkout --detach "$(LLAMA_CPP_REV)"; \
 		fi
 	@touch "$@"

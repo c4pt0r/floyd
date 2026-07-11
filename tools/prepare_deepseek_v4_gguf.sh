@@ -53,7 +53,7 @@ fi
 if test "${LLAMA_CPP_SKIP_REV_CHECK:-0}" != 1; then
     current=$(git -C "$LLAMA_CPP_DIR" rev-parse HEAD 2>/dev/null || true)
     if test "$current" != "$LLAMA_CPP_REV"; then
-        git -C "$LLAMA_CPP_DIR" fetch --depth 1 origin "$LLAMA_CPP_REV"
+        git -C "$LLAMA_CPP_DIR" fetch --depth 1 "$LLAMA_CPP_REPO" "$LLAMA_CPP_REV"
         git -C "$LLAMA_CPP_DIR" checkout --detach "$LLAMA_CPP_REV"
     fi
     current=$(git -C "$LLAMA_CPP_DIR" rev-parse HEAD)

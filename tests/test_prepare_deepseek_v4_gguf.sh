@@ -10,6 +10,8 @@ grep -F 'LLAMA_CPP_REPO=${LLAMA_CPP_REPO:-https://github.com/cchuter/llama.cpp.g
 grep -F 'LLAMA_CPP_REV=${LLAMA_CPP_REV:-19b63dc368dfef6db6783e5ba3143927b7ed1c96}' "$PREPARE"
 grep -F 'LLAMA_CPP_REPO ?= https://github.com/cchuter/llama.cpp.git' "$ROOT/Makefile"
 grep -F 'LLAMA_CPP_REV ?= 19b63dc368dfef6db6783e5ba3143927b7ed1c96' "$ROOT/Makefile"
+grep -F 'fetch --depth 1 "$LLAMA_CPP_REPO" "$LLAMA_CPP_REV"' "$PREPARE"
+grep -F 'fetch --depth 1 "$(LLAMA_CPP_REPO)" "$(LLAMA_CPP_REV)"' "$ROOT/Makefile"
 
 MODEL="$TMP/model"
 OUTPUT="$TMP/output"
