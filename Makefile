@@ -149,6 +149,12 @@ test-deepseek-v4-naming:
 test-prepare-deepseek-v4-gguf:
 	sh tests/test_prepare_deepseek_v4_gguf.sh
 
+tests/test_deepseek_v4_ggml: tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp deepseek_v4_ggml.h
+	$(CXX) -O2 -std=c++17 -x c++ tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp -o $@
+
+test-deepseek-v4-ggml: tests/test_deepseek_v4_ggml
+	./tests/test_deepseek_v4_ggml
+
 prepare-deepseek-v4-gguf:
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	PYTHON="$(PYTHON)" tools/prepare_deepseek_v4_gguf.sh "$(DSPARK)" \
