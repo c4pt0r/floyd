@@ -148,11 +148,16 @@ fixture_dspark_layers_0_2/oracle.safetensors: tools/make_v4_real_layer0_oracle.p
 	$(PYTHON) tools/make_v4_real_layer0_oracle.py --model "$(DSPARK)" \
 	  --output fixture_dspark_layer0/oracle.safetensors --layers-0-2-output $@
 
+fixture_dspark_layer3_hca/oracle.safetensors: tools/make_v4_real_layer0_oracle.py
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	$(PYTHON) tools/make_v4_real_layer0_oracle.py --model "$(DSPARK)" \
+	  --output fixture_dspark_layer0/oracle.safetensors --layer3-hca-output $@
+
 tests/test_v4_real_layer0: tests/test_v4_real_layer0.c v4_real_layer0.h v4_quant.h v4_hc.h moe_route.h st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-test-v4-real-layer0: fixture_dspark_layer0/oracle.safetensors fixture_dspark_layers_0_2/oracle.safetensors tests/test_v4_real_layer0
-	./tests/test_v4_real_layer0 "$(DSPARK)" fixture_dspark_layer0 fixture_dspark_layers_0_2
+test-v4-real-layer0: fixture_dspark_layer0/oracle.safetensors fixture_dspark_layers_0_2/oracle.safetensors fixture_dspark_layer3_hca/oracle.safetensors tests/test_v4_real_layer0
+	./tests/test_v4_real_layer0 "$(DSPARK)" fixture_dspark_layer0 fixture_dspark_layers_0_2 fixture_dspark_layer3_hca
 
 clean:
 	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_v4_native_quant tests/test_v4_model_manifest tests/test_v4_real_layer0 tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tools/probe_safetensors

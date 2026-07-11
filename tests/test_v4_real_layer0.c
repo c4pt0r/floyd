@@ -30,15 +30,16 @@ static float max_error(const float *actual, const float *expected, int count) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle>\n", argv[0]);
+    if (argc != 5) {
+        fprintf(stderr, "usage: %s <DeepSeek-V4-Flash-DSpark> <layer0-oracle> <layers-0-2-oracle> <layer3-hca-oracle>\n", argv[0]);
         return 2;
     }
     enum { D = 4096, HC = 4, EXPERTS = 256, TOP_K = 6 };
-    shards model, oracle, oracle_0_2;
+    shards model, oracle, oracle_0_2, oracle_3;
     st_init(&model, argv[1]);
     st_init(&oracle, argv[2]);
     st_init(&oracle_0_2, argv[3]);
+    st_init(&oracle_3, argv[4]);
     float input[HC * D], attn_post[HC], attn_comb[HC * HC], attn_collapsed[D];
     float attn_norm[D], attn_output[D], after_attn[HC * D];
     float ffn_post[HC], ffn_comb[HC * HC], ffn_collapsed[D], ffn_norm[D];
@@ -143,6 +144,72 @@ int main(int argc, char **argv) {
     CHECK(layer_errors[2] < 9e-4f);
     free(streams);
     free(layer_outputs);
+
+    enum { HCA_TOKENS = 128 };
+    int hca_token_ids[HCA_TOKENS];
+    for (int i = 0; i < HCA_TOKENS; i++) hca_token_ids[i] = 3;
+    float *hca_streams = load_f32(&oracle_3, "layer.3.input",
+                                  HCA_TOKENS * HC * D);
+    float *hca_projected_kv = malloc((size_t)HCA_TOKENS * 512 * sizeof(float));
+    float *hca_projected_gate = malloc((size_t)HCA_TOKENS * 512 * sizeof(float));
+    float *hca_router_scores = malloc((size_t)HCA_TOKENS * EXPERTS * sizeof(float));
+    float *hca_router_weights = malloc((size_t)HCA_TOKENS * TOP_K * sizeof(float));
+    int64_t *hca_router_indices = malloc((size_t)HCA_TOKENS * TOP_K * sizeof(int64_t));
+    CHECK(hca_streams && hca_projected_kv && hca_projected_gate &&
+          hca_router_scores && hca_router_weights && hca_router_indices);
+    V4RealLayerState hca_state;
+    V4RealLayerCapture hca_capture = {
+        .projected_kv = hca_projected_kv,
+        .projected_gate = hca_projected_gate,
+        .router_scores = hca_router_scores,
+        .router_weights = hca_router_weights,
+        .router_indices = hca_router_indices,
+    };
+    CHECK(v4_real_layer_state_init(&hca_state, 3, HCA_TOKENS));
+    CHECK(v4_real_layer_forward_state(&model, 3, hca_token_ids, HCA_TOKENS,
+                                      hca_streams, &hca_state, &hca_capture));
+    float *expected_hca_kv = load_f32(&oracle_3, "layer.3.hca.kv", HCA_TOKENS * 512);
+    float *expected_hca_gate = load_f32(&oracle_3, "layer.3.hca.gate", HCA_TOKENS * 512);
+    float *expected_hca_output = load_f32(&oracle_3, "layer.3.hca.output", 512);
+    float *expected_hca_scores = load_f32(&oracle_3, "layer.3.router.scores",
+                                          HCA_TOKENS * EXPERTS);
+    float *expected_hca_weights = load_f32(&oracle_3, "layer.3.router.weights",
+                                           HCA_TOKENS * TOP_K);
+    int64_t *expected_hca_indices = malloc((size_t)HCA_TOKENS * TOP_K * sizeof(int64_t));
+    float *expected_hca_layer = load_f32(&oracle_3, "layer.3.output",
+                                         HCA_TOKENS * HC * D);
+    CHECK(expected_hca_kv && expected_hca_gate && expected_hca_output &&
+          expected_hca_scores && expected_hca_weights && expected_hca_indices &&
+          expected_hca_layer);
+    st_read_raw(&oracle_3, "layer.3.router.indices", expected_hca_indices, 0);
+    float hca_kv_error = max_error(hca_projected_kv, expected_hca_kv,
+                                   HCA_TOKENS * 512);
+    float hca_gate_error = max_error(hca_projected_gate, expected_hca_gate,
+                                     HCA_TOKENS * 512);
+    float hca_compress_error = max_error(v4_kv_cache_key(&hca_state.compressed, 0),
+                                         expected_hca_output, 512);
+    float hca_score_error = max_error(hca_router_scores, expected_hca_scores,
+                                      HCA_TOKENS * EXPERTS);
+    float hca_weight_error = max_error(hca_router_weights, expected_hca_weights,
+                                       HCA_TOKENS * TOP_K);
+    float hca_layer_error = max_error(hca_streams, expected_hca_layer,
+                                      HCA_TOKENS * HC * D);
+    int hca_route_hits = 0;
+    for (int i = 0; i < HCA_TOKENS * TOP_K; i++)
+        if (hca_router_indices[i] == expected_hca_indices[i]) hca_route_hits++;
+    printf("v4 real layer3 HCA: kv=%.9g gate=%.9g compress=%.9g router=%.9g weights=%.9g routes=%d/%d output=%.9g\n",
+           hca_kv_error, hca_gate_error, hca_compress_error, hca_score_error,
+           hca_weight_error, hca_route_hits, HCA_TOKENS * TOP_K, hca_layer_error);
+    CHECK(hca_kv_error < 3e-4f && hca_gate_error < 3e-4f);
+    CHECK(hca_compress_error < 3e-4f && hca_score_error < 3e-4f);
+    CHECK(hca_weight_error < 3e-5f && hca_route_hits == HCA_TOKENS * TOP_K);
+    CHECK(hca_layer_error < 3e-4f);
+    v4_real_layer_state_free(&hca_state);
+    free(hca_streams); free(hca_projected_kv); free(hca_projected_gate);
+    free(hca_router_scores); free(hca_router_weights); free(hca_router_indices);
+    free(expected_hca_kv); free(expected_hca_gate); free(expected_hca_output);
+    free(expected_hca_scores); free(expected_hca_weights); free(expected_hca_indices);
+    free(expected_hca_layer);
     puts("v4 real layer0 tests: ok");
     return 0;
 }
