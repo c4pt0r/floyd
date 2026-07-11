@@ -5,7 +5,11 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from tools.make_v4_real_layer0_oracle import write_layer0_oracle, write_layers_0_2_oracle
+from tools.make_v4_real_layer0_oracle import (
+    write_layer0_oracle,
+    write_layer3_hca_oracle,
+    write_layers_0_2_oracle,
+)
 
 
 def test_real_layer0_oracle():
@@ -55,7 +59,32 @@ def test_real_layers_0_2_oracle():
             assert oracle.get_slice("layer.2.block_bias").get_shape() == [4, 1]
 
 
+def test_real_layer3_hca_oracle():
+    model_dir = os.environ["DSPARK"]
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp) / "layer3_hca.safetensors"
+        write_layer3_hca_oracle(model_dir, output, [3] * 128)
+        with safe_open(output, framework="pt") as oracle:
+            shapes = {
+                "layer.3.input": [128, 4, 4096],
+                "layer.3.hca.kv": [128, 512],
+                "layer.3.hca.gate": [128, 512],
+                "layer.3.hca.output": [1, 512],
+                "layer.3.router.scores": [128, 256],
+                "layer.3.router.weights": [128, 6],
+                "layer.3.router.indices": [128, 6],
+                "layer.3.output": [128, 4, 4096],
+            }
+            assert set(oracle.keys()) == set(shapes)
+            for name, shape in shapes.items():
+                tensor = oracle.get_tensor(name)
+                assert list(tensor.shape) == shape
+                if tensor.is_floating_point():
+                    assert torch.isfinite(tensor).all()
+
+
 if __name__ == "__main__":
     test_real_layer0_oracle()
     test_real_layers_0_2_oracle()
+    test_real_layer3_hca_oracle()
     print("v4 real layer0 oracle tests: ok")
