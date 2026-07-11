@@ -51,6 +51,15 @@ grep -Fx -- "--outtype" "$TMP/args"
 grep -Fx -- "auto" "$TMP/args"
 grep -Fx -- "--split-max-size" "$TMP/args"
 grep -Fx -- "48G" "$TMP/args"
+grep -Fx -- "--deepseek4-expert-outtypes" "$TMP/args"
+grep -Fx -- "mxfp4" "$TMP/args"
+grep -Fx -- "--deepseek4-expert-workers" "$TMP/args"
+grep -Fx -- "8" "$TMP/args"
+
+PATCH="$ROOT/patches/llama.cpp/deepseek-v4-native-mxfp4-converter.patch"
+test -f "$PATCH"
+grep -F '"mxfp4": gguf.GGMLQuantizationType.MXFP4' "$PATCH"
+grep -F 'self.hparams.update(json.load(handle))' "$PATCH"
 
 mkdir -p "$MODEL/nested-output"
 if LLAMA_CPP_DIR="$LLAMA" LLAMA_CPP_SKIP_REV_CHECK=1 \

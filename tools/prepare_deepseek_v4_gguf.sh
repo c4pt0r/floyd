@@ -6,6 +6,8 @@ LLAMA_CPP_REPO=${LLAMA_CPP_REPO:-https://github.com/cchuter/llama.cpp.git}
 LLAMA_CPP_REV=${LLAMA_CPP_REV:-19b63dc368dfef6db6783e5ba3143927b7ed1c96}
 LLAMA_CPP_DIR=${LLAMA_CPP_DIR:-"$ROOT/.deps/llama.cpp"}
 PYTHON=${PYTHON:-python3}
+DEEPSEEK_V4_EXPERT_WORKERS=${DEEPSEEK_V4_EXPERT_WORKERS:-8}
+CONVERTER_PATCH="$ROOT/patches/llama.cpp/deepseek-v4-native-mxfp4-converter.patch"
 
 usage() {
     echo "usage: $0 <DeepSeek-V4-checkpoint> [output-directory]" >&2
@@ -61,11 +63,21 @@ if test "${LLAMA_CPP_SKIP_REV_CHECK:-0}" != 1; then
         echo "llama.cpp revision mismatch: expected $LLAMA_CPP_REV, got $current" >&2
         exit 2
     }
+    if git -C "$LLAMA_CPP_DIR" apply --reverse --check "$CONVERTER_PATCH" 2>/dev/null; then
+        :
+    elif git -C "$LLAMA_CPP_DIR" apply --check "$CONVERTER_PATCH"; then
+        git -C "$LLAMA_CPP_DIR" apply "$CONVERTER_PATCH"
+    else
+        echo "llama.cpp converter patch does not apply: $CONVERTER_PATCH" >&2
+        exit 2
+    fi
 fi
 
 set -- "$MODEL_REAL" \
     --outfile "$OUTPUT_REAL/model-{ftype}.gguf" \
     --outtype auto \
+    --deepseek4-expert-outtypes mxfp4 \
+    --deepseek4-expert-workers "$DEEPSEEK_V4_EXPERT_WORKERS" \
     --split-max-size 48G
 "$PYTHON" "$LLAMA_CPP_DIR/convert_hf_to_gguf.py" "$@"
 
