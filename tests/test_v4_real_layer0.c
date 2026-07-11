@@ -339,6 +339,42 @@ int main(int argc, char **argv) {
     CHECK(base_errors[4] < 3e-4f);
     for (int i = 0; i < 43; i++) CHECK(isfinite(base_errors[i]));
     CHECK(isfinite(target_error));
+
+    enum { VOCAB = 129280 };
+    float *head_input = load_f32(&oracle_base, "layer.42.output", 4 * HC * D);
+    float *head_hidden = malloc((size_t)4 * D * sizeof(float));
+    float *head_norm = malloc((size_t)4 * D * sizeof(float));
+    float *head_logits = malloc((size_t)VOCAB * sizeof(float));
+    CHECK(head_input && head_hidden && head_norm && head_logits);
+    V4RealHeadCapture head_capture = {
+        .hidden = head_hidden, .normalized = head_norm, .logits = head_logits,
+    };
+    CHECK(v4_real_base_head_forward(&model, head_input, 4, &head_capture));
+    float *expected_head_hidden = load_f32(&oracle_base, "final.hidden", 4 * D);
+    float *expected_head_norm = load_f32(&oracle_base, "final.norm", 4 * D);
+    float *expected_head_logits = load_f32(&oracle_base, "final.logits", VOCAB);
+    int64_t expected_argmax;
+    st_read_raw(&oracle_base, "final.argmax", &expected_argmax, 0);
+    CHECK(expected_head_hidden && expected_head_norm && expected_head_logits);
+    float head_hidden_error = max_error(head_hidden, expected_head_hidden, 4 * D);
+    float head_norm_error = max_error(head_norm, expected_head_norm, 4 * D);
+    float head_logits_error = max_error(head_logits, expected_head_logits, VOCAB);
+    int isolated_argmax = 0;
+    for (int token = 1; token < VOCAB; token++)
+        if (head_logits[token] > head_logits[isolated_argmax]) isolated_argmax = token;
+    CHECK(v4_real_base_head_forward(&model, base_streams, 4, &head_capture));
+    int continuous_argmax = 0;
+    for (int token = 1; token < VOCAB; token++)
+        if (head_logits[token] > head_logits[continuous_argmax]) continuous_argmax = token;
+    printf("v4 real base head: hidden=%.9g norm=%.9g logits=%.9g isolated=%d expected=%lld continuous=%d\n",
+           head_hidden_error, head_norm_error, head_logits_error,
+           isolated_argmax, (long long)expected_argmax, continuous_argmax);
+    CHECK(head_hidden_error < 3e-4f && head_norm_error < 3e-4f);
+    CHECK(head_logits_error < 3e-3f);
+    CHECK(isolated_argmax == expected_argmax);
+    CHECK(continuous_argmax == expected_argmax);
+    free(head_input); free(head_hidden); free(head_norm); free(head_logits);
+    free(expected_head_hidden); free(expected_head_norm); free(expected_head_logits);
     v4_real_model_state_free(&base_state);
     free(base_streams); free(base_checkpoints); free(base_targets); free(base_routes);
     puts("v4 real layer0 tests: ok");
