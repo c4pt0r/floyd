@@ -55,23 +55,23 @@ int main(int argc, char **argv) {
     CHECK(v4_real_layer0_forward(&model, 3, &capture));
 
     float attn_error = 0.0f, ffn_error = 0.0f;
-#define ACCUM_ERROR(group, field, count) do { \
+#define ACCUM_ERROR(group, member, field, count) do { \
     float *expected = load_f32(&oracle, field, count); CHECK(expected); \
-    float error = max_error(capture.group, expected, count); \
+    float error = max_error(capture.member, expected, count); \
     if (error > group##_error) group##_error = error; free(expected); \
 } while (0)
-    ACCUM_ERROR(attn, "attn.post", HC);
-    ACCUM_ERROR(attn, "attn.comb", HC * HC);
-    ACCUM_ERROR(attn, "attn.collapsed", D);
-    ACCUM_ERROR(attn, "attn.norm", D);
-    ACCUM_ERROR(attn, "attn.output", D);
-    ACCUM_ERROR(attn, "after_attn", HC * D);
-    ACCUM_ERROR(ffn, "ffn.post", HC);
-    ACCUM_ERROR(ffn, "ffn.comb", HC * HC);
-    ACCUM_ERROR(ffn, "ffn.collapsed", D);
-    ACCUM_ERROR(ffn, "ffn.norm", D);
-    ACCUM_ERROR(ffn, "moe.output", D);
-    ACCUM_ERROR(ffn, "output", HC * D);
+    ACCUM_ERROR(attn, attn_post, "attn.post", HC);
+    ACCUM_ERROR(attn, attn_comb, "attn.comb", HC * HC);
+    ACCUM_ERROR(attn, attn_collapsed, "attn.collapsed", D);
+    ACCUM_ERROR(attn, attn_norm, "attn.norm", D);
+    ACCUM_ERROR(attn, attn_output, "attn.output", D);
+    ACCUM_ERROR(attn, after_attn, "after_attn", HC * D);
+    ACCUM_ERROR(ffn, ffn_post, "ffn.post", HC);
+    ACCUM_ERROR(ffn, ffn_comb, "ffn.comb", HC * HC);
+    ACCUM_ERROR(ffn, ffn_collapsed, "ffn.collapsed", D);
+    ACCUM_ERROR(ffn, ffn_norm, "ffn.norm", D);
+    ACCUM_ERROR(ffn, moe_output, "moe.output", D);
+    ACCUM_ERROR(ffn, output, "output", HC * D);
 #undef ACCUM_ERROR
     float *expected_scores = load_f32(&oracle, "router.scores", EXPERTS);
     float *expected_weights = load_f32(&oracle, "router.weights", TOP_K);
