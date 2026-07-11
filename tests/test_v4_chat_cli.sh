@@ -15,3 +15,9 @@ output=$(PROMPT=hello NGEN=1 V4_CHAT_TRACE=1 \
     ./v4_chat "$model" 64 1 2>&1)
 printf '%s\n' "$output"
 printf '%s\n' "$output" | grep -q "V4_TOKEN $expected"
+backend=${EXPECT_BACKEND:-cpu}
+printf '%s\n' "$output" | grep -q "V4_BACKEND backend=$backend"
+printf '%s\n' "$output" | grep -q "V4_MATMUL metal_calls="
+if [ "$backend" = metal ]; then
+    printf '%s\n' "$output" | grep -Eq "V4_MATMUL metal_calls=[1-9][0-9]*"
+fi
