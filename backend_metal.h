@@ -32,6 +32,14 @@ void fm_matmul_q8(float *y, const float *x, const int8_t  *w, const float *s,
 void fm_matmul_q4(float *y, const float *x, const uint8_t *w, const float *s,
                    int O, int I, int S, int cache);
 
+/* Native DeepSeek V4 formats. These are not compatible with the q8/q4
+ * kernels above: FP8 uses E4M3 values with 128x128 E8M0 scales, while FP4
+ * uses the model codebook with one E8M0 scale per 32 columns. */
+int fm_matmul_v4_fp8(float *y, const float *x, const uint8_t *w,
+                     const uint8_t *s, int O, int I, int S, int block_size);
+int fm_matmul_v4_fp4(float *y, const float *x, const uint8_t *w,
+                     const uint8_t *s, int O, int I, int S);
+
 #ifdef __cplusplus
 }
 #endif
