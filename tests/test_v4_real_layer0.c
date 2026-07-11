@@ -112,6 +112,37 @@ int main(int argc, char **argv) {
            csa_error, index_error, index_hits, bias_hits);
     CHECK(csa_error < 3e-4f && index_error < 3e-4f);
     CHECK(index_hits == 4 && bias_hits == 4);
+
+    int token_ids[4] = {3, 14, 15, 9};
+    float *streams = load_f32(&oracle_0_2, "layer.0.input", 4 * HC * D);
+    float *layer_outputs = malloc((size_t)3 * 4 * HC * D * sizeof(float));
+    float runner_kv[512], runner_scores[4], runner_bias[4];
+    int64_t runner_ids[4];
+    V4RealLayer2CSACapture runner_csa = {
+        .compressed_kv = runner_kv, .index_scores = runner_scores,
+        .index_ids = runner_ids, .block_bias = runner_bias,
+    };
+    CHECK(streams && layer_outputs);
+    CHECK(v4_real_layers_forward(&model, token_ids, 4, 0, 3, streams,
+                                 layer_outputs, &runner_csa));
+    float layer_errors[3];
+    for (int layer = 0; layer < 3; layer++) {
+        char name[64];
+        snprintf(name, sizeof(name), "layer.%d.output", layer);
+        float *expected = load_f32(&oracle_0_2, name, 4 * HC * D);
+        CHECK(expected);
+        layer_errors[layer] = max_error(
+            layer_outputs + (int64_t)layer * 4 * HC * D,
+            expected, 4 * HC * D);
+        free(expected);
+    }
+    printf("v4 real layers 0-2: layer0=%.9g layer1=%.9g layer2=%.9g\n",
+           layer_errors[0], layer_errors[1], layer_errors[2]);
+    CHECK(layer_errors[0] < 3e-4f);
+    CHECK(layer_errors[1] < 6e-4f);
+    CHECK(layer_errors[2] < 9e-4f);
+    free(streams);
+    free(layer_outputs);
     puts("v4 real layer0 tests: ok");
     return 0;
 }
