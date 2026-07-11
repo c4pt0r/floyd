@@ -9,6 +9,7 @@ from tools.make_v4_real_layer0_oracle import (
     write_layer0_oracle,
     write_base_forward_oracle,
     write_dspark_oracle,
+    write_dspark_decode_oracle,
     write_layer3_hca_oracle,
     write_layers_0_2_oracle,
     write_layers_3_4_oracle,
@@ -149,6 +150,24 @@ def test_real_dspark_oracle():
             assert oracle.get_slice("dspark.confidence").get_shape() == [5]
 
 
+def test_real_dspark_decode_oracle():
+    model_dir = os.environ["DSPARK"]
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp) / "dspark_decode.safetensors"
+        write_dspark_decode_oracle(model_dir, output)
+        with safe_open(output, framework="pt") as oracle:
+            assert oracle.get_slice("base.first_id").get_shape() == [1]
+            assert oracle.get_slice("base.input_id").get_shape() == [1]
+            assert oracle.get_slice("dspark.prompt_main_x").get_shape() == [5, 4096]
+            assert oracle.get_slice("dspark.current_main_x").get_shape() == [1, 4096]
+            for stage in range(3):
+                assert oracle.get_slice(f"dspark.prefill_kv.{stage}").get_shape() == [5, 512]
+                assert oracle.get_slice(f"dspark.stage.{stage}.output").get_shape() == [5, 4, 4096]
+            assert oracle.get_slice("dspark.hidden").get_shape() == [5, 4096]
+            assert oracle.get_slice("dspark.output_ids").get_shape() == [6]
+            assert oracle.get_slice("dspark.confidence").get_shape() == [5]
+
+
 if __name__ == "__main__":
     test_real_layer0_oracle()
     test_real_layers_0_2_oracle()
@@ -157,4 +176,5 @@ if __name__ == "__main__":
     test_real_base_forward_oracle()
     test_real_base_decode_oracle()
     test_real_dspark_oracle()
+    test_real_dspark_decode_oracle()
     print("v4 real layer0 oracle tests: ok")

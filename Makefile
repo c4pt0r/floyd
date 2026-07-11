@@ -194,6 +194,11 @@ fixture_dspark_dspark/oracle.safetensors: tools/make_v4_real_layer0_oracle.py
 	$(PYTHON) tools/make_v4_real_layer0_oracle.py --model "$(DSPARK)" \
 	  --output fixture_dspark_layer0/oracle.safetensors --dspark-output $@
 
+fixture_dspark_dspark_decode/oracle.safetensors: tools/make_v4_real_layer0_oracle.py
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	$(PYTHON) tools/make_v4_real_layer0_oracle.py --model "$(DSPARK)" \
+	  --output fixture_dspark_layer0/oracle.safetensors --dspark-decode-output $@
+
 tests/test_v4_real_layer0: tests/test_v4_real_layer0.c v4_real_layer0.h v4_quant.h v4_hc.h v4_kv_cache.h moe_route.h st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -203,10 +208,16 @@ tests/test_v4_real_decode: tests/test_v4_real_decode.c v4_runtime.h v4_real_laye
 test-v4-real-decode: fixture_dspark_base_decode/oracle.safetensors tests/test_v4_real_decode
 	./tests/test_v4_real_decode "$(DSPARK)" fixture_dspark_base_decode
 
+tests/test_v4_dspark_decode: tests/test_v4_dspark_decode.c v4_real_layer0.h v4_quant.h v4_hc.h v4_kv_cache.h moe_route.h st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test-v4-dspark-decode: fixture_dspark_dspark_decode/oracle.safetensors tests/test_v4_dspark_decode
+	./tests/test_v4_dspark_decode "$(DSPARK)" fixture_dspark_dspark_decode
+
 test-v4-real-layer0: fixture_dspark_layer0/oracle.safetensors fixture_dspark_layers_0_2/oracle.safetensors fixture_dspark_layer3_hca/oracle.safetensors fixture_dspark_layers_3_4/oracle.safetensors fixture_dspark_base_forward/oracle.safetensors fixture_dspark_dspark/oracle.safetensors tests/test_v4_real_layer0
 	./tests/test_v4_real_layer0 "$(DSPARK)" fixture_dspark_layer0 fixture_dspark_layers_0_2 fixture_dspark_layer3_hca fixture_dspark_layers_3_4 fixture_dspark_base_forward fixture_dspark_dspark
 
 clean:
-	rm -f floyd v4_chat *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_v4_native_quant tests/test_v4_model_manifest tests/test_v4_real_layer0 tests/test_v4_real_decode tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_v4_chat_format tools/probe_safetensors
+	rm -f floyd v4_chat *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_v4_moe_fixture tests/test_v4_hc tests/test_v4_hc_fixture tests/test_v4_attention_fixture tests/test_v4_compress_fixture tests/test_v4_indexer_fixture tests/test_v4_kv_cache_fixture tests/test_v4_quant tests/test_v4_native_quant tests/test_v4_model_manifest tests/test_v4_real_layer0 tests/test_v4_real_decode tests/test_v4_dspark_decode tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_v4_chat_format tools/probe_safetensors
 
-.PHONY: all test-c test-tok test-v4-attention test-v4-chat test-v4-chat-format test-v4-compress test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-model-manifest test-v4-moe test-v4-native-quant test-v4-oracle test-v4-real-decode test-v4-real-layer0 test-v4-real-layer0-oracle metal-test clean portable
+.PHONY: all test-c test-tok test-v4-attention test-v4-chat test-v4-chat-format test-v4-compress test-v4-dspark-decode test-v4-hc test-v4-indexer test-v4-kv-cache test-v4-model-manifest test-v4-moe test-v4-native-quant test-v4-oracle test-v4-real-decode test-v4-real-layer0 test-v4-real-layer0-oracle metal-test clean portable

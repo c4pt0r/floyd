@@ -681,6 +681,124 @@ def write_dspark_oracle(model_dir, output_path, token_ids):
     save_file({name: value.detach().contiguous() for name, value in captures.items()}, output_path)
 
 
+def base_target_forward(checkpoint, token_ids):
+    streams = torch.stack([
+        checkpoint.row("embed.weight", token).float() for token in token_ids
+    ])[:, None, :].repeat(1, 4, 1)
+    target_means = []
+    for layer in range(43):
+        collapsed, post, comb = hc_batch(checkpoint, layer, "attn", streams)
+        hidden = norm_batch(
+            collapsed, checkpoint.tensor(f"layers.{layer}.attn_norm.weight")
+        )
+        streams = hc_post_batch(
+            attention_batch(checkpoint, layer, hidden, {}), streams, post, comb
+        )
+        collapsed, post, comb = hc_batch(checkpoint, layer, "ffn", streams)
+        hidden = norm_batch(
+            collapsed, checkpoint.tensor(f"layers.{layer}.ffn_norm.weight")
+        )
+        streams = hc_post_batch(
+            moe_batch(checkpoint, layer, hidden, token_ids), streams, post, comb
+        )
+        if layer >= 40:
+            target_means.append(streams.mean(1))
+    flat = streams.flatten(1).float()
+    inv_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+    mixes = F.linear(flat, checkpoint.tensor("hc_head_fn").float()) * inv_rms
+    pre = torch.sigmoid(
+        mixes * checkpoint.tensor("hc_head_scale").float()
+        + checkpoint.tensor("hc_head_base").float()
+    ) + 1e-6
+    hidden = (pre.unsqueeze(-1) * streams.float()).sum(1)
+    normalized = norm_batch(hidden, checkpoint.tensor("norm.weight"))
+    logits = F.linear(normalized[-1], checkpoint.tensor("head.weight").float())
+    return torch.cat(target_means, -1), logits
+
+
+def write_dspark_decode_oracle(model_dir, output_path):
+    torch.set_num_threads(8)
+    checkpoint = Checkpoint(model_dir)
+    prompt_ids = [0, 128803, 33310, 128804, 128822]
+    prompt_hidden, prompt_logits = base_target_forward(checkpoint, prompt_ids)
+    first_id = int(prompt_logits.argmax())
+    decode_hidden, decode_logits = base_target_forward(
+        checkpoint, prompt_ids + [first_id]
+    )
+    input_id = int(decode_logits.argmax())
+    prompt_main_x = norm_batch(
+        quant_linear_batch(checkpoint, "mtp.0.main_proj", prompt_hidden),
+        checkpoint.tensor("mtp.0.main_norm.weight"),
+    )
+    current_main_x = norm_batch(
+        quant_linear_batch(checkpoint, "mtp.0.main_proj", decode_hidden[-1:]),
+        checkpoint.tensor("mtp.0.main_norm.weight"),
+    )
+    captures = {
+        "base.first_id": torch.tensor([first_id], dtype=torch.long),
+        "base.input_id": torch.tensor([input_id], dtype=torch.long),
+        "dspark.prompt_main_x": prompt_main_x,
+        "dspark.current_main_x": current_main_x,
+    }
+    main_caches = []
+    for stage in range(3):
+        prefix = f"mtp.{stage}.attn"
+        cache = torch.zeros(128, 512)
+        prefill_kv = norm_batch(
+            quant_linear_batch(checkpoint, f"{prefix}.wkv", prompt_main_x),
+            checkpoint.tensor(f"{prefix}.kv_norm.weight"),
+        )
+        prefill_kv = rope_batch(
+            prefill_kv, torch.arange(len(prompt_ids)), compressed=False
+        )
+        cache[:len(prompt_ids)] = prefill_kv
+        main_caches.append(cache)
+        captures[f"dspark.prefill_kv.{stage}"] = prefill_kv
+
+    draft_ids = torch.tensor([input_id, 128799, 128799, 128799, 128799])
+    draft_streams = torch.stack([
+        checkpoint.row("embed.weight", int(token)).float() for token in draft_ids
+    ])[:, None, :].repeat(1, 4, 1)
+    for stage in range(3):
+        draft_streams = dspark_stage(
+            checkpoint, stage, draft_streams, draft_ids,
+            current_main_x, main_caches[stage], len(prompt_ids),
+        )
+        captures[f"dspark.stage.{stage}.output"] = draft_streams.clone()
+
+    flat = draft_streams.flatten(1).float()
+    inv_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+    mixes = F.linear(flat, checkpoint.tensor("mtp.2.hc_head_fn").float()) * inv_rms
+    pre = torch.sigmoid(
+        mixes * checkpoint.tensor("mtp.2.hc_head_scale").float()
+        + checkpoint.tensor("mtp.2.hc_head_base").float()
+    ) + 1e-6
+    hidden = (pre.unsqueeze(-1) * draft_streams.float()).sum(1)
+    normalized = norm_batch(hidden, checkpoint.tensor("mtp.2.norm.weight"))
+    logits = F.linear(normalized, checkpoint.tensor("head.weight").float())
+    markov_w2 = checkpoint.tensor("mtp.2.markov_head.markov_w2.weight").float()
+    output_ids = [input_id]
+    markov_embeds = []
+    for position in range(5):
+        markov_embed = checkpoint.row(
+            "mtp.2.markov_head.markov_w1.weight", output_ids[-1]
+        ).float()
+        logits[position] += torch.mv(markov_w2, markov_embed)
+        output_ids.append(int(logits[position].argmax()))
+        markov_embeds.append(markov_embed)
+    confidence = F.linear(
+        torch.cat((hidden, torch.stack(markov_embeds)), -1),
+        checkpoint.tensor("mtp.2.confidence_head.proj.weight").float(),
+    ).squeeze(-1)
+    captures["dspark.hidden"] = hidden
+    captures["dspark.output_ids"] = torch.tensor(output_ids, dtype=torch.long)
+    captures["dspark.confidence"] = confidence
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_file({name: value.detach().contiguous() for name, value in captures.items()},
+              output_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -691,6 +809,7 @@ def main():
     parser.add_argument("--base-forward-output")
     parser.add_argument("--base-decode-output")
     parser.add_argument("--dspark-output")
+    parser.add_argument("--dspark-decode-output")
     parser.add_argument("--token-id", type=int, default=3)
     args = parser.parse_args()
     write_layer0_oracle(args.model, args.output, args.token_id)
@@ -706,6 +825,8 @@ def main():
         write_base_forward_oracle(args.model, args.base_decode_output, [3, 14, 15, 9, 5])
     if args.dspark_output:
         write_dspark_oracle(args.model, args.dspark_output, [3, 14, 15, 9])
+    if args.dspark_decode_output:
+        write_dspark_decode_oracle(args.model, args.dspark_decode_output)
     print(f"saved {args.output}")
 
 
