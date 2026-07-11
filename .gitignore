@@ -20,11 +20,13 @@ tests/test_st_probe
 tests/test_v4_quant
 tests/test_v4_native_quant
 tests/test_v4_model_manifest
+tests/test_v4_real_layer0
 tests/test_backend_metal
 tests/test_tok_moon
 tools/probe_safetensors
 kernels_metal.h
 fixture_tiny*/
+fixture_dspark*/
 *.log
 tok_cases.json
 .worktrees/
