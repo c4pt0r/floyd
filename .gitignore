@@ -29,6 +29,7 @@ tests/test_backend_metal
 tests/test_tok_moon
 tests/test_deepseek_v4_chat_format
 tests/test_deepseek_v4_ggml
+tests/test_deepseek_v4_ggml_official
 tools/probe_safetensors
 kernels_metal.h
 fixture_tiny*/
