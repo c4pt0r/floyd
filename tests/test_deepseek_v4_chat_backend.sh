@@ -10,7 +10,7 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     fi
-    rm -f "$output"
+    rm -f "$output" "$output.missing"
 }
 trap cleanup EXIT INT TERM
 
@@ -36,6 +36,9 @@ if ! grep -q "DEEPSEEK_V4_BACKEND backend=$expected" "$output"; then
     echo "missing DEEPSEEK_V4_BACKEND backend=$expected" >&2
     exit 1
 fi
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+pid=
 
 missing="$model/missing.gguf"
 set +e
@@ -46,6 +49,5 @@ set -e
 cat "$output.missing"
 test "$status" -eq 2
 grep -q 'FLOYD_DEEPSEEK_V4_GGUF' "$output.missing"
-rm -f "$output.missing"
 
 echo "DeepSeek V4 chat resident backend contract: ok"

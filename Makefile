@@ -23,8 +23,12 @@ endif
 
 METAL    ?= 0
 METAL_OBJ =
+DEEPSEEK_V4_GGML_OBJ =
+FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
+LLAMA_CPP_REV ?= e3546c7948e3af463d0b401e6421d5a4c2faf565
+LLAMA_REV_STAMP = $(LLAMA_CPP_DIR)/.floyd-revision-$(LLAMA_CPP_REV)
 LLAMA_INCLUDES = -I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
 LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
 	$(LLAMA_BUILD_DIR)/ggml/src/libggml.a \
@@ -38,7 +42,10 @@ $(error METAL=1 e' supportato solo su macOS)
 endif
 CFLAGS  += -DFLOYD_METAL
 METAL_OBJ = backend_metal.o
-LDFLAGS += -framework Metal -framework Foundation
+CFLAGS  += -DFLOYD_DEEPSEEK_V4_GGML
+DEEPSEEK_V4_GGML_OBJ = deepseek_v4_ggml.o
+FLOYD_LINK = $(CXX)
+LDFLAGS += -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
 endif
 
 TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_hc tests/test_deepseek_v4_quant tests/test_st_probe
@@ -47,8 +54,37 @@ all: floyd
 
 DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h
 
-floyd: floyd.c deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h $(METAL_OBJ)
-	$(CC) $(CFLAGS) floyd.c deepseek_v4_chat.c $(METAL_OBJ) -o floyd $(LDFLAGS)
+floyd: floyd.o deepseek_v4_chat.o $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ)
+	$(FLOYD_LINK) floyd.o deepseek_v4_chat.o $(METAL_OBJ) \
+		$(DEEPSEEK_V4_GGML_OBJ) $(if $(DEEPSEEK_V4_GGML_OBJ),$(LLAMA_STATIC_LIBS)) \
+		-o floyd $(LDFLAGS)
+
+floyd.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+deepseek_v4_chat.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(LLAMA_REV_STAMP):
+	@test -f "$(LLAMA_CPP_DIR)/CMakeLists.txt" || \
+		git clone --filter=blob:none https://github.com/ggml-org/llama.cpp "$(LLAMA_CPP_DIR)"
+	@current=$$(git -C "$(LLAMA_CPP_DIR)" rev-parse HEAD); \
+		if test "$$current" != "$(LLAMA_CPP_REV)"; then \
+			git -C "$(LLAMA_CPP_DIR)" fetch --depth 1 origin "$(LLAMA_CPP_REV)"; \
+			git -C "$(LLAMA_CPP_DIR)" checkout --detach "$(LLAMA_CPP_REV)"; \
+		fi
+	@touch "$@"
+
+$(LLAMA_BUILD_DIR)/src/libllama.a: $(LLAMA_REV_STAMP)
+	cmake -S "$(LLAMA_CPP_DIR)" -B "$(LLAMA_BUILD_DIR)" -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+		-DGGML_METAL=ON -DGGML_ACCELERATE=ON -DLLAMA_CURL=OFF \
+		-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+		-DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
+	cmake --build "$(LLAMA_BUILD_DIR)" --target llama -j 16
+
+deepseek_v4_ggml.o: deepseek_v4_ggml.cpp deepseek_v4_ggml.h deepseek_v4_chat_format.h $(LLAMA_BUILD_DIR)/src/libllama.a
+	$(CXX) -O3 -std=c++17 -DFLOYD_DEEPSEEK_V4_GGML $(LLAMA_INCLUDES) -c $< -o $@
 
 backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 	clang -O2 -fobjc-arc -c backend_metal.m -o $@
@@ -164,7 +200,7 @@ tests/test_deepseek_v4_ggml: tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp 
 test-deepseek-v4-ggml: tests/test_deepseek_v4_ggml
 	./tests/test_deepseek_v4_ggml
 
-tests/test_deepseek_v4_ggml_official: tests/test_deepseek_v4_ggml_official.c deepseek_v4_ggml.cpp deepseek_v4_ggml.h
+tests/test_deepseek_v4_ggml_official: tests/test_deepseek_v4_ggml_official.c deepseek_v4_ggml.cpp deepseek_v4_ggml.h $(LLAMA_BUILD_DIR)/src/libllama.a
 	$(CXX) -O2 -std=c++17 -DFLOYD_DEEPSEEK_V4_GGML $(LLAMA_INCLUDES) \
 		-x c++ $< deepseek_v4_ggml.cpp -x none $(LLAMA_STATIC_LIBS) -o $@ \
 		-framework Accelerate -framework Metal -framework MetalKit -framework Foundation
@@ -289,6 +325,6 @@ test-deepseek-v4-forward: fixture_dspark_layer0/oracle.safetensors fixture_dspar
 	./tests/test_deepseek_v4_forward "$(DSPARK)" fixture_dspark_layer0 fixture_dspark_layers_0_2 fixture_dspark_layer3_hca fixture_dspark_layers_3_4 fixture_dspark_base_forward fixture_dspark_dspark
 
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_moe_fixture tests/test_deepseek_v4_hc tests/test_deepseek_v4_hc_fixture tests/test_deepseek_v4_attention_fixture tests/test_deepseek_v4_compress_fixture tests/test_deepseek_v4_indexer_fixture tests/test_deepseek_v4_kv_cache_fixture tests/test_deepseek_v4_quant tests/test_deepseek_v4_native_quant tests/test_deepseek_v4_native_quant_metal tests/test_deepseek_v4_model_manifest tests/test_deepseek_v4_forward tests/test_deepseek_v4_decode tests/test_deepseek_v4_dspark_decode tests/test_deepseek_v4_spec_runtime tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_deepseek_v4_chat_format tools/probe_safetensors
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_moe_fixture tests/test_deepseek_v4_hc tests/test_deepseek_v4_hc_fixture tests/test_deepseek_v4_attention_fixture tests/test_deepseek_v4_compress_fixture tests/test_deepseek_v4_indexer_fixture tests/test_deepseek_v4_kv_cache_fixture tests/test_deepseek_v4_quant tests/test_deepseek_v4_native_quant tests/test_deepseek_v4_native_quant_metal tests/test_deepseek_v4_model_manifest tests/test_deepseek_v4_forward tests/test_deepseek_v4_decode tests/test_deepseek_v4_dspark_decode tests/test_deepseek_v4_spec_runtime tests/test_deepseek_v4_ggml tests/test_deepseek_v4_ggml_official tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_deepseek_v4_chat_format tools/probe_safetensors
 
-.PHONY: all floyd test-c test-tok test-cli-default-chat test-deepseek-v4-naming test-deepseek-v4-chat-dispatch test-deepseek-v4-attention test-deepseek-v4-chat test-deepseek-v4-chat-metal test-deepseek-v4-chat-backend test-deepseek-v4-chat-backend-metal test-deepseek-v4-chat-format test-deepseek-v4-chat-spec test-deepseek-v4-compress test-deepseek-v4-dspark-decode test-deepseek-v4-hc test-deepseek-v4-indexer test-deepseek-v4-kv-cache test-deepseek-v4-model-manifest test-deepseek-v4-moe test-deepseek-v4-native-quant test-deepseek-v4-native-quant-metal test-deepseek-v4-oracle test-deepseek-v4-decode test-deepseek-v4-forward test-deepseek-v4-forward-oracle test-deepseek-v4-spec-runtime metal-test clean portable
+.PHONY: all floyd prepare-deepseek-v4-gguf test-c test-tok test-cli-default-chat test-deepseek-v4-naming test-deepseek-v4-chat-dispatch test-deepseek-v4-attention test-deepseek-v4-chat test-deepseek-v4-chat-metal test-deepseek-v4-chat-backend test-deepseek-v4-chat-backend-metal test-deepseek-v4-chat-format test-deepseek-v4-chat-spec test-deepseek-v4-compress test-deepseek-v4-dspark-decode test-deepseek-v4-ggml test-deepseek-v4-ggml-official test-deepseek-v4-hc test-deepseek-v4-indexer test-deepseek-v4-kv-cache test-deepseek-v4-model-manifest test-deepseek-v4-moe test-deepseek-v4-native-quant test-deepseek-v4-native-quant-metal test-deepseek-v4-oracle test-deepseek-v4-decode test-deepseek-v4-forward test-deepseek-v4-forward-oracle test-deepseek-v4-spec-runtime test-prepare-deepseek-v4-gguf metal-test clean portable

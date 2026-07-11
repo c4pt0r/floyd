@@ -1,6 +1,6 @@
 # floyd
 
-**Same tiny engine, an even bigger model.** `floyd` runs **Moonlight-16B-A3B**
+**Same native engine, an even bigger model.** `floyd` runs **Moonlight-16B-A3B**
 (moonshotai, `deepseek_v3` architecture — MLA attention, 64-expert
 sigmoid/`noaux_tc` MoE router, 2 shared experts) in pure C, with the same
 methodology as [colibrì](https://github.com/JustVugg/colibri): offline
@@ -75,39 +75,33 @@ sqrt-softplus routing; it is a correctness target, not a performance model.
 Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
 CSA/Lightning Indexer block integration point is layer 2.
 
-Build and run the current greedy DeepSeek V4 chat path directly against the official
-checkpoint:
+Prepare and run the resident DeepSeek V4 Metal chat path against the official
+checkpoint. Conversion and the pinned llama.cpp checkout are local ignored
+artifacts; neither is committed:
 
 ```bash
-make floyd
-./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
+PYTHON=.venv/bin/python make prepare-deepseek-v4-gguf \
+  DSPARK=/path/to/DeepSeek-V4-Flash-DSpark
 
-# optional batch FP8/FP4 Metal path (macOS)
 make METAL=1 floyd
 ./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
 
-# enable lossless three-stage DSpark proposals
-DSPARK_SPEC=1 ./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
-
-# one-shot parity/debug mode
+# explicit slow safetensors correctness path
 PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
+  FLOYD_DEEPSEEK_V4_REFERENCE=1 \
   SNAP=/path/to/DeepSeek-V4-Flash-DSpark CHAT=1 CTX=64 ./floyd
 ```
 
-The built-in runtime implements the official DeepSeek V4 chat-mode prompt,
-incremental KV state, streaming decode, `:reset`, and `:exit` (`/clear` and
-`/exit` remain accepted aliases). `DSPARK_SPEC=1` enables the
-three speculative layers while retaining base-greedy token identity. Startup
-prints `DEEPSEEK_V4_BACKEND backend=cpu|metal`; each turn prints Metal call and CPU
-fallback counts. A Metal build enables the GPU path by default;
-`FLOYD_METAL=0` explicitly selects CPU instead. `FM_MIN_S` controls the minimum
-batch size (default 8, minimum 2).
-
-The Metal path currently covers native DSpark FP8 (E4M3 with 128x128 E8M0
-scales) and FP4 (model codebook with per-32-column E8M0 scales) batch matmul.
-F32 dense operations and single-token decode remain on CPU. Checkpoint weights
-are still streamed and uploaded per call, so this is a correctness runtime with
-partial prefill acceleration, not an optimized GPU serving engine.
+The production path statically links a pinned ggml runtime, keeps the split GGUF
+mmap-resident, and offloads the full DeepSeek4 graph and MXFP4 MoE to Metal. It
+implements the official chat-mode prompt, incremental compressed KV state,
+streaming decode, `:reset`, and `:exit` (`/clear` and `/exit` remain aliases),
+without Python or an inference subprocess. Startup prints
+`DEEPSEEK_V4_BACKEND backend=metal-ggml`; each turn prints measured prompt and
+decode throughput. The old safetensors implementation remains available only
+through `FLOYD_DEEPSEEK_V4_REFERENCE=1` for oracle debugging. DSpark/MTP export
+is not yet enabled in the resident runtime, so `DSPARK_SPEC=1` currently reports
+`disabled=mtp-not-prepared` instead of claiming speculative acceleration.
 
 ## What's *not* here (scope)
 
@@ -207,9 +201,10 @@ building (`METAL=1` or not) to get the multi-threaded OpenMP build.
 `--metal` (or legacy `FLOYD_METAL=1`) on a CPU-only build (`make` without
 `METAL=1`) hard-errors (exit code 2) rather than silently ignoring the flag.
 
-#### Metal is for batch, not chat decode
+#### Moonlight's original Metal wrapper is for batch, not chat decode
 
-Metal accelerates the **batch** matmul path (prefill / teacher-forcing /
+For Moonlight and the explicit DeepSeek reference backend, Metal accelerates the
+**batch** matmul path (prefill / teacher-forcing /
 forward over `S >= FM_MIN_S` tokens at once, default `FM_MIN_S=8`) — chat
 decode (`S=1`, one token at a time) stays on CPU by design and default, and
 should. The generic Metal dispatch wrapper this project ships (transient
