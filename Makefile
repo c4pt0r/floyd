@@ -27,7 +27,8 @@ DEEPSEEK_V4_GGML_OBJ =
 FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
-LLAMA_CPP_REV ?= e3546c7948e3af463d0b401e6421d5a4c2faf565
+LLAMA_CPP_REPO ?= https://github.com/cchuter/llama.cpp.git
+LLAMA_CPP_REV ?= 19b63dc368dfef6db6783e5ba3143927b7ed1c96
 LLAMA_REV_STAMP = $(LLAMA_CPP_DIR)/.floyd-revision-$(LLAMA_CPP_REV)
 LLAMA_INCLUDES = -I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
 LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
@@ -67,7 +68,7 @@ deepseek_v4_chat.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml
 
 $(LLAMA_REV_STAMP):
 	@test -f "$(LLAMA_CPP_DIR)/CMakeLists.txt" || \
-		git clone --filter=blob:none https://github.com/ggml-org/llama.cpp "$(LLAMA_CPP_DIR)"
+		git clone --filter=blob:none "$(LLAMA_CPP_REPO)" "$(LLAMA_CPP_DIR)"
 	@current=$$(git -C "$(LLAMA_CPP_DIR)" rev-parse HEAD); \
 		if test "$$current" != "$(LLAMA_CPP_REV)"; then \
 			git -C "$(LLAMA_CPP_DIR)" fetch --depth 1 origin "$(LLAMA_CPP_REV)"; \

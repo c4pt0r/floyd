@@ -2,7 +2,8 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-LLAMA_CPP_REV=${LLAMA_CPP_REV:-e3546c7948e3af463d0b401e6421d5a4c2faf565}
+LLAMA_CPP_REPO=${LLAMA_CPP_REPO:-https://github.com/cchuter/llama.cpp.git}
+LLAMA_CPP_REV=${LLAMA_CPP_REV:-19b63dc368dfef6db6783e5ba3143927b7ed1c96}
 LLAMA_CPP_DIR=${LLAMA_CPP_DIR:-"$ROOT/.deps/llama.cpp"}
 PYTHON=${PYTHON:-python3}
 
@@ -46,7 +47,7 @@ esac
 
 if test ! -f "$LLAMA_CPP_DIR/convert_hf_to_gguf.py"; then
     mkdir -p "$(dirname "$LLAMA_CPP_DIR")"
-    git clone --filter=blob:none https://github.com/ggml-org/llama.cpp "$LLAMA_CPP_DIR"
+    git clone --filter=blob:none "$LLAMA_CPP_REPO" "$LLAMA_CPP_DIR"
 fi
 
 if test "${LLAMA_CPP_SKIP_REV_CHECK:-0}" != 1; then

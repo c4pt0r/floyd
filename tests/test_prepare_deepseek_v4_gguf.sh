@@ -6,6 +6,11 @@ PREPARE="$ROOT/tools/prepare_deepseek_v4_gguf.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/floyd-dsv4-prepare.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
+grep -F 'LLAMA_CPP_REPO=${LLAMA_CPP_REPO:-https://github.com/cchuter/llama.cpp.git}' "$PREPARE"
+grep -F 'LLAMA_CPP_REV=${LLAMA_CPP_REV:-19b63dc368dfef6db6783e5ba3143927b7ed1c96}' "$PREPARE"
+grep -F 'LLAMA_CPP_REPO ?= https://github.com/cchuter/llama.cpp.git' "$ROOT/Makefile"
+grep -F 'LLAMA_CPP_REV ?= 19b63dc368dfef6db6783e5ba3143927b7ed1c96' "$ROOT/Makefile"
+
 MODEL="$TMP/model"
 OUTPUT="$TMP/output"
 LLAMA="$TMP/llama.cpp"
