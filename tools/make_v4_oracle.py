@@ -178,9 +178,39 @@ def build_compressor_captures(model):
             position_ids = torch.arange(n_tokens, dtype=torch.long).unsqueeze(0)
             kv = compressor.kv_proj(hidden)
             gate = compressor.gate_proj(hidden)
-            compressed, _ = compressor(
-                hidden, q_residual, position_ids, None, layer_index
-            )
+            handles = []
+            if mode == "csa":
+                def capture_scorer(module, args, output):
+                    q, compressed_kv, scorer_hidden = args
+                    captures["indexer.q"] = q[0].detach().float().contiguous().clone()
+                    captures["indexer.kv"] = (
+                        compressed_kv[0].detach().float().contiguous().clone()
+                    )
+                    captures["indexer.weights"] = (
+                        module.weights_proj(scorer_hidden)[0]
+                        .detach().float().contiguous().clone()
+                    )
+                    captures["indexer.scores"] = (
+                        output[0].detach().float().contiguous().clone()
+                    )
+
+                def capture_indexer(module, args, output):
+                    captures["indexer.positions"] = (
+                        args[2][0].detach().contiguous().clone()
+                    )
+                    captures["indexer.indices"] = (
+                        output[0].detach().contiguous().clone()
+                    )
+
+                handles.append(compressor.indexer.scorer.register_forward_hook(capture_scorer))
+                handles.append(compressor.indexer.register_forward_hook(capture_indexer))
+            try:
+                compressed, _ = compressor(
+                    hidden, q_residual, position_ids, None, layer_index
+                )
+            finally:
+                for handle in handles:
+                    handle.remove()
 
             captures[f"compress.{mode}.kv"] = kv[0].float().contiguous()
             captures[f"compress.{mode}.gate"] = gate[0].float().contiguous()

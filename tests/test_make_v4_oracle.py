@@ -80,6 +80,8 @@ def test_write_tiny_is_complete_and_deterministic():
             for mode in ("hca", "csa"):
                 for field in ("kv", "gate", "ape", "norm", "output"):
                     expected_keys.add(f"compress.{mode}.{field}")
+            for field in ("q", "kv", "weights", "scores", "positions", "indices"):
+                expected_keys.add(f"indexer.{field}")
             assert set(oracle.keys()) == expected_keys
             n_tokens = len(ref["full_ids"])
             assert oracle.get_slice("input_ids").get_shape() == [n_tokens]
@@ -110,6 +112,12 @@ def test_write_tiny_is_complete_and_deterministic():
             assert oracle.get_slice("compress.csa.ape").get_shape() == [4, 32]
             assert oracle.get_slice("compress.csa.norm").get_shape() == [16]
             assert oracle.get_slice("compress.csa.output").get_shape() == [3, 16]
+            assert oracle.get_slice("indexer.q").get_shape() == [12, 4, 8]
+            assert oracle.get_slice("indexer.kv").get_shape() == [3, 8]
+            assert oracle.get_slice("indexer.weights").get_shape() == [12, 4]
+            assert oracle.get_slice("indexer.scores").get_shape() == [12, 3]
+            assert oracle.get_slice("indexer.positions").get_shape() == [12]
+            assert oracle.get_slice("indexer.indices").get_shape() == [12, 2]
 
 
 if __name__ == "__main__":
