@@ -10,6 +10,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--forward-output")
     args = parser.parse_args()
 
     model_dir = Path(args.model)
@@ -47,6 +48,9 @@ def main():
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({"cases": cases}, ensure_ascii=False, indent=2))
+    if args.forward_output:
+        from make_v4_real_layer0_oracle import write_base_forward_oracle
+        write_base_forward_oracle(model_dir, args.forward_output, cases[0]["ids"])
 
 
 if __name__ == "__main__":

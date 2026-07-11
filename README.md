@@ -49,7 +49,9 @@ shared experts. `v4_hc.h` provides the F32 mHC/Sinkhorn reference, and
 references also cover CSA/HCA compression, Lightning Indexer selection, native
 packed FP4/FP8 matmul, and official checkpoint manifest loading. The real
 layer-0 gate runs official attention, mHC, hash routing, routed FP4 experts, and
-the shared FP8 expert. Full 43-layer execution and DSpark decoding remain open.
+the shared FP8 expert. The official-checkpoint reference path now covers all 43
+base layers, final norm/head, incremental KV decode, and all three DSpark draft
+stages. Lossless base verification of DSpark proposals remains open.
 
 Generate the deterministic CPU-sized V4 architecture oracle with:
 
@@ -71,6 +73,23 @@ fixture covers sliding/HCA/CSA attention, mHC, hash MoE, and learned
 sqrt-softplus routing; it is a correctness target, not a performance model.
 Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
 CSA/Lightning Indexer block integration point is layer 2.
+
+Build and run the current greedy V4 chat path directly against the official
+checkpoint:
+
+```bash
+make v4_chat
+./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+
+# one-shot parity/debug mode
+PROMPT=hello NGEN=1 V4_CHAT_TRACE=1 \
+  ./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 64 1
+```
+
+The executable implements the official V4 chat-mode prompt, incremental KV
+state, streaming decode, `/clear`, and `/exit`. It is currently the CPU
+correctness path: weights are streamed from the original checkpoint, so it is
+not an optimized serving runtime.
 
 ## What's *not* here (scope)
 
