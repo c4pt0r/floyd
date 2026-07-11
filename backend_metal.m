@@ -9,7 +9,7 @@
 #include "kernels_metal.h"      /* xxd -i kernels.metal: unsigned char kernels_metal[], kernels_metal_len */
 
 static id<MTLDevice> g_dev; static id<MTLCommandQueue> g_q;
-static id<MTLComputePipelineState> g_p8, g_p4, g_v4_fp8, g_v4_fp4;
+static id<MTLComputePipelineState> g_p8, g_p4, g_deepseek_v4_fp8, g_deepseek_v4_fp4;
 
 /* Cache pesi chiave-puntatore: per tensori model-resident, upload lazy una
  * sola volta poi riuso (equivalente a colibri' CUDA "lazy upload once").
@@ -28,7 +28,7 @@ static os_unfair_lock g_wc_lock = OS_UNFAIR_LOCK_INIT;
 
 int fm_init(void) {
     @autoreleasepool {
-        if (g_dev && g_q && g_p8 && g_p4 && g_v4_fp8 && g_v4_fp4) return 1;
+        if (g_dev && g_q && g_p8 && g_p4 && g_deepseek_v4_fp8 && g_deepseek_v4_fp4) return 1;
         g_dev = MTLCreateSystemDefaultDevice();
         if (!g_dev) return 0;
         g_q = [g_dev newCommandQueue];
@@ -38,9 +38,9 @@ int fm_init(void) {
         if (!lib) { fprintf(stderr, "[METAL] compile: %s\n", err.localizedDescription.UTF8String); return 0; }
         g_p8 = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_q8"] error:&err];
         g_p4 = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_q4"] error:&err];
-        g_v4_fp8 = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_v4_fp8"] error:&err];
-        g_v4_fp4 = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_v4_fp4"] error:&err];
-        return (g_p8 && g_p4 && g_v4_fp8 && g_v4_fp4) ? 1 : 0;
+        g_deepseek_v4_fp8 = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_deepseek_v4_fp8"] error:&err];
+        g_deepseek_v4_fp4 = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matmul_deepseek_v4_fp4"] error:&err];
+        return (g_p8 && g_p4 && g_deepseek_v4_fp8 && g_deepseek_v4_fp4) ? 1 : 0;
     }
 }
 const char *fm_device_name(void) { return g_dev ? g_dev.name.UTF8String : "(none)"; }
@@ -125,15 +125,15 @@ void fm_matmul_q8(float *y, const float *x, const int8_t *w, const float *s, int
 { run(g_p8, w, (size_t)O * I, s, x, y, O, I, S, cache); }
 void fm_matmul_q4(float *y, const float *x, const uint8_t *w, const float *s, int O, int I, int S, int cache)
 { run(g_p4, w, (size_t)O * ((I + 1) / 2), s, x, y, O, I, S, cache); }
-int fm_matmul_v4_fp8(float *y, const float *x, const uint8_t *w,
+int fm_matmul_deepseek_v4_fp8(float *y, const float *x, const uint8_t *w,
                      const uint8_t *s, int O, int I, int S, int block_size) {
     if (block_size != 128 || O % 128 || I % 128) return 0;
-    return run_v4(g_v4_fp8, w, (size_t)O * I, s,
+    return run_v4(g_deepseek_v4_fp8, w, (size_t)O * I, s,
                   (size_t)(O / 128) * (I / 128), x, y, O, I, S);
 }
-int fm_matmul_v4_fp4(float *y, const float *x, const uint8_t *w,
+int fm_matmul_deepseek_v4_fp4(float *y, const float *x, const uint8_t *w,
                      const uint8_t *s, int O, int I, int S) {
     if (I % 32) return 0;
-    return run_v4(g_v4_fp4, w, (size_t)O * (I / 2), s,
+    return run_v4(g_deepseek_v4_fp4, w, (size_t)O * (I / 2), s,
                   (size_t)O * (I / 32), x, y, O, I, S);
 }

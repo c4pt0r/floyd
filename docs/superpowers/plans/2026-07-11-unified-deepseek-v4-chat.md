@@ -23,9 +23,9 @@
 
 **Files:**
 - Create: `tests/test_deepseek_v4_naming.sh`
-- Rename: `v4_*.h` to `deepseek_v4_*.h`
-- Rename: `tests/test_v4_*` and `tests/test_make_v4_oracle.py` to `tests/test_deepseek_v4_*` and `tests/test_make_deepseek_v4_oracle.py`
-- Rename: `tools/make_v4_*` to `tools/make_deepseek_v4_*`
+- Rename: `deepseek_v4_*.h` to `deepseek_v4_*.h`
+- Rename: `tests/test_deepseek_v4_*` and `tests/test_make_deepseek_v4_oracle.py` to `tests/test_deepseek_v4_*` and `tests/test_make_deepseek_v4_oracle.py`
+- Rename: `tools/make_deepseek_v4_*` to `tools/make_deepseek_v4_*`
 - Rename: DeepSeek V4 docs containing `v4` in their filename to `deepseek-v4`
 - Modify: `Makefile`, `.gitignore`, `README.md`, renamed C/Python/shell files
 
@@ -35,24 +35,24 @@
 
 - [ ] **Step 1: Write the failing naming gate**
 
-The shell test must fail when tracked source/build filenames match `(^|/)(v4_|test_v4_|make_v4_)`, when C files contain `\bv4_` or `\bV4_`, or when `Makefile` contains `test-v4-`.
+The shell test must fail when tracked source/build filenames match `(^|/)(deepseek_v4_|test_deepseek_v4_|make_deepseek_v4_)`, when C files contain `\bdeepseek_v4_` or `\bDEEPSEEK_V4_`, or when `Makefile` contains `test-deepseek-v4-`.
 
 - [ ] **Step 2: Run the gate and verify RED**
 
 Run: `sh tests/test_deepseek_v4_naming.sh`
 
-Expected: failure listing current `v4_quant.h`, `V4Runtime`, and `test-v4-*` names.
+Expected: failure listing current `deepseek_v4_quant.h`, `DeepSeekV4Runtime`, and `test-deepseek-v4-*` names.
 
 - [ ] **Step 3: Perform scoped mechanical renames**
 
 Use `git mv` for tracked files. Apply token-aware replacements only to project-owned names:
 
 ```text
-v4_ -> deepseek_v4_
-V4_ -> DEEPSEEK_V4_
-V4Runtime/V4Real/V4Quant -> DeepSeekV4Runtime/DeepSeekV4Real/DeepSeekV4Quant
-test-v4- -> test-deepseek-v4-
-fixture_tiny_v4 -> fixture_tiny_deepseek_v4
+deepseek_v4_ -> deepseek_v4_
+DEEPSEEK_V4_ -> DEEPSEEK_V4_
+DeepSeekV4Runtime/DeepSeekV4Forward/DeepSeekV4Quant -> DeepSeekV4Runtime/DeepSeekV4Forward/DeepSeekV4Quant
+test-deepseek-v4- -> test-deepseek-v4-
+fixture_tiny_deepseek_v4 -> fixture_tiny_deepseek_v4
 ```
 
 Do not rewrite upstream `DeepseekV4ForCausalLM` or the JSON value `deepseek_v4`.

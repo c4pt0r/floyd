@@ -44,8 +44,8 @@ softmax, sigmoid, and square-root-softplus expert affinity while keeping
 selection bias separate from mixture weights. Moonlight now uses this shared
 path without changing its routing results. `moe_exec.h` provides the F32
 reference execution path for learned and hash routing, clamped SwiGLU, and
-shared experts. `v4_hc.h` provides the F32 mHC/Sinkhorn reference, and
-`v4_attention.h` provides full-sequence and cached sliding attention. The V4
+shared experts. `deepseek_v4_hc.h` provides the F32 mHC/Sinkhorn reference, and
+`deepseek_v4_attention.h` provides full-sequence and cached sliding attention. The V4
 references also cover CSA/HCA compression, Lightning Indexer selection, native
 packed FP4/FP8 matmul, and official checkpoint manifest loading. The real
 layer-0 gate runs official attention, mHC, hash routing, routed FP4 experts, and
@@ -57,19 +57,19 @@ mismatch emits the base token and starts a new proposal block.
 Generate the deterministic CPU-sized V4 architecture oracle with:
 
 ```bash
-.venv/bin/python tools/make_v4_oracle.py tiny
-make test-v4-moe
-make test-v4-hc
-make test-v4-attention
+.venv/bin/python tools/make_deepseek_v4_oracle.py tiny
+make test-deepseek-v4-moe
+make test-deepseek-v4-hc
+make test-deepseek-v4-attention
 
 # official checkpoint gates (model files remain external and ignored)
-DSPARK=/path/to/DeepSeek-V4-Flash-DSpark make test-v4-native-quant
-DSPARK=/path/to/DeepSeek-V4-Flash-DSpark make test-v4-model-manifest
+DSPARK=/path/to/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-native-quant
+DSPARK=/path/to/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-model-manifest
 PYTHON=.venv/bin/python DSPARK=/path/to/DeepSeek-V4-Flash-DSpark \
-  make test-v4-real-layer0
+  make test-deepseek-v4-forward
 ```
 
-This creates ignored `fixture_tiny_v4/` and `ref_v4_tiny.json` artifacts. The
+This creates ignored `fixture_tiny_deepseek_v4/` and `ref_deepseek_v4_tiny.json` artifacts. The
 fixture covers sliding/HCA/CSA attention, mHC, hash MoE, and learned
 sqrt-softplus routing; it is a correctness target, not a performance model.
 Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
@@ -79,25 +79,25 @@ Build and run the current greedy V4 chat path directly against the official
 checkpoint:
 
 ```bash
-make v4_chat
-./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+make deepseek_v4_chat
+./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
 
 # optional batch FP8/FP4 Metal path (macOS)
-make METAL=1 v4_chat
-./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+make METAL=1 deepseek_v4_chat
+./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
 
 # enable lossless three-stage DSpark proposals
-DSPARK_SPEC=1 ./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+DSPARK_SPEC=1 ./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
 
 # one-shot parity/debug mode
-PROMPT=hello NGEN=1 V4_CHAT_TRACE=1 \
-  ./v4_chat /path/to/DeepSeek-V4-Flash-DSpark 64 1
+PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
+  ./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 64 1
 ```
 
 The executable implements the official V4 chat-mode prompt, incremental KV
 state, streaming decode, `/clear`, and `/exit`. `DSPARK_SPEC=1` enables the
 three speculative layers while retaining base-greedy token identity. Startup
-prints `V4_BACKEND backend=cpu|metal`; each turn prints Metal call and CPU
+prints `DEEPSEEK_V4_BACKEND backend=cpu|metal`; each turn prints Metal call and CPU
 fallback counts. A Metal build enables the GPU path by default;
 `FLOYD_METAL=0` explicitly selects CPU instead. `FM_MIN_S` controls the minimum
 batch size (default 8, minimum 2).

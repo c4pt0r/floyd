@@ -38,11 +38,11 @@ kernel void matmul_q4(device const uchar *w [[buffer(0)]],
     y[(ulong)t * d.x + o] = acc * s[o];
 }
 
-static inline float v4_e8m0(uchar code) {
+static inline float deepseek_v4_e8m0(uchar code) {
     return code == 255 ? NAN : exp2((float)((int)code - 127));
 }
 
-static inline float v4_e4m3(uchar code) {
+static inline float deepseek_v4_e4m3(uchar code) {
     int sign = (code & 0x80) ? -1 : 1;
     int exponent = (code >> 3) & 0x0f;
     int mantissa = code & 0x07;
@@ -53,7 +53,7 @@ static inline float v4_e4m3(uchar code) {
     return (float)sign * value;
 }
 
-kernel void matmul_v4_fp8(device const uchar *w [[buffer(0)]],
+kernel void matmul_deepseek_v4_fp8(device const uchar *w [[buffer(0)]],
                           device const uchar *s [[buffer(1)]],
                           device const float *x [[buffer(2)]],
                           device float       *y [[buffer(3)]],
@@ -67,11 +67,11 @@ kernel void matmul_v4_fp8(device const uchar *w [[buffer(0)]],
     device const uchar *sr = s + (ulong)(o / 128) * scale_columns;
     float acc = 0.0f;
     for (uint i = 0; i < d.y; i++)
-        acc += xr[i] * v4_e4m3(wr[i]) * v4_e8m0(sr[i / 128]);
+        acc += xr[i] * deepseek_v4_e4m3(wr[i]) * deepseek_v4_e8m0(sr[i / 128]);
     y[(ulong)t * d.x + o] = acc;
 }
 
-kernel void matmul_v4_fp4(device const uchar *w [[buffer(0)]],
+kernel void matmul_deepseek_v4_fp4(device const uchar *w [[buffer(0)]],
                           device const uchar *s [[buffer(1)]],
                           device const float *x [[buffer(2)]],
                           device float       *y [[buffer(3)]],
@@ -92,7 +92,7 @@ kernel void matmul_v4_fp4(device const uchar *w [[buffer(0)]],
     for (uint i = 0; i < d.y; i++) {
         uchar packed = wr[i >> 1];
         uchar code = (i & 1) ? packed >> 4 : packed & 0x0f;
-        acc += xr[i] * values[code] * v4_e8m0(sr[i / 32]);
+        acc += xr[i] * values[code] * deepseek_v4_e8m0(sr[i / 32]);
     }
     y[(ulong)t * d.x + o] = acc;
 }

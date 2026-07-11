@@ -12,7 +12,7 @@ The target checkpoint is revision `62af8fffb2f7030cac4de2f0169f5b8d1101b646`. It
 
 ## FP4 Reference
 
-`v4_quant.h` exposes allocation-free scalar and row decoding helpers. Packed E2M1 values use the official nibble table and low-nibble-first order. Each group of 32 logical FP4 values shares one E8M0 scale; E8M0 byte `e` represents `2^(e-127)`, with `255` treated as NaN.
+`deepseek_v4_quant.h` exposes allocation-free scalar and row decoding helpers. Packed E2M1 values use the official nibble table and low-nibble-first order. Each group of 32 logical FP4 values shares one E8M0 scale; E8M0 byte `e` represents `2^(e-127)`, with `255` treated as NaN.
 
 The reference path favors clarity and exact format verification. Optimized NEON, Metal, or fused matmul kernels remain later milestones and must be tested against this implementation.
 

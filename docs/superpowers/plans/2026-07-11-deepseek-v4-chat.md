@@ -1,0 +1,228 @@
+# DeepSeek V4 Chat Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Run an interactive, multi-turn chat against the official `DeepSeek-V4-Flash-DSpark` checkpoint with exact V4 prompt encoding, incremental base decode, and verified DSpark proposals.
+
+**Architecture:** Keep Moonlight unchanged. Add a V4-specific tokenizer/prompt module, extend the verified streaming kernels behind a stateful runtime API, and expose that API through a small `deepseek_v4_chat` executable. Base greedy decode is authoritative; DSpark is an optional lossless proposal layer.
+
+**Tech Stack:** C11-style header-only numerical kernels, safetensors shards, Hugging Face `tokenizer.json`, Python/PyTorch official oracle, Make.
+
+## Global Constraints
+
+- Use `/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark` as the real checkpoint.
+- Follow RED/GREEN TDD and commit each independently verifiable behavior.
+- Do not commit model files, generated fixtures, binaries, logs, or `AGENTS.md`.
+- Keep all existing V4 and Moonlight parity gates passing.
+
+---
+
+### Task 1: Official V4 Tokenizer And Prompt
+
+**Files:**
+- Create: `deepseek_v4_chat_format.h`
+- Create: `tools/make_deepseek_v4_chat_oracle.py`
+- Create: `tests/test_deepseek_v4_chat_format.c`
+- Modify: `Makefile`
+
+**Interfaces:**
+- Produces: `deepseek_v4_chat_append_user(char *dst, size_t cap, size_t used, const char *text, int first_turn)` and the existing `Tok` encode/decode API validated for the V4 tokenizer.
+
+- [ ] **Step 1: Write the failing real-tokenizer test**
+
+Generate an untracked JSON oracle containing official `encode_messages(..., thinking_mode="chat")` strings, token IDs, and decode text for ASCII, Chinese, punctuation, multiline, and two-turn prompts. In C, load the official `tokenizer.json`, render each prompt, assert byte equality, token-ID equality, and decode equality. Include exact special-token checks for IDs `0` (BOS) and `1` (EOS).
+
+- [ ] **Step 2: Verify RED**
+
+Run:
+
+```bash
+PYTHON=.venv/bin/python DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat-format
+```
+
+Expected: FAIL because `deepseek_v4_chat_format.h` and V4 tokenizer semantics are absent or mismatch the official oracle.
+
+- [ ] **Step 3: Implement the minimal format/tokenizer support**
+
+Render chat mode as BOS once, then `<｜User｜>{text}<｜Assistant｜></think>` per user turn. Generalize `tok.h` pre-tokenization only where the V4 fixture proves a difference; preserve Moonlight behavior through an explicit tokenizer pattern mode selected at load time.
+
+- [ ] **Step 4: Verify GREEN and regress Moonlight tokenizer**
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat-format
+make test-tok
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add deepseek_v4_chat_format.h tools/make_deepseek_v4_chat_oracle.py tests/test_deepseek_v4_chat_format.c Makefile tok.h
+git commit -m "v4 chat: match official prompt tokens"
+```
+
+### Task 2: Incremental Base Decode Oracle
+
+**Files:**
+- Modify: `tools/make_deepseek_v4_forward_oracle.py`
+- Modify: `tests/test_deepseek_v4_forward.py`
+- Modify: `tests/test_deepseek_v4_forward.c`
+- Modify: `Makefile`
+
+**Interfaces:**
+- Produces fixture tensors for a real prompt split into prefill and one-token decode, including layer outputs, cache positions/counts, final logits/top tokens, compressor entries, and indexer IDs.
+
+- [ ] **Step 1: Add the oracle and failing C assertions**
+
+Use official `inference/model.py` semantics to capture one prompt both as a single causal pass and as prefill plus decode at nonzero `start_pos`. Cover positions crossing ratio-4 and ratio-128 boundaries. Require per-layer activation bounds already established by the real runner, exact cache counts/positions, exact router/indexer IDs, and exact top-1 token.
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+PYTHON=.venv/bin/python DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat-oracle
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-forward
+```
+
+Expected: oracle generation passes; C fails because the runner rejects `next_position != 0` and non-four-token calls.
+
+- [ ] **Step 3: Commit the test contract**
+
+```bash
+git add tools/make_deepseek_v4_forward_oracle.py tests/test_deepseek_v4_forward.py tests/test_deepseek_v4_forward.c Makefile
+git commit -m "test: require V4 incremental decode parity"
+```
+
+### Task 3: Stateful V4 Base Runtime
+
+**Files:**
+- Create: `deepseek_v4_runtime.h`
+- Modify: `deepseek_v4_forward.h`
+- Modify: `tests/test_deepseek_v4_forward.c`
+
+**Interfaces:**
+- Produces: `deepseek_v4_runtime_init`, `deepseek_v4_runtime_reset`, `deepseek_v4_runtime_forward`, and `deepseek_v4_runtime_free`; `deepseek_v4_runtime_forward(runtime, ids, count, logits)` consumes exactly the next contiguous token span.
+
+- [ ] **Step 1: Implement one-token attention/cache updates**
+
+Remove the position-zero restrictions behind a new stateful entrypoint. Append window KV for every token; incrementally pool compressor state; append compressed/index KV only at complete block boundaries; compute sparse attention against the causal window and eligible compressed blocks.
+
+- [ ] **Step 2: Run the focused test until GREEN**
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-forward
+```
+
+Do not relax existing thresholds; locate the first divergent layer/cache transition.
+
+- [ ] **Step 3: Expose arbitrary prefill and logits**
+
+Initialize embeddings for any positive count, run all 43 layers with their shared runtime state, retain target-layer means, and run the final norm/head for the last token.
+
+- [ ] **Step 4: Verify split versus contiguous parity and commit**
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-forward
+git add deepseek_v4_runtime.h deepseek_v4_forward.h tests/test_deepseek_v4_forward.c
+git commit -m "v4 runtime: support incremental base decode"
+```
+
+### Task 4: Greedy Generation And Interactive Chat
+
+**Files:**
+- Create: `deepseek_v4_chat.c`
+- Create: `tests/test_deepseek_v4_chat.c`
+- Modify: `Makefile`
+- Modify: `README.md`
+
+**Interfaces:**
+- Produces: `./deepseek_v4_chat <checkpoint> [max_context] [max_new_tokens]`; supports `/clear`, `/exit`, `DSPARK_SPEC=0`, and streamed UTF-8 output.
+
+- [ ] **Step 1: Write a failing generation test**
+
+Feed the official prompt-token fixture to the runtime, greedily generate a short completion, and assert every token against the Python oracle. Exercise two turns by appending EOS and the next user suffix without resetting state; assert `/clear` resets the next position to zero.
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat
+```
+
+Expected: FAIL because no generation loop/CLI exists.
+
+- [ ] **Step 3: Implement greedy chat and verify GREEN**
+
+Use argmax logits, stop at token ID `1`, decode each token through `Tok`, append all emitted IDs to history, and retain runtime state across turns. Reject context overflow before mutating state.
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat
+printf 'hello\n/exit\n' | ./deepseek_v4_chat /Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark 512 8
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add deepseek_v4_chat.c tests/test_deepseek_v4_chat.c Makefile README.md
+git commit -m "v4 chat: add greedy interactive generation"
+```
+
+### Task 5: Lossless DSpark Verification
+
+**Files:**
+- Modify: `deepseek_v4_runtime.h`
+- Modify: `deepseek_v4_forward.h`
+- Modify: `tools/make_deepseek_v4_forward_oracle.py`
+- Modify: `tests/test_deepseek_v4_chat.c`
+
+**Interfaces:**
+- Produces: `deepseek_v4_runtime_generate_block`, which returns only tokens accepted by a base causal verification pass and falls back to the first base mismatch token.
+
+- [ ] **Step 1: Add failing accept and reject fixtures**
+
+Capture official DSpark proposals plus base verification logits for one fully accepted prefix and one mismatch. Assert proposed IDs, acceptance length, emitted IDs, and that `DSPARK_SPEC=0` and `DSPARK_SPEC=1` produce identical greedy output.
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat
+```
+
+- [ ] **Step 3: Implement proposal verification**
+
+Run all three DSpark stages from captured base target-layer means, verify the five-token proposal through the base runner, commit only the matching prefix, and reset/discard speculative temporary state after a mismatch. Never emit confidence-only accepted tokens.
+
+- [ ] **Step 4: Verify GREEN and commit**
+
+```bash
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat test-deepseek-v4-forward
+git add deepseek_v4_runtime.h deepseek_v4_forward.h tools/make_deepseek_v4_forward_oracle.py tests/test_deepseek_v4_chat.c
+git commit -m "v4 chat: verify DSpark proposals"
+```
+
+### Task 6: Full Regression And Repository Audit
+
+**Files:** none unless a verified regression requires a scoped fix.
+
+- [ ] **Step 1: Run V4 gates**
+
+```bash
+PYTHON=.venv/bin/python DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-oracle test-deepseek-v4-chat-oracle
+DSPARK=/Users/dongxu/floyd/models/DeepSeek-V4-Flash-DSpark make test-deepseek-v4-chat-format test-deepseek-v4-chat test-deepseek-v4-forward test-deepseek-v4-native-quant test-deepseek-v4-model-manifest
+make test-deepseek-v4-compress test-deepseek-v4-indexer test-deepseek-v4-attention test-deepseek-v4-kv-cache test-deepseek-v4-moe test-deepseek-v4-hc
+```
+
+- [ ] **Step 2: Run existing build and Moonlight gates**
+
+```bash
+make clean && make && make test-c
+SNAP=/Users/dongxu/floyd/fixture_tiny TF=1 REF=/Users/dongxu/floyd/ref_tiny.json ./floyd 8 16 16
+SNAP=/Users/dongxu/floyd/fixture_tiny REF=/Users/dongxu/floyd/ref_tiny.json ./floyd 8 16 16
+```
+
+- [ ] **Step 3: Audit**
+
+```bash
+git diff --check
+git status --short --untracked-files=all
+git log --oneline -12
+```
+
+Confirm no model, fixture, binary, log, or `AGENTS.md` is staged or committed.

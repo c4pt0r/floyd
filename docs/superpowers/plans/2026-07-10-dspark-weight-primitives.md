@@ -69,13 +69,13 @@ git commit -m "v4 weights 1: index DSpark safetensors dtypes"
 ### Task 2: FP4 and E8M0 Reference Decoder
 
 **Files:**
-- Create: `v4_quant.h`
-- Create: `tests/test_v4_quant.c`
+- Create: `deepseek_v4_quant.h`
+- Create: `tests/test_deepseek_v4_quant.c`
 - Modify: `Makefile`
 
 **Interfaces:**
 - Consumes: packed FP4 bytes, E8M0 scale bytes, logical element count.
-- Produces: `v4_fp4_code_value`, `v4_e8m0_to_f32`, and `v4_fp4_dequant_row`.
+- Produces: `deepseek_v4_fp4_code_value`, `deepseek_v4_e8m0_to_f32`, and `deepseek_v4_fp4_dequant_row`.
 
 - [ ] **Step 1: Add the failing test target**
 
@@ -83,9 +83,9 @@ Test all 16 official FP4 values, low/high nibble order, E8M0 codes 0/125/126/127
 
 - [ ] **Step 2: Run RED**
 
-Run: `make tests/test_v4_quant`
+Run: `make tests/test_deepseek_v4_quant`
 
-Expected: Make fails because `v4_quant.h` is absent.
+Expected: Make fails because `deepseek_v4_quant.h` is absent.
 
 - [ ] **Step 3: Implement the reference decoder**
 
@@ -99,14 +99,14 @@ Decode scale byte 255 as `NAN`; otherwise return `ldexpf(1.0f, code - 127)`. Dec
 
 - [ ] **Step 4: Run GREEN**
 
-Run: `make tests/test_v4_quant && ./tests/test_v4_quant && make test-c`
+Run: `make tests/test_deepseek_v4_quant && ./tests/test_deepseek_v4_quant && make test-c`
 
 Expected: `v4 quant tests: ok` and all C tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Makefile v4_quant.h tests/test_v4_quant.c
+git add Makefile deepseek_v4_quant.h tests/test_deepseek_v4_quant.c
 git commit -m "v4 weights 2: add FP4 reference decoder"
 ```
 
