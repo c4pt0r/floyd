@@ -33,6 +33,7 @@
 #include "tok.h"
 #include "moe_route.h"
 #include "tok_moon.h"                              /* tokenizer moonshot (Chat-Task 4): mtok_*, template builders */
+#include "deepseek_v4_chat.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -2638,6 +2639,15 @@ int main(int argc, char **argv){
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    if(getenv("CHAT") && deepseek_v4_model_dir(snap)) {
+        DeepSeekV4ChatOptions options = {
+            .model_dir = snap,
+            .max_context = getenv("CTX") ? atoi(getenv("CTX")) : 512,
+            .max_new_tokens = getenv("NGEN") ? atoi(getenv("NGEN")) : 16,
+            .use_spec = getenv("DSPARK_SPEC") && atoi(getenv("DSPARK_SPEC")) != 0,
+        };
+        return deepseek_v4_chat_run(&options);
+    }
 #ifdef FLOYD_METAL
     g_metal = (getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))) ? 1 : 0;
     g_metal_min_s = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;

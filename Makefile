@@ -36,11 +36,10 @@ TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_ex
 
 all: floyd
 
-floyd: floyd.c st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h $(METAL_OBJ)
-	$(CC) $(CFLAGS) floyd.c $(METAL_OBJ) -o floyd $(LDFLAGS)
+DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h
 
-deepseek_v4_chat: deepseek_v4_chat.c deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h $(METAL_OBJ)
-	$(CC) $(CFLAGS) deepseek_v4_chat.c $(METAL_OBJ) -o deepseek_v4_chat $(LDFLAGS)
+floyd: floyd.c deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) floyd.c deepseek_v4_chat.c $(METAL_OBJ) -o floyd $(LDFLAGS)
 
 backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 	clang -O2 -fobjc-arc -c backend_metal.m -o $@
@@ -147,6 +146,10 @@ test-cli-default-chat: floyd
 test-deepseek-v4-naming:
 	sh tests/test_deepseek_v4_naming.sh
 
+test-deepseek-v4-chat-dispatch: floyd
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	sh tests/test_deepseek_v4_chat_dispatch.sh "$(DSPARK)"
+
 tests/test_deepseek_v4_chat_format: tests/test_deepseek_v4_chat_format.c tok.h tok_unicode.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -162,22 +165,22 @@ fixture_dspark_chat/forward.safetensors: tools/make_deepseek_v4_chat_oracle.py t
 test-deepseek-v4-chat-format: fixture_dspark_chat/chat_oracle.json tests/test_deepseek_v4_chat_format
 	./tests/test_deepseek_v4_chat_format "$(DSPARK)" fixture_dspark_chat/chat_oracle.json
 
-test-deepseek-v4-chat: fixture_dspark_chat/forward.safetensors deepseek_v4_chat
+test-deepseek-v4-chat: fixture_dspark_chat/forward.safetensors floyd
 	PYTHON="$(PYTHON)" sh tests/test_deepseek_v4_chat_cli.sh "$(DSPARK)" $<
 
-test-deepseek-v4-chat-metal: fixture_dspark_chat/forward.safetensors deepseek_v4_chat
+test-deepseek-v4-chat-metal: fixture_dspark_chat/forward.safetensors floyd
 	FM_MIN_S=4 EXPECT_BACKEND=metal PYTHON="$(PYTHON)" \
 		sh tests/test_deepseek_v4_chat_cli.sh "$(DSPARK)" $<
 
-test-deepseek-v4-chat-backend: deepseek_v4_chat
+test-deepseek-v4-chat-backend: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	sh tests/test_deepseek_v4_chat_backend.sh "$(DSPARK)" cpu
 
-test-deepseek-v4-chat-backend-metal: deepseek_v4_chat
+test-deepseek-v4-chat-backend-metal: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	FM_MIN_S=4 sh tests/test_deepseek_v4_chat_backend.sh "$(DSPARK)" metal
 
-test-deepseek-v4-chat-spec: fixture_dspark_dspark_decode/oracle.safetensors deepseek_v4_chat
+test-deepseek-v4-chat-spec: fixture_dspark_dspark_decode/oracle.safetensors floyd
 	sh tests/test_deepseek_v4_chat_spec.sh "$(DSPARK)"
 
 tools/probe_safetensors: tools/probe_safetensors.c st.h st_probe.h json.h compat.h
@@ -254,6 +257,6 @@ test-deepseek-v4-forward: fixture_dspark_layer0/oracle.safetensors fixture_dspar
 	./tests/test_deepseek_v4_forward "$(DSPARK)" fixture_dspark_layer0 fixture_dspark_layers_0_2 fixture_dspark_layer3_hca fixture_dspark_layers_3_4 fixture_dspark_base_forward fixture_dspark_dspark
 
 clean:
-	rm -f floyd deepseek_v4_chat *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_moe_fixture tests/test_deepseek_v4_hc tests/test_deepseek_v4_hc_fixture tests/test_deepseek_v4_attention_fixture tests/test_deepseek_v4_compress_fixture tests/test_deepseek_v4_indexer_fixture tests/test_deepseek_v4_kv_cache_fixture tests/test_deepseek_v4_quant tests/test_deepseek_v4_native_quant tests/test_deepseek_v4_native_quant_metal tests/test_deepseek_v4_model_manifest tests/test_deepseek_v4_forward tests/test_deepseek_v4_decode tests/test_deepseek_v4_dspark_decode tests/test_deepseek_v4_spec_runtime tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_deepseek_v4_chat_format tools/probe_safetensors
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_moe_fixture tests/test_deepseek_v4_hc tests/test_deepseek_v4_hc_fixture tests/test_deepseek_v4_attention_fixture tests/test_deepseek_v4_compress_fixture tests/test_deepseek_v4_indexer_fixture tests/test_deepseek_v4_kv_cache_fixture tests/test_deepseek_v4_quant tests/test_deepseek_v4_native_quant tests/test_deepseek_v4_native_quant_metal tests/test_deepseek_v4_model_manifest tests/test_deepseek_v4_forward tests/test_deepseek_v4_decode tests/test_deepseek_v4_dspark_decode tests/test_deepseek_v4_spec_runtime tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_deepseek_v4_chat_format tools/probe_safetensors
 
-.PHONY: all deepseek_v4_chat test-c test-tok test-cli-default-chat test-deepseek-v4-naming test-deepseek-v4-attention test-deepseek-v4-chat test-deepseek-v4-chat-metal test-deepseek-v4-chat-backend test-deepseek-v4-chat-backend-metal test-deepseek-v4-chat-format test-deepseek-v4-chat-spec test-deepseek-v4-compress test-deepseek-v4-dspark-decode test-deepseek-v4-hc test-deepseek-v4-indexer test-deepseek-v4-kv-cache test-deepseek-v4-model-manifest test-deepseek-v4-moe test-deepseek-v4-native-quant test-deepseek-v4-native-quant-metal test-deepseek-v4-oracle test-deepseek-v4-decode test-deepseek-v4-forward test-deepseek-v4-forward-oracle test-deepseek-v4-spec-runtime metal-test clean portable
+.PHONY: all floyd test-c test-tok test-cli-default-chat test-deepseek-v4-naming test-deepseek-v4-chat-dispatch test-deepseek-v4-attention test-deepseek-v4-chat test-deepseek-v4-chat-metal test-deepseek-v4-chat-backend test-deepseek-v4-chat-backend-metal test-deepseek-v4-chat-format test-deepseek-v4-chat-spec test-deepseek-v4-compress test-deepseek-v4-dspark-decode test-deepseek-v4-hc test-deepseek-v4-indexer test-deepseek-v4-kv-cache test-deepseek-v4-model-manifest test-deepseek-v4-moe test-deepseek-v4-native-quant test-deepseek-v4-native-quant-metal test-deepseek-v4-oracle test-deepseek-v4-decode test-deepseek-v4-forward test-deepseek-v4-forward-oracle test-deepseek-v4-spec-runtime metal-test clean portable

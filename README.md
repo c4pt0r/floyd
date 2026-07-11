@@ -79,19 +79,19 @@ Build and run the current greedy V4 chat path directly against the official
 checkpoint:
 
 ```bash
-make deepseek_v4_chat
-./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+make floyd
+./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
 
 # optional batch FP8/FP4 Metal path (macOS)
-make METAL=1 deepseek_v4_chat
-./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+make METAL=1 floyd
+./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
 
 # enable lossless three-stage DSpark proposals
-DSPARK_SPEC=1 ./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 512 16
+DSPARK_SPEC=1 ./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
 
 # one-shot parity/debug mode
 PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
-  ./deepseek_v4_chat /path/to/DeepSeek-V4-Flash-DSpark 64 1
+  SNAP=/path/to/DeepSeek-V4-Flash-DSpark CHAT=1 CTX=64 ./floyd
 ```
 
 The executable implements the official V4 chat-mode prompt, incremental KV

@@ -3,7 +3,6 @@ models/
 __pycache__/
 *.o
 floyd
-deepseek_v4_chat
 ref*.json
 .DS_Store
 tests/test_json

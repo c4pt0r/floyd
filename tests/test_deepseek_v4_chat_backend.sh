@@ -14,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-PROMPT=hello NGEN=1 ./deepseek_v4_chat "$model" 64 1 >"$output" 2>&1 &
+./floyd --model "$model" --ctx 64 --ngen 1 >"$output" 2>&1 &
 pid=$!
 attempt=0
 while [ "$attempt" -lt 50 ]; do

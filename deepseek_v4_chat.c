@@ -2,9 +2,42 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "deepseek_v4_chat.h"
 #include "tok.h"
 #include "deepseek_v4_chat_format.h"
 #include "deepseek_v4_runtime.h"
+#include "json.h"
+
+int deepseek_v4_model_dir(const char *model_dir) {
+    if (!model_dir) return 0;
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    if (fseek(file, 0, SEEK_END) || ftell(file) <= 0) {
+        fclose(file);
+        return 0;
+    }
+    long size = ftell(file);
+    if (size > (1 << 20) || fseek(file, 0, SEEK_SET)) {
+        fclose(file);
+        return 0;
+    }
+    char *text = malloc((size_t)size + 1);
+    if (!text) { fclose(file); return 0; }
+    size_t read_size = fread(text, 1, (size_t)size, file);
+    fclose(file);
+    if (read_size != (size_t)size) { free(text); return 0; }
+    text[size] = 0;
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    jval *model_type = json_get(root, "model_type");
+    int is_v4 = model_type && model_type->t == J_STR &&
+                !strcmp(model_type->str, "deepseek_v4");
+    free(arena);
+    free(text);
+    return is_v4;
+}
 
 static int deepseek_v4_chat_trace_enabled(void) {
     const char *value = getenv("DEEPSEEK_V4_CHAT_TRACE");
@@ -187,43 +220,37 @@ static int deepseek_v4_chat_turn(DeepSeekV4Runtime *runtime, Tok *tokenizer, con
     return result;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2 || argc > 4) {
-        fprintf(stderr,
-                "usage: %s <DeepSeek-V4-Flash-DSpark> [max_context] [max_new_tokens]\n",
-                argv[0]);
-        return 2;
-    }
-    int max_context = argc >= 3 ? atoi(argv[2]) : 512;
-    int max_new_tokens = argc >= 4 ? atoi(argv[3]) : 16;
-    if (getenv("NGEN")) max_new_tokens = atoi(getenv("NGEN"));
-    int use_spec = getenv("DSPARK_SPEC") && atoi(getenv("DSPARK_SPEC")) != 0;
-    if (max_context <= 0 || max_new_tokens <= 0) {
+int deepseek_v4_chat_run(const DeepSeekV4ChatOptions *options) {
+    if (!options || !options->model_dir || options->max_context <= 0 ||
+        options->max_new_tokens <= 0) {
         fprintf(stderr, "max_context and max_new_tokens must be positive\n");
         return 2;
     }
     if (!deepseek_v4_chat_backend_init()) return 2;
 
     char tokenizer_path[2048];
-    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", argv[1]);
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
     Tok tokenizer;
     tok_load(&tokenizer, tokenizer_path);
     DeepSeekV4Runtime runtime;
-    if (!deepseek_v4_runtime_init(&runtime, argv[1], max_context)) {
-        fprintf(stderr, "failed to initialize V4 runtime\n");
+    if (!deepseek_v4_runtime_init(&runtime, options->model_dir,
+                                  options->max_context)) {
+        fprintf(stderr, "failed to initialize DeepSeek V4 runtime\n");
         return 1;
     }
 
     const char *one_shot = getenv("PROMPT");
     if (one_shot) {
         int result = deepseek_v4_chat_turn(&runtime, &tokenizer, one_shot, 1,
-                                  max_new_tokens, 0, use_spec);
+                                  options->max_new_tokens, 0,
+                                  options->use_spec);
         if (result >= 0) putchar('\n');
         deepseek_v4_runtime_free(&runtime);
         return result < 0;
     }
 
-    puts("DeepSeek V4 chat (/clear, /exit)");
+    fprintf(stderr, "floyd chat [DeepSeek V4] — :reset azzera, :exit esce\n");
     char *line = NULL;
     size_t capacity = 0;
     int first_turn = 1, status = 0;
@@ -233,8 +260,8 @@ int main(int argc, char **argv) {
         ssize_t size = getline(&line, &capacity, stdin);
         if (size < 0) break;
         if (size && line[size - 1] == '\n') line[--size] = 0;
-        if (!strcmp(line, "/exit")) break;
-        if (!strcmp(line, "/clear")) {
+        if (!strcmp(line, ":exit") || !strcmp(line, "/exit")) break;
+        if (!strcmp(line, ":reset") || !strcmp(line, "/clear")) {
             deepseek_v4_runtime_reset(&runtime);
             first_turn = 1;
             puts("context cleared");
@@ -244,7 +271,8 @@ int main(int argc, char **argv) {
         fputs("assistant> ", stdout);
         fflush(stdout);
         int result = deepseek_v4_chat_turn(&runtime, &tokenizer, line, first_turn,
-                                  max_new_tokens, 1, use_spec);
+                                  options->max_new_tokens, 1,
+                                  options->use_spec);
         putchar('\n');
         if (result < 0) { status = 1; break; }
         first_turn = 0;

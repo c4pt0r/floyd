@@ -11,8 +11,8 @@ with safe_open(sys.argv[1], framework="pt") as source:
     print(int(source.get_tensor("final.argmax")[0]))
 PY
 )
-output=$(PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
-    ./deepseek_v4_chat "$model" 64 1 2>&1)
+output=$(SNAP="$model" CHAT=1 PROMPT=hello CTX=64 NGEN=1 \
+    DEEPSEEK_V4_CHAT_TRACE=1 ./floyd 2>&1)
 printf '%s\n' "$output"
 printf '%s\n' "$output" | grep -q "DEEPSEEK_V4_TOKEN $expected"
 backend=${EXPECT_BACKEND:-cpu}
