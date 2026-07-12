@@ -32,6 +32,14 @@ class SupportGGUFManifest:
     complete: bool
 
 
+@dataclass(frozen=True)
+class TensorSpec:
+    name: str
+    shape: tuple[int, ...]
+    quant_type: str
+    nbytes: int
+
+
 def _stage_ids(names):
     return tuple(sorted({int(match.group(1)) for name in names
                          if (match := _STAGE_RE.match(name))}))
@@ -71,6 +79,70 @@ def inspect_support_gguf(path: Path) -> SupportGGUFManifest:
     required_names = {tensor.name for tensor in reader.tensors}
     complete = not missing and all(name in required_names for name in _REQUIRED)
     return SupportGGUFManifest(stage_ids, missing, complete)
+
+
+def _q8_nbytes(shape: tuple[int, ...]) -> int:
+    columns = shape[-1]
+    if columns % 32:
+        raise ValueError(f"Q8_0 columns must be divisible by 32: {shape}")
+    rows = 1
+    for dim in shape[:-1]:
+        rows *= dim
+    return rows * (columns // 32) * 34
+
+
+def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
+    from gguf import GGMLQuantizationType, GGUFReader
+
+    reader = GGUFReader(Path(single_stage_gguf), "r")
+    classic_merge = {
+        "e_proj.weight", "h_proj.weight", "enorm.weight", "hnorm.weight",
+    }
+    final_only = {
+        "hc_head_base.weight", "hc_head_fn.weight", "hc_head_scale.weight",
+        "norm.weight",
+    }
+    common = []
+    final = []
+    for tensor in reader.tensors:
+        if not tensor.name.startswith("mtp.0."):
+            continue
+        suffix = tensor.name[len("mtp.0."):]
+        if suffix in classic_merge:
+            continue
+        spec = TensorSpec(
+            suffix,
+            tuple(reversed(tuple(int(dim) for dim in tensor.shape))),
+            GGMLQuantizationType(tensor.tensor_type).name,
+            int(tensor.n_bytes),
+        )
+        (final if suffix in final_only else common).append(spec)
+
+    specs = []
+    for stage in range(3):
+        specs.extend(TensorSpec(f"mtp.{stage}.{spec.name}", spec.shape,
+                                spec.quant_type, spec.nbytes)
+                     for spec in common)
+        if stage == 0:
+            specs.extend((
+                TensorSpec("mtp.0.main_proj.weight", (4096, 12288), "Q8_0",
+                           _q8_nbytes((4096, 12288))),
+                TensorSpec("mtp.0.main_norm.weight", (4096,), "F32", 4096 * 4),
+            ))
+        if stage == 2:
+            specs.extend(TensorSpec(f"mtp.2.{spec.name}", spec.shape,
+                                    spec.quant_type, spec.nbytes)
+                         for spec in final)
+            markov_shape = (129280, 256)
+            specs.extend((
+                TensorSpec("mtp.2.markov_head.markov_w1.weight", markov_shape,
+                           "Q8_0", _q8_nbytes(markov_shape)),
+                TensorSpec("mtp.2.markov_head.markov_w2.weight", markov_shape,
+                           "Q8_0", _q8_nbytes(markov_shape)),
+                TensorSpec("mtp.2.confidence_head.proj.weight", (1, 4352),
+                           "F32", 4352 * 4),
+            ))
+    return tuple(specs)
 
 
 def main() -> None:
