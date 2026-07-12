@@ -437,7 +437,7 @@ index a55d4c9..e781974 100644
 +
 +    const uint32_t exact_batch_n_comp = ratio != 0
 +        ? g->layer_n_comp[il] : 0u;
-+    if (ok && tiny_raw_batch_stored &&
++    if (ok && tiny_raw_batch_stored && n_tokens >= 2 &&
 +        !(ratio == 4 && exact_batch_n_comp > DS4_N_INDEXER_TOP_K)) {
 +        ok = ds4_gpu_attention_decode_exact_batch_heads_tensor(
 +            g->batch_heads,
@@ -2581,7 +2581,7 @@ index 7e3f8bd..9862ee0 100644
 +        const ds4_gpu_tensor *x,
 +        uint64_t                n_tok,
 +        float                   clamp) {
-+    if (n_tok < 2) return 0;
++    if (n_tok == 0) return 0;
 +    const int ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
 +        gate, up, mid, model_map, model_size, gate_offset, up_offset,
 +        in_dim, out_dim, x, n_tok, clamp);
@@ -3807,7 +3807,7 @@ index 7e3f8bd..9862ee0 100644
 +        uint32_t                n_embd,
 +        uint32_t                n_hc,
 +        uint32_t                n_tokens) {
-+    if (n_tokens < 2) return 0;
++    if (n_tokens == 0) return 0;
 +    return ds4_gpu_shared_down_hc_expand_q8_0_rows_tensor(
 +        out_hc, shared_out, model_map, model_size, weight_offset,
 +        in_dim, out_dim, shared_mid, routed_out, residual_hc, split,
@@ -3923,7 +3923,7 @@ index 7e3f8bd..9862ee0 100644
 +        uint32_t                n_embd,
 +        uint32_t                n_hc,
 +        uint32_t                n_tokens) {
-+    if (n_tokens < 2) return 0;
++    if (n_tokens == 0) return 0;
 +    const int ok = ds4_gpu_matmul_q8_0_hc_expand_rows_tensor(
 +        out_hc, block_out, model_map, model_size, weight_offset,
 +        in_dim, out_dim, x, residual_hc, split, n_embd, n_hc, n_tokens);
