@@ -11,6 +11,9 @@
 #ifdef FLOYD_DEEPSEEK_V4_GGML
 #include "deepseek_v4_ggml.h"
 #endif
+#ifdef FLOYD_DEEPSEEK_V4_DS4
+#include "deepseek_v4_ds4.h"
+#endif
 
 int deepseek_v4_model_dir(const char *model_dir) {
     if (!model_dir) return 0;
@@ -47,6 +50,100 @@ static int deepseek_v4_chat_trace_enabled(void) {
     const char *value = getenv("DEEPSEEK_V4_CHAT_TRACE");
     return value && atoi(value) != 0;
 }
+
+#ifdef FLOYD_DEEPSEEK_V4_DS4
+static int deepseek_v4_chat_ds4_emit(int token, const char *piece,
+                                    size_t piece_size, void *user_data) {
+    (void)user_data;
+    if (deepseek_v4_chat_trace_enabled())
+        fprintf(stderr, "DEEPSEEK_V4_TOKEN %d\n", token);
+    if (piece_size && fwrite(piece, 1, piece_size, stdout) != piece_size) return 0;
+    fflush(stdout);
+    return 1;
+}
+
+static void deepseek_v4_chat_ds4_perf(const DeepSeekV4Ds4Stats *stats) {
+    double prompt_tps = stats->prompt_ms > 0.0
+        ? 1000.0 * stats->prompt_tokens / stats->prompt_ms : 0.0;
+    double decode_tps = stats->decode_ms > 0.0
+        ? 1000.0 * stats->generated_tokens / stats->decode_ms : 0.0;
+    fprintf(stderr,
+            "DEEPSEEK_V4_PERF load_ms=%.3f prompt_tokens=%d prompt_tps=%.3f "
+            "generated_tokens=%d decode_tps=%.3f spec_rounds=%d spec_tokens=%d\n",
+            stats->load_ms, stats->prompt_tokens, prompt_tps,
+            stats->generated_tokens, decode_tps,
+            stats->speculative_rounds, stats->speculative_tokens);
+}
+
+static int deepseek_v4_chat_run_ds4(const DeepSeekV4ChatOptions *options,
+                                    const char *model_path) {
+    char error[4096];
+    fprintf(stderr, "DEEPSEEK_V4_BACKEND backend=%s gguf=%s\n",
+            deepseek_v4_ds4_backend_name(), model_path);
+    if (options->use_spec && !getenv("FLOYD_DEEPSEEK_V4_DS4_MTP"))
+        fprintf(stderr, "DEEPSEEK_V4_SPEC disabled=mtp-not-prepared\n");
+
+    DeepSeekV4Ds4Session *session = deepseek_v4_ds4_open(
+        model_path, options->max_context, options->use_spec,
+        error, sizeof(error));
+    if (!session) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+
+    const char *one_shot = getenv("PROMPT");
+    if (one_shot) {
+        DeepSeekV4Ds4Stats stats;
+        int generated = deepseek_v4_ds4_generate_user(
+            session, one_shot, options->max_new_tokens,
+            deepseek_v4_chat_ds4_emit, NULL, &stats, error, sizeof(error));
+        if (generated < 0) fprintf(stderr, "%s\n", error);
+        else deepseek_v4_chat_ds4_perf(&stats);
+        putchar('\n');
+        deepseek_v4_ds4_close(session);
+        return generated < 0;
+    }
+
+    fprintf(stderr, "floyd chat [DeepSeek V4] — :reset azzera, :exit esce\n");
+    char *line = NULL;
+    size_t capacity = 0;
+    int status = 0;
+    for (;;) {
+        fputs("\n› ", stdout);
+        fflush(stdout);
+        ssize_t size = getline(&line, &capacity, stdin);
+        if (size < 0) break;
+        if (size && line[size - 1] == '\n') line[--size] = 0;
+        if (!strcmp(line, ":exit") || !strcmp(line, "/exit")) break;
+        if (!strcmp(line, ":reset") || !strcmp(line, "/clear")) {
+            if (!deepseek_v4_ds4_reset(session)) {
+                fprintf(stderr, "failed to reset DeepSeek V4 DS4 state\n");
+                status = 1;
+                break;
+            }
+            puts("context cleared");
+            continue;
+        }
+        if (!size) continue;
+        fputs("◆ ", stdout);
+        fflush(stdout);
+        DeepSeekV4Ds4Stats stats;
+        int generated = deepseek_v4_ds4_generate_user(
+            session, line, options->max_new_tokens,
+            deepseek_v4_chat_ds4_emit, NULL, &stats, error, sizeof(error));
+        putchar('\n');
+        if (generated < 0) {
+            fprintf(stderr, "%s\n", error);
+            status = 1;
+            break;
+        }
+        deepseek_v4_chat_ds4_perf(&stats);
+    }
+    free(line);
+    deepseek_v4_ds4_close(session);
+    return status;
+}
+#endif
 
 #ifdef FLOYD_DEEPSEEK_V4_GGML
 static int deepseek_v4_chat_ggml_emit(int token, const char *piece,
@@ -330,6 +427,17 @@ int deepseek_v4_chat_run(const DeepSeekV4ChatOptions *options) {
     }
     const char *reference = getenv("FLOYD_DEEPSEEK_V4_REFERENCE");
     if (!reference || atoi(reference) == 0) {
+#ifdef FLOYD_DEEPSEEK_V4_DS4
+        char ds4_model[4096], ds4_error[4096];
+        if (deepseek_v4_ds4_find_model(options->model_dir, ds4_model,
+                                       sizeof(ds4_model), ds4_error,
+                                       sizeof(ds4_error)))
+            return deepseek_v4_chat_run_ds4(options, ds4_model);
+        if (getenv("FLOYD_DEEPSEEK_V4_DS4_GGUF")) {
+            fprintf(stderr, "%s\n", ds4_error);
+            return 2;
+        }
+#endif
 #ifdef FLOYD_DEEPSEEK_V4_GGML
         return deepseek_v4_chat_run_ggml(options);
 #else
