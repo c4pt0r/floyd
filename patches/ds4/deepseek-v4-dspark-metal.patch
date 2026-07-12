@@ -4212,7 +4212,7 @@ index 7e8cbd8..345ba79 100644
              device const int32_t *src = hash + row * 6u;
              for (uint i = 0; i < 6; i++) {
 diff --git a/metal/moe.metal b/metal/moe.metal
-index d47fab2..e6ab32c 100644
+index d47fab2..7d34457 100644
 --- a/metal/moe.metal
 +++ b/metal/moe.metal
 @@ -1,9 +1,16 @@
@@ -4336,7 +4336,28 @@ index d47fab2..e6ab32c 100644
 
  // DS4 attention output low projection, specialized for the fixed block
  // diagonal mapping used by the model:
-@@ -1148,8 +1238,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
+@@ -1101,14 +1191,16 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
+             float sg = 0;
+             float su = 0;
+             for (short l = 0; l < 4; ++l) {
+-                const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+-                const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
++                const uint64_t gridg = svalues[aux8g[l]];
++                const uint64_t gridu = svalues[aux8u[l]];
+                 const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
+                 const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                 for (short j = 0; j < 8; ++j) {
+                     const float v = yl[8 * l + j];
+-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
++                    const uint8_t vg = (uint8_t)(gridg >> (8 * j));
++                    const uint8_t vu = (uint8_t)(gridu >> (8 * j));
++                    sg += v * vg * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
++                    su += v * vu * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                 }
+             }
+             sumg[row] += dg * sg;
+@@ -1148,8 +1240,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
                  g = min(g, c);
                  u = clamp(u, -c, c);
              }
