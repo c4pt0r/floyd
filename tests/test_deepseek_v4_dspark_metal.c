@@ -94,10 +94,10 @@ int main(int argc, char **argv) {
            (long long)expected_ids[2], (long long)expected_ids[3],
            (long long)expected_ids[4], (long long)expected_ids[5]);
     CHECK(rmses[0] < 0.02f);
-    CHECK(rmses[1] < 4.0f);
+    CHECK(rmses[1] < 0.05f);
     CHECK(rmses[2] < 7.0f);
     CHECK(cosines[0] > 0.999f);
-    CHECK(cosines[1] > 0.79f);
+    CHECK(cosines[1] > 0.999f);
     CHECK(cosines[2] > 0.70f);
     CHECK(id_hits == 6);
     free(expected);
