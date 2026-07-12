@@ -74,6 +74,7 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_sync(speculative, &prompt, error, sizeof(error)) == 0);
 
     int greedy_ids[6], spec_ids[6], spec_count = 0, max_round = 0;
+    int eval_rounds = 0;
     for (int i = 0; i < 6; i++) {
         greedy_ids[i] = ds4_session_argmax(greedy);
         CHECK(greedy_ids[i] >= 0);
@@ -86,6 +87,7 @@ int main(int argc, char **argv) {
             speculative, first, 6 - spec_count, -1,
             round, 6, error, sizeof(error));
         CHECK(count > 0);
+        eval_rounds++;
         if (count > max_round) max_round = count;
         for (int i = 0; i < count; i++) spec_ids[spec_count++] = round[i];
     }
@@ -95,6 +97,21 @@ int main(int argc, char **argv) {
            stream_hits, max_round);
     CHECK(stream_hits == 6);
     CHECK(max_round > 1);
+
+    ds4_session_spec_stats spec_stats;
+    CHECK(ds4_session_get_spec_stats(speculative, &spec_stats));
+    CHECK(spec_stats.rounds > 0);
+    CHECK(spec_stats.proposed_tokens >= spec_stats.accepted_tokens);
+    CHECK(spec_stats.accepted_tokens == (uint64_t)(spec_count - eval_rounds));
+    CHECK(spec_stats.target_ms > 0.0);
+    CHECK(spec_stats.proposal_ms > 0.0);
+    CHECK(spec_stats.verify_ms > 0.0);
+    printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
+           "verify=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
+           spec_stats.target_ms, spec_stats.proposal_ms,
+           spec_stats.verify_ms, spec_stats.replay_ms,
+           (unsigned long long)spec_stats.proposed_tokens,
+           (unsigned long long)spec_stats.accepted_tokens);
 
     ds4_session_free(speculative);
     ds4_session_free(greedy);
