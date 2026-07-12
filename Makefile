@@ -25,6 +25,8 @@ METAL    ?= 0
 METAL_OBJ =
 DEEPSEEK_V4_GGML_OBJ =
 DEEPSEEK_V4_DS4_OBJ =
+FLOYD_OBJ = floyd.o
+DEEPSEEK_V4_CHAT_OBJ = deepseek_v4_chat.o
 FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
@@ -56,6 +58,8 @@ CFLAGS  += -DFLOYD_DEEPSEEK_V4_GGML
 CFLAGS  += -DFLOYD_DEEPSEEK_V4_DS4
 DEEPSEEK_V4_GGML_OBJ = deepseek_v4_ggml.o
 DEEPSEEK_V4_DS4_OBJ = deepseek_v4_ds4.o
+FLOYD_OBJ = floyd_metal.o
+DEEPSEEK_V4_CHAT_OBJ = deepseek_v4_chat_metal.o
 FLOYD_LINK = $(CXX)
 LDFLAGS += -pthread -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
 endif
@@ -66,8 +70,8 @@ all: floyd
 
 DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h
 
-floyd: floyd.o deepseek_v4_chat.o $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
-	$(FLOYD_LINK) floyd.o deepseek_v4_chat.o $(METAL_OBJ) \
+floyd: $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
+	$(FLOYD_LINK) $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(METAL_OBJ) \
 		$(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) \
 		$(if $(DEEPSEEK_V4_GGML_OBJ),$(LLAMA_STATIC_LIBS)) \
 		$(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS)) \
@@ -76,7 +80,13 @@ floyd: floyd.o deepseek_v4_chat.o $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEE
 floyd.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
+floyd_metal.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
 deepseek_v4_chat.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h deepseek_v4_ds4.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+deepseek_v4_chat_metal.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h deepseek_v4_ds4.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LLAMA_REV_STAMP): $(LLAMA_PATCHES)
