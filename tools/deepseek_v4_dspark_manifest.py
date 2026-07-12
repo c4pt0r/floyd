@@ -129,7 +129,11 @@ def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
         }:
             quant_type = "MXFP4"
             nbytes = _mxfp4_nbytes(shape)
-        if suffix in {"hc_attn_fn.weight", "hc_ffn_fn.weight", "hc_head_fn.weight"}:
+        if suffix in {
+            "attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
+            "attn_output_a.weight", "attn_output_b.weight",
+            "hc_attn_fn.weight", "hc_ffn_fn.weight", "hc_head_fn.weight",
+        }:
             quant_type = "F16"
             nbytes = 2
             for dim in shape:
