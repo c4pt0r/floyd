@@ -53,17 +53,21 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_argmax(session) == (int)input_id);
 
     int actual[6] = {-1, -1, -1, -1, -1, -1};
-    CHECK(ds4_session_copy_dspark_proposals(session, actual, 6) == 6);
+    int proposal_count = ds4_session_copy_dspark_proposals(session, actual, 6);
+    CHECK(proposal_count == 4);
     int hits = 0;
-    for (int i = 0; i < 6; i++) if (actual[i] == expected[i]) hits++;
-    printf("DeepSeek V4 DSpark resident proposals: ids=%d/6\n", hits);
+    for (int i = 0; i < proposal_count; i++) if (actual[i] == expected[i]) hits++;
+    printf("DeepSeek V4 DSpark resident proposals: ids=%d/%d\n",
+           hits, proposal_count);
     printf("  actual=%d,%d,%d,%d,%d,%d expected=%lld,%lld,%lld,%lld,%lld,%lld\n",
            actual[0], actual[1], actual[2], actual[3], actual[4], actual[5],
            (long long)expected[0], (long long)expected[1],
            (long long)expected[2], (long long)expected[3],
            (long long)expected[4], (long long)expected[5]);
-    for (int i = 0; i < 4; i++) CHECK(actual[i] == expected[i]);
-    for (int i = 0; i < 6; i++) CHECK(actual[i] >= 0 && actual[i] < 129280);
+    for (int i = 0; i < proposal_count; i++) CHECK(actual[i] == expected[i]);
+    for (int i = 0; i < proposal_count; i++)
+        CHECK(actual[i] >= 0 && actual[i] < 129280);
+    for (int i = proposal_count; i < 6; i++) CHECK(actual[i] == -1);
 
     ds4_session_free(session);
     session = NULL;
