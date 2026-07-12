@@ -43,7 +43,9 @@ def test_three_stage_template_reuses_ds4_quant_layout():
     assert by_name["mtp.0.main_proj.weight"].quant_type == "Q8_0"
     assert by_name["mtp.0.hc_attn_fn.weight"].quant_type == "F16"
     assert by_name["mtp.1.hc_ffn_fn.weight"].quant_type == "F16"
+    assert by_name["mtp.2.hc_head_fn.weight"].quant_type == "F16"
     assert by_name["mtp.2.markov_head.markov_w1.weight"].shape == (129280, 256)
+    assert by_name["mtp.2.markov_head.markov_w1.weight"].quant_type == "F16"
     assert by_name["mtp.2.markov_head.markov_w2.weight"].quant_type == "Q8_0"
     assert by_name["mtp.2.confidence_head.proj.weight"].shape == (1, 4352)
     assert "mtp.0.e_proj.weight" not in by_name
