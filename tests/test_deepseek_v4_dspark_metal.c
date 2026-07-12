@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "ds4.h"
+#include "ds4_gpu.h"
 #include "../st.h"
 
 #define D 4096
@@ -48,6 +49,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
         return 2;
     }
+    enum { VOCAB = 129280 };
+    float *argmax_logits = malloc((size_t)VOCAB * sizeof(*argmax_logits));
+    CHECK(argmax_logits);
+    for (int i = 0; i < VOCAB; i++) argmax_logits[i] = -10.0f;
+    argmax_logits[17] = 3.0f;
+    argmax_logits[42] = 3.0f;
+    CHECK(ds4_gpu_init());
+    ds4_gpu_tensor *argmax_input =
+        ds4_gpu_tensor_alloc((uint64_t)VOCAB * sizeof(*argmax_logits));
+    ds4_gpu_tensor *argmax_output = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    CHECK(argmax_input && argmax_output);
+    CHECK(ds4_gpu_tensor_write(argmax_input, 0, argmax_logits,
+                               (uint64_t)VOCAB * sizeof(*argmax_logits)));
+    CHECK(ds4_gpu_argmax_tensor(argmax_output, argmax_input, VOCAB));
+    int32_t argmax_id = -1;
+    CHECK(ds4_gpu_tensor_read(argmax_output, 0, &argmax_id, sizeof(argmax_id)));
+    CHECK(argmax_id == 17);
+    ds4_gpu_kernel_stats argmax_stats_before;
+    ds4_gpu_get_kernel_stats(&argmax_stats_before);
+    CHECK(argmax_stats_before.fast_argmax_calls > 0);
+    ds4_gpu_tensor_free(argmax_output);
+    ds4_gpu_tensor_free(argmax_input);
+    free(argmax_logits);
+
     shards oracle;
     st_init(&oracle, argv[3]);
     float *main_x = malloc(D * sizeof(float));
@@ -69,6 +94,10 @@ int main(int argc, char **argv) {
 
     CHECK(ds4_dspark_probe_stages(argv[1], argv[2], prefill, DRAFT,
                                   main_x, (int)input_id, actual, output_ids) == 0);
+    ds4_gpu_kernel_stats argmax_stats_after;
+    ds4_gpu_get_kernel_stats(&argmax_stats_after);
+    CHECK(argmax_stats_after.fast_argmax_calls >=
+          argmax_stats_before.fast_argmax_calls + DRAFT);
     float errors[3], rmses[3], cosines[3];
     for (int stage = 0; stage < 3; stage++) {
         char name[64];
@@ -87,6 +116,9 @@ int main(int argc, char **argv) {
     int id_hits = 0;
     for (int i = 0; i < 6; i++) if (output_ids[i] == expected_ids[i]) id_hits++;
     printf("DeepSeek V4 DSpark Metal proposals: ids=%d/6\n", id_hits);
+    printf("DeepSeek V4 DSpark fast argmax: calls=%llu tie_id=%d\n",
+           (unsigned long long)argmax_stats_after.fast_argmax_calls,
+           argmax_id);
     printf("  actual=%d,%d,%d,%d,%d,%d expected=%lld,%lld,%lld,%lld,%lld,%lld\n",
            output_ids[0], output_ids[1], output_ids[2], output_ids[3],
            output_ids[4], output_ids[5],
