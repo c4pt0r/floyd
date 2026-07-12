@@ -111,11 +111,19 @@ def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
         suffix = tensor.name[len("mtp.0."):]
         if suffix in classic_merge:
             continue
+        shape = tuple(reversed(tuple(int(dim) for dim in tensor.shape)))
+        quant_type = GGMLQuantizationType(tensor.tensor_type).name
+        nbytes = int(tensor.n_bytes)
+        if suffix in {"hc_attn_fn.weight", "hc_ffn_fn.weight"}:
+            quant_type = "F16"
+            nbytes = 2
+            for dim in shape:
+                nbytes *= dim
         spec = TensorSpec(
             suffix,
-            tuple(reversed(tuple(int(dim) for dim in tensor.shape))),
-            GGMLQuantizationType(tensor.tensor_type).name,
-            int(tensor.n_bytes),
+            shape,
+            quant_type,
+            nbytes,
         )
         (final if suffix in final_only else common).append(spec)
 
