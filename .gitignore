@@ -24,6 +24,7 @@ tests/test_deepseek_v4_model_manifest
 tests/test_deepseek_v4_forward
 tests/test_deepseek_v4_decode
 tests/test_deepseek_v4_dspark_decode
+tests/test_deepseek_v4_dspark_metal
 tests/test_deepseek_v4_dspark_support
 tests/test_deepseek_v4_spec_runtime
 tests/test_backend_metal
