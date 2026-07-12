@@ -7,7 +7,7 @@ tokens=${NGEN:-16}
 output=$(mktemp -t floyd-deepseek-v4-ds4-official.XXXXXX)
 trap 'rm -f "$output"' EXIT INT TERM
 
-prompt=${PROMPT_TEXT:-hello}
+prompt=${PROMPT_TEXT:-写一个至少100字的中文故事。}
 printf '%s\n:exit\n' "$prompt" |
     ./floyd --model "$model" --ctx 512 --ngen "$tokens" >"$output" 2>&1
 cat "$output"
