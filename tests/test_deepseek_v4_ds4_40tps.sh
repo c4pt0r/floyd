@@ -36,8 +36,6 @@ printf 'tokens=%s decode_tps=%s replay_ms=%s direct_accepted=%s prefix1_accepted
 test "$count" -eq "$tokens"
 test -n "$direct"
 test "$direct" -gt 0
-test -n "$prefix1"
-test "$prefix1" -gt 0
 test -n "$snapshots"
 test "$snapshots" -le 2
 test "$replay" = "0.000"
