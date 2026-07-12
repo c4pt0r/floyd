@@ -210,6 +210,12 @@ tests/test_deepseek_v4_ggml: tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp 
 test-deepseek-v4-ggml: tests/test_deepseek_v4_ggml
 	./tests/test_deepseek_v4_ggml
 
+tests/test_deepseek_v4_ds4: tests/test_deepseek_v4_ds4.c deepseek_v4_ds4.c deepseek_v4_ds4.h
+	$(CC) -O2 tests/test_deepseek_v4_ds4.c deepseek_v4_ds4.c -o $@
+
+test-deepseek-v4-ds4: tests/test_deepseek_v4_ds4
+	./tests/test_deepseek_v4_ds4
+
 tests/test_deepseek_v4_ggml_official: tests/test_deepseek_v4_ggml_official.c deepseek_v4_ggml.cpp deepseek_v4_ggml.h $(LLAMA_BUILD_DIR)/src/libllama.a
 	$(CXX) -O2 -std=c++17 -DFLOYD_DEEPSEEK_V4_GGML $(LLAMA_INCLUDES) \
 		-x c++ $< deepseek_v4_ggml.cpp -x none $(LLAMA_STATIC_LIBS) -o $@ \
