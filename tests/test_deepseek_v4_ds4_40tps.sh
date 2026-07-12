@@ -26,10 +26,14 @@ perf=$(grep '^DEEPSEEK_V4_PERF ' "$trace")
 count=$(grep -c '^DEEPSEEK_V4_TOKEN ' "$trace")
 tps=$(printf '%s\n' "$perf" | sed -n 's/.* decode_tps=\([0-9.]*\).*/\1/p')
 replay=$(printf '%s\n' "$perf" | sed -n 's/.* replay_ms=\([0-9.]*\).*/\1/p')
+direct=$(printf '%s\n' "$perf" | sed -n 's/.* direct_accepted=\([0-9][0-9]*\).*/\1/p')
 printf '%s\n' "$perf"
-printf 'tokens=%s decode_tps=%s replay_ms=%s\n' "$count" "$tps" "$replay"
+printf 'tokens=%s decode_tps=%s replay_ms=%s direct_accepted=%s\n' \
+    "$count" "$tps" "$replay" "$direct"
 
 test "$count" -eq "$tokens"
+test -n "$direct"
+test "$direct" -gt 0
 test "$(grep -c '^DEEPSEEK_V4_TOKEN ' "$greedy_trace")" -eq "$tokens"
 grep '^DEEPSEEK_V4_TOKEN ' "$trace" | sed 's/.* /token /' >"$spec_ids"
 grep '^DEEPSEEK_V4_TOKEN ' "$greedy_trace" | sed 's/.* /token /' >"$greedy_ids"
