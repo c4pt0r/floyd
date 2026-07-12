@@ -27,7 +27,7 @@ int main(void) {
     unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
     CHECK(deepseek_v4_ds4_spec_config_from_env(
         &spec, spec_error, sizeof(spec_error)));
-    CHECK(spec.draft_tokens == 5);
+    CHECK(spec.draft_tokens == 3);
     CHECK(spec.margin == 3.0f);
 
     CHECK(setenv("DRAFT", "4", 1) == 0);
