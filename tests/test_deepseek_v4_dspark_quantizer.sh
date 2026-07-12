@@ -30,4 +30,11 @@ test "$(map_tensor mtp.2.ffn_down_exps.weight)" = \
 test "$(map_tensor mtp.2.markov_head.markov_w2.weight)" = \
     "mtp.2.markov_head.markov_w2.weight -> mtp.2.markov_head.markov_w2.weight"
 
+confidence_probe=$(
+    "$QUANTIZER" --hf "$DSPARK" --template "$TMP/template.gguf" \
+        --compare-tensor mtp.2.confidence_head.proj.weight 2>/dev/null
+)
+printf '%s\n' "$confidence_probe" | grep -q '^generated_bytes: 17408$'
+printf '%s\n' "$confidence_probe" | grep -q '^byte_compare: FAIL '
+
 echo "DeepSeek V4 DSpark quantizer mapping: ok"
