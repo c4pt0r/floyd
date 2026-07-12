@@ -1,0 +1,197 @@
+diff --git a/ds4.c b/ds4.c
+index 3551b88..a0c3a51 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -28308,6 +28308,8 @@ int ds4_session_get_kernel_stats(const ds4_session *s,
+             gpu_stats.tiny_batch_raw_store_calls;
+         out->tiny_batch_exact_attn_calls =
+             gpu_stats.tiny_batch_exact_attn_calls;
++        out->tiny_batch_exact_q8_calls =
++            gpu_stats.tiny_batch_exact_q8_calls;
+     }
+ #endif
+     return 1;
+diff --git a/ds4.h b/ds4.h
+index 599a0c0..fc77cda 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -73,6 +73,7 @@ typedef struct {
+     uint64_t tiny_batch_attn_hc_calls;
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
++    uint64_t tiny_batch_exact_q8_calls;
+ } ds4_session_kernel_stats;
+ 
+ #define DS4_DEFAULT_TEMPERATURE 1.0f
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 83053af..e35f0bb 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -27,6 +27,7 @@ typedef struct {
+     uint64_t tiny_batch_attn_hc_calls;
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
++    uint64_t tiny_batch_exact_q8_calls;
+     uint64_t fast_argmax_calls;
+ } ds4_gpu_kernel_stats;
+ 
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 8594703..a84efe7 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -346,6 +346,7 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
+ static uint64_t g_tiny_batch_attn_hc_calls;
+ static uint64_t g_tiny_batch_raw_store_calls;
+ static uint64_t g_tiny_batch_exact_attn_calls;
++static uint64_t g_tiny_batch_exact_q8_calls;
+ static uint64_t g_fast_argmax_calls;
+ 
+ void ds4_gpu_get_kernel_stats(ds4_gpu_kernel_stats *out) {
+@@ -359,6 +360,7 @@ void ds4_gpu_get_kernel_stats(ds4_gpu_kernel_stats *out) {
+     out->tiny_batch_attn_hc_calls = g_tiny_batch_attn_hc_calls;
+     out->tiny_batch_raw_store_calls = g_tiny_batch_raw_store_calls;
+     out->tiny_batch_exact_attn_calls = g_tiny_batch_exact_attn_calls;
++    out->tiny_batch_exact_q8_calls = g_tiny_batch_exact_q8_calls;
+     out->fast_argmax_calls = g_fast_argmax_calls;
+ }
+ 
+@@ -12964,8 +12966,16 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
+             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+             if (out_dim > 65536u) mv_dispatch.nsg = 8;
+             mv_args.nr0 = mv_dispatch.nr0;
++            const bool exact_rows = tiny_decode_order && n_tok >= 2 && n_tok <= 4 &&
++                getenv("DS4_METAL_DISABLE_TINY_EXACT_Q8_ROWS") == NULL;
++            const char *pipeline_name = mv_dispatch.function_name;
++            if (exact_rows) {
++                pipeline_name = n_tok == 2 ? "kernel_mul_mv_q8_0_f32_exact_rows2" :
++                    (n_tok == 3 ? "kernel_mul_mv_q8_0_f32_exact_rows3" :
++                                  "kernel_mul_mv_q8_0_f32_exact_rows4");
++            }
+             id<MTLComputePipelineState> pipeline =
+-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
++                ds4_gpu_get_mul_mv_pipeline(pipeline_name, mv_dispatch.nsg);
+             if (!pipeline) return 0;
+ 
+             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+@@ -12976,10 +12986,11 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
+             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+             [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+-                                                  (NSUInteger)n_tok,
++                                                  exact_rows ? 1u : (NSUInteger)n_tok,
+                                                   1)
+                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+             ds4_gpu_end_compute_encoder(cb, enc);
++            if (exact_rows) g_tiny_batch_exact_q8_calls++;
+ 
+             if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor matvec")) {
+                 return 0;
+diff --git a/metal/dense.metal b/metal/dense.metal
+index a3a82a5..1ae6ea7 100644
+--- a/metal/dense.metal
++++ b/metal/dense.metal
+@@ -190,6 +190,104 @@ kernel void kernel_mul_mv_q8_0_f32(
+     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
++template<short NR1>
++void kernel_mul_mv_q8_0_f32_exact_rows_impl(
++        constant ds4_metal_args_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NR0 = N_R0_Q8_0;
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NQ = 8;
++
++    const int nb = args.ne00/QK8_0;
++    const int r0 = tgpig.x*NR0;
++    const int im = tgpig.z;
++    const uint i12 = im%args.ne12;
++    const uint i13 = im/args.ne12;
++
++    device const block_q8_0 * ax[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const uint64_t offset0 = (r0 + row)*args.nb01 +
++            (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
++        ax[row] = (device const block_q8_0 *)(src0 + offset0);
++    }
++
++    float sumf[NR1][NR0] = {{0.f}};
++    const short ix = tiisg/(NW/NQ);
++    const short il = tiisg%(NW/NQ);
++    const int ib0 = sgitg*NQ + ix;
++
++    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
++        FOR_UNROLL (short token = 0; token < NR1; ++token) {
++            const uint64_t offset1 = token*args.nb11 +
++                i12*args.nb12 + i13*args.nb13;
++            device const float * yb = (device const float *)(src1 + offset1) +
++                ib*QK8_0 + il*NQ;
++            float yl[NQ];
++            FOR_UNROLL (short i = 0; i < NQ; ++i) {
++                yl[i] = yb[i];
++            }
++            FOR_UNROLL (short row = 0; row < NR0; ++row) {
++                device const int8_t * qs = ax[row][ib].qs + il*NQ;
++                float sumq = 0.f;
++                FOR_UNROLL (short i = 0; i < NQ; ++i) {
++                    sumq += qs[i] * yl[i];
++                }
++                sumf[token][row] += sumq*ax[row][ib].d;
++            }
++        }
++    }
++
++    FOR_UNROLL (short token = 0; token < NR1; ++token) {
++        device float * dst_f32 = (device float *)dst +
++            (uint64_t)im*args.ne0*args.ne1 + (uint64_t)token*args.ne0;
++        helper_mv_reduce_and_write<NR0>(dst_f32, sumf[token], r0,
++                                        args.ne01, tiisg, sgitg, shmem);
++    }
++}
++
++[[host_name("kernel_mul_mv_q8_0_f32_exact_rows2")]]
++kernel void kernel_mul_mv_q8_0_f32_exact_rows2(
++        constant ds4_metal_args_mul_mv & args,
++        device const char * src0, device const char * src1,
++        device char * dst, threadgroup char * shmem [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_q8_0_f32_exact_rows_impl<2>(args, src0, src1, dst, shmem,
++                                              tgpig, tiisg, sgitg);
++}
++
++[[host_name("kernel_mul_mv_q8_0_f32_exact_rows3")]]
++kernel void kernel_mul_mv_q8_0_f32_exact_rows3(
++        constant ds4_metal_args_mul_mv & args,
++        device const char * src0, device const char * src1,
++        device char * dst, threadgroup char * shmem [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_q8_0_f32_exact_rows_impl<3>(args, src0, src1, dst, shmem,
++                                              tgpig, tiisg, sgitg);
++}
++
++[[host_name("kernel_mul_mv_q8_0_f32_exact_rows4")]]
++kernel void kernel_mul_mv_q8_0_f32_exact_rows4(
++        constant ds4_metal_args_mul_mv & args,
++        device const char * src0, device const char * src1,
++        device char * dst, threadgroup char * shmem [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_q8_0_f32_exact_rows_impl<4>(args, src0, src1, dst, shmem,
++                                              tgpig, tiisg, sgitg);
++}
++
+ // Decode shared-expert gate/up projections followed by SwiGLU:
+ //
+ //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)
