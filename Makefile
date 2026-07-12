@@ -232,6 +232,9 @@ test-deepseek-v4-naming:
 test-prepare-deepseek-v4-gguf:
 	sh tests/test_prepare_deepseek_v4_gguf.sh
 
+test-prepare-deepseek-v4-ds4:
+	sh tests/test_prepare_deepseek_v4_ds4.sh
+
 tests/test_deepseek_v4_ggml: tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp deepseek_v4_ggml.h
 	$(CXX) -O2 -std=c++17 -x c++ tests/test_deepseek_v4_ggml.c deepseek_v4_ggml.cpp -o $@
 
@@ -257,6 +260,12 @@ prepare-deepseek-v4-gguf:
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	PYTHON="$(PYTHON)" tools/prepare_deepseek_v4_gguf.sh "$(DSPARK)" \
 		"$(if $(DEEPSEEK_V4_GGUF),$(DEEPSEEK_V4_GGUF),$(DSPARK)-GGUF)"
+
+prepare-deepseek-v4-ds4:
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	DS4_DIR="$(DS4_DIR)" DS4_REV="$(DS4_REV)" DS4_QUANT="$(if $(DS4_QUANT),$(DS4_QUANT),q2-imatrix)" \
+		tools/prepare_deepseek_v4_ds4.sh "$(DSPARK)" \
+		"$(if $(DEEPSEEK_V4_DS4_GGUF),$(DEEPSEEK_V4_DS4_GGUF),$(DSPARK)-DS4)"
 
 test-deepseek-v4-chat-dispatch: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
