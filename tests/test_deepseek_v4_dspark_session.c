@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
         .model_path = argv[1],
         .dspark_path = argv[2],
         .backend = DS4_BACKEND_METAL,
-        .mtp_draft_tokens = 4,
+        .mtp_draft_tokens = 6,
     };
     ds4_engine *engine = NULL;
     ds4_session *session = NULL;
@@ -77,26 +77,25 @@ int main(int argc, char **argv) {
 
     int actual[6] = {-1, -1, -1, -1, -1, -1};
     int proposal_count = ds4_session_copy_dspark_proposals(session, actual, 6);
-    CHECK(proposal_count == 4);
+    CHECK(proposal_count == 6);
     int hits = 0;
-    for (int i = 0; i < proposal_count; i++) if (actual[i] == expected[i]) hits++;
-    printf("DeepSeek V4 DSpark resident proposals: ids=%d/%d\n",
-           hits, proposal_count);
+    for (int i = 0; i < 4; i++) if (actual[i] == expected[i]) hits++;
+    printf("DeepSeek V4 DSpark resident proposals: oracle_prefix=%d/4 draft=%d\n",
+           hits, proposal_count - 1);
     printf("  actual=%d,%d,%d,%d,%d,%d expected=%lld,%lld,%lld,%lld,%lld,%lld\n",
            actual[0], actual[1], actual[2], actual[3], actual[4], actual[5],
            (long long)expected[0], (long long)expected[1],
            (long long)expected[2], (long long)expected[3],
            (long long)expected[4], (long long)expected[5]);
-    for (int i = 0; i < proposal_count; i++) CHECK(actual[i] == expected[i]);
+    for (int i = 0; i < 4; i++) CHECK(actual[i] == expected[i]);
     for (int i = 0; i < proposal_count; i++)
         CHECK(actual[i] >= 0 && actual[i] < 129280);
-    for (int i = proposal_count; i < 6; i++) CHECK(actual[i] == -1);
     float confidence[5] = {NAN, NAN, NAN, NAN, NAN};
     int confidence_count = ds4_session_copy_dspark_confidence(
         session, confidence, 5);
     CHECK(confidence_count == proposal_count - 1);
     float confidence_max_abs = 0.0f;
-    for (int i = 0; i < confidence_count; i++) {
+    for (int i = 0; i < 3; i++) {
         CHECK(isfinite(confidence[i]));
         float error = fabsf(confidence[i] - expected_confidence[i]);
         if (error > confidence_max_abs) confidence_max_abs = error;
@@ -113,35 +112,35 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_sync(greedy, &prompt, error, sizeof(error)) == 0);
     CHECK(ds4_session_sync(speculative, &prompt, error, sizeof(error)) == 0);
 
-    int greedy_ids[6], spec_ids[6], spec_count = 0, max_round = 0;
+    int greedy_ids[8], spec_ids[8], spec_count = 0, max_round = 0;
     int eval_rounds = 0;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         greedy_ids[i] = ds4_session_argmax(greedy);
         CHECK(greedy_ids[i] >= 0);
         CHECK(ds4_session_eval(greedy, greedy_ids[i], error, sizeof(error)) == 0);
     }
-    while (spec_count < 6) {
+    while (spec_count < 8) {
         int first = ds4_session_argmax(speculative);
-        int round[6];
+        int round[8];
         int count = ds4_session_eval_speculative_argmax(
-            speculative, first, 6 - spec_count, -1,
-            round, 6, error, sizeof(error));
+            speculative, first, 8 - spec_count, -1,
+            round, 8, error, sizeof(error));
         CHECK(count > 0);
         eval_rounds++;
         if (count > max_round) max_round = count;
         for (int i = 0; i < count; i++) spec_ids[spec_count++] = round[i];
     }
     int stream_hits = 0;
-    for (int i = 0; i < 6; i++) if (spec_ids[i] == greedy_ids[i]) stream_hits++;
-    printf("DeepSeek V4 DSpark resident verify: greedy=%d/6 max_round=%d\n",
+    for (int i = 0; i < 8; i++) if (spec_ids[i] == greedy_ids[i]) stream_hits++;
+    printf("DeepSeek V4 DSpark resident verify: greedy=%d/8 max_round=%d\n",
            stream_hits, max_round);
-    CHECK(stream_hits == 6);
+    CHECK(stream_hits == 8);
     CHECK(max_round > 1);
 
     ds4_session_spec_stats spec_stats;
     CHECK(ds4_session_get_spec_stats(speculative, &spec_stats));
     CHECK(spec_stats.rounds > 0);
-    CHECK(spec_stats.proposed_tokens == 4);
+    CHECK(spec_stats.proposed_tokens >= 6);
     CHECK(spec_stats.proposed_tokens >= spec_stats.accepted_tokens);
     CHECK(spec_stats.accepted_tokens == (uint64_t)(spec_count - eval_rounds));
     CHECK(spec_stats.target_ms > 0.0);
