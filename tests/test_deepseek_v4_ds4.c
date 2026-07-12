@@ -21,6 +21,42 @@ static int touch_file(const char *path) {
 }
 
 int main(void) {
+    DeepSeekV4Ds4SpecConfig spec;
+    char spec_error[256] = {0};
+    unsetenv("DRAFT");
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
+    CHECK(deepseek_v4_ds4_spec_config_from_env(
+        &spec, spec_error, sizeof(spec_error)));
+    CHECK(spec.draft_tokens == 2);
+    CHECK(spec.margin == 3.0f);
+
+    CHECK(setenv("DRAFT", "4", 1) == 0);
+    CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN", "2.5", 1) == 0);
+    CHECK(deepseek_v4_ds4_spec_config_from_env(
+        &spec, spec_error, sizeof(spec_error)));
+    CHECK(spec.draft_tokens == 4);
+    CHECK(spec.margin == 2.5f);
+
+    const char *bad_drafts[] = {"1", "17", "4x"};
+    for (size_t i = 0; i < sizeof(bad_drafts) / sizeof(bad_drafts[0]); i++) {
+        CHECK(setenv("DRAFT", bad_drafts[i], 1) == 0);
+        spec_error[0] = 0;
+        CHECK(!deepseek_v4_ds4_spec_config_from_env(
+            &spec, spec_error, sizeof(spec_error)));
+        CHECK(strstr(spec_error, "DRAFT") != NULL);
+    }
+    CHECK(setenv("DRAFT", "2", 1) == 0);
+    const char *bad_margins[] = {"0", "-1", "nan", "2x"};
+    for (size_t i = 0; i < sizeof(bad_margins) / sizeof(bad_margins[0]); i++) {
+        CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN", bad_margins[i], 1) == 0);
+        spec_error[0] = 0;
+        CHECK(!deepseek_v4_ds4_spec_config_from_env(
+            &spec, spec_error, sizeof(spec_error)));
+        CHECK(strstr(spec_error, "MTP_MARGIN") != NULL);
+    }
+    unsetenv("DRAFT");
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
+
     char root[] = "/tmp/floyd-dsv4-ds4.XXXXXX";
     CHECK(mkdtemp(root) != NULL);
 

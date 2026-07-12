@@ -2660,7 +2660,8 @@ int main(int argc, char **argv){
             .model_dir = snap,
             .max_context = getenv("CTX") ? atoi(getenv("CTX")) : 512,
             .max_new_tokens = getenv("NGEN") ? atoi(getenv("NGEN")) : 16,
-            .use_spec = getenv("DSPARK_SPEC") && atoi(getenv("DSPARK_SPEC")) != 0,
+            .use_spec = (getenv("DSPARK_SPEC") && atoi(getenv("DSPARK_SPEC")) != 0) ||
+                        (getenv("DRAFT") && atoi(getenv("DRAFT")) > 1),
         };
         return deepseek_v4_chat_run(&options);
     }

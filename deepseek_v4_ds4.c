@@ -1,6 +1,8 @@
 #include "deepseek_v4_ds4.h"
 
+#include <errno.h>
 #include <glob.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +37,41 @@ static int ds4_incomplete(const char *path) {
 
 const char *deepseek_v4_ds4_backend_name(void) {
     return "metal-ds4";
+}
+
+int deepseek_v4_ds4_spec_config_from_env(
+    DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size) {
+    if (!config) return 0;
+    config->draft_tokens = 2;
+    config->margin = 3.0f;
+
+    const char *draft = getenv("DRAFT");
+    if (draft && *draft) {
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(draft, &end, 10);
+        if (errno || !end || *end || value < 2 || value > 16) {
+            if (error && error_size)
+                snprintf(error, error_size, "DRAFT must be an integer in 2..16");
+            return 0;
+        }
+        config->draft_tokens = (int)value;
+    }
+
+    const char *margin = getenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
+    if (margin && *margin) {
+        char *end = NULL;
+        errno = 0;
+        float value = strtof(margin, &end);
+        if (errno || !end || *end || !isfinite(value) || value <= 0.0f) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN must be finite and positive");
+            return 0;
+        }
+        config->margin = value;
+    }
+    return 1;
 }
 
 int deepseek_v4_ds4_find_model(const char *checkpoint_dir,
@@ -165,13 +202,19 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     DeepSeekV4Ds4Session *result = calloc(1, sizeof(*result));
     if (!result) return NULL;
     const char *mtp_path = use_spec ? getenv("FLOYD_DEEPSEEK_V4_DS4_MTP") : NULL;
+    DeepSeekV4Ds4SpecConfig spec = {.draft_tokens = 1, .margin = 3.0f};
+    if (mtp_path && *mtp_path &&
+        !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {
+        free(result);
+        return NULL;
+    }
     ds4_engine_options options = {
         .model_path = model_path,
         .mtp_path = mtp_path,
         .backend = DS4_BACKEND_METAL,
         .warm_weights = true,
-        .mtp_draft_tokens = mtp_path && *mtp_path ? 2 : 1,
-        .mtp_margin = 3.0f,
+        .mtp_draft_tokens = spec.draft_tokens,
+        .mtp_margin = spec.margin,
     };
     double started = ds4_now_ms();
     if (ds4_engine_open(&result->engine, &options) != 0 ||

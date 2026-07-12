@@ -18,6 +18,12 @@ printf '%s\n' "$output" | grep -q 'floyd chat \[DeepSeek V4\]'
 printf '%s\n' "$output" | grep -q 'DEEPSEEK_V4_BACKEND backend='
 printf '%s\n' "$output" | grep -q '›'
 
+draft_output=$(printf ':exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
+    ./floyd --model "$model" --ctx 64 --ngen 1 --draft 3 2>&1)
+printf '%s\n' "$draft_output"
+printf '%s\n' "$draft_output" |
+    grep -q 'DEEPSEEK_V4_SPEC disabled=mtp-not-prepared'
+
 for option in temp top-p system; do
     case "$option" in
         temp) value=0.7 ;;
