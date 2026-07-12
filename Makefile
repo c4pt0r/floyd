@@ -373,7 +373,8 @@ tests/test_deepseek_v4_dspark_support: tests/test_deepseek_v4_dspark_support.c $
 test-deepseek-v4-dspark-support: tests/test_deepseek_v4_dspark_support
 	@test -n "$(DS4_GGUF)" || (echo "set DS4_GGUF=/path/to/base.gguf"; exit 2)
 	@test -n "$(DSPARK_SUPPORT)" || (echo "set DSPARK_SUPPORT=/path/to/three-stage-dspark.gguf"; exit 2)
-	./tests/test_deepseek_v4_dspark_support "$(DS4_GGUF)" "$(DSPARK_SUPPORT)"
+	cd "$(DS4_DIR)" && "$(abspath $<)" "$(abspath $(DS4_GGUF))" \
+	  "$(abspath $(DSPARK_SUPPORT))"
 
 tests/test_deepseek_v4_dspark_metal: tests/test_deepseek_v4_dspark_metal.c st.h json.h compat.h $(DS4_CORE_OBJS)
 	$(CC) -O2 -I$(DS4_DIR) $< $(DS4_CORE_OBJS) -o $@ -lm -pthread \

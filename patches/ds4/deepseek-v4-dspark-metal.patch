@@ -1,5 +1,5 @@
 diff --git a/ds4.c b/ds4.c
-index a55d4c9..91680a0 100644
+index a55d4c9..99d4b8c 100644
 --- a/ds4.c
 +++ b/ds4.c
 @@ -3723,15 +3723,18 @@ static void dspark_block_validate_layout(const ds4_layer_weights *l) {
@@ -395,12 +395,142 @@ index a55d4c9..91680a0 100644
  /* =========================================================================
   * Imatrix Collection.
   * =========================================================================
+@@ -21961,6 +22177,7 @@ struct ds4_engine {
+     ds4_vocab vocab;
+     ds4_weights weights;
+     ds4_mtp_weights mtp_weights;
++    ds4_dspark_weights dspark_weights;
+     ds4_backend backend;
+     int mtp_draft_tokens;
+     float mtp_margin;
+@@ -21980,6 +22197,7 @@ struct ds4_engine {
+     ds4_distributed_options distributed;
+     bool metal_ready;
+     bool mtp_ready;
++    bool dspark_ready;
+ };
+ 
+ static bool cpu_directional_steering_enabled(
+@@ -24193,7 +24411,13 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
+ bool ds4_engine_has_mtp(ds4_engine *e) {
+     return e && e->backend != DS4_BACKEND_CPU &&
+            e->distributed.role == DS4_DISTRIBUTED_NONE &&
+-           e->mtp_ready;
++           (e->mtp_ready || e->dspark_ready);
++}
++
++bool ds4_engine_has_dspark(ds4_engine *e) {
++    return e && e->backend != DS4_BACKEND_CPU &&
++           e->distributed.role == DS4_DISTRIBUTED_NONE &&
++           e->dspark_ready;
+ }
+ 
+ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+@@ -25829,19 +26053,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+         *out = NULL;
+         return 1;
+     }
+-    if (opt->mtp_path && opt->mtp_path[0] &&
++    const bool wants_mtp = opt->mtp_path && opt->mtp_path[0];
++    const bool wants_dspark = opt->dspark_path && opt->dspark_path[0];
++    if (wants_mtp && wants_dspark) {
++        fprintf(stderr, "ds4: MTP and DSpark support models are mutually exclusive\n");
++        ds4_engine_close(e);
++        *out = NULL;
++        return 1;
++    }
++    if ((wants_mtp || wants_dspark) &&
+         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
++        const char *support_path = wants_dspark ? opt->dspark_path : opt->mtp_path;
+         if (e->ssd_streaming) {
+-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
++            fprintf(stderr, "ds4: --ssd-streaming is not compatible with speculative support yet\n");
+             ds4_engine_close(e);
+             *out = NULL;
+             return 1;
+         }
+-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+-        mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
+-        e->mtp_ready = true;
+-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
+-                opt->mtp_path,
++        model_open(&e->mtp_model, support_path, graph_backend, true);
++        if (wants_dspark) {
++            dspark_weights_bind(&e->dspark_weights, &e->mtp_model);
++            e->dspark_ready = true;
++        } else {
++            mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
++            e->mtp_ready = true;
++        }
++        fprintf(stderr, "ds4: %s support model loaded: %s (draft=%d)\n",
++                wants_dspark ? "DSpark" : "MTP",
++                support_path,
+                 e->mtp_draft_tokens);
+     }
+ 
+@@ -26052,7 +26291,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+             *out = NULL;
+             return 1;
+         }
+-        if (e->mtp_ready &&
++        if ((e->mtp_ready || e->dspark_ready) &&
+             !ds4_gpu_set_model_map_range(e->mtp_model.map,
+                                            e->mtp_model.size,
+                                            e->mtp_model.tensor_data_pos,
+@@ -26095,7 +26334,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+         free(load_sizes);
+         /* Also apply explicit optional Q8 preload settings to the MTP support
+          * model when loaded. */
+-        if (e->mtp_ready) {
++        if (e->mtp_ready || e->dspark_ready) {
+             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
+             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                  NULL, NULL, 0)) {
+@@ -26174,7 +26413,7 @@ void ds4_engine_close(ds4_engine *e) {
+     weights_free(&e->weights);
+     vocab_free(&e->vocab);
+     ds4_threads_shutdown();
+-    if (e->mtp_ready) model_close(&e->mtp_model);
++    if (e->mtp_ready || e->dspark_ready) model_close(&e->mtp_model);
+     model_close(&e->model);
+ #ifndef DS4_NO_GPU
+     ds4_gpu_cleanup();
+@@ -26222,7 +26461,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+         return 1;
+     }
+     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
+-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
++                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap,
++                                   e->mtp_ready || e->dspark_ready))
+     {
+         free(s);
+         return 1;
+@@ -26241,7 +26481,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+         return 1;
+     }
+     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+-    if (e->mtp_ready) {
++    if (e->mtp_ready || e->dspark_ready) {
+         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+         s->mtp_draft_token = -1;
+     }
 diff --git a/ds4.h b/ds4.h
-index 07ba0f0..82ab4aa 100644
+index 07ba0f0..2992ed1 100644
 --- a/ds4.h
 +++ b/ds4.h
-@@ -276,6 +276,10 @@ bool ds4_engine_has_output_head(ds4_engine *e);
+@@ -94,6 +94,7 @@ typedef struct {
+ typedef struct {
+     const char *model_path;
+     const char *mtp_path;
++    const char *dspark_path;
+     ds4_backend backend;
+     int n_threads;
+     uint32_t prefill_chunk;
+@@ -274,8 +275,13 @@ int ds4_session_prefill_cap(ds4_session *s);
+ int ds4_engine_routed_quant_bits(ds4_engine *e);
+ bool ds4_engine_has_output_head(ds4_engine *e);
  bool ds4_engine_has_mtp(ds4_engine *e);
++bool ds4_engine_has_dspark(ds4_engine *e);
  int ds4_engine_mtp_draft_tokens(ds4_engine *e);
  int ds4_dspark_support_validate(const char *path, int *stage_count);
 +int ds4_dspark_probe_stages(const char *base_path, const char *support_path,
