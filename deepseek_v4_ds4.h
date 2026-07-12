@@ -45,6 +45,7 @@ typedef struct {
 const char *deepseek_v4_ds4_backend_name(void);
 int deepseek_v4_ds4_spec_config_from_env(
     DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size);
+float deepseek_v4_ds4_default_confidence_threshold(const char *support_path);
 int deepseek_v4_ds4_find_model(const char *checkpoint_dir,
                                char *model_path, size_t model_path_size,
                                char *error, size_t error_size);

@@ -39,12 +39,17 @@ const char *deepseek_v4_ds4_backend_name(void) {
     return "metal-ds4";
 }
 
+float deepseek_v4_ds4_default_confidence_threshold(const char *support_path) {
+    return support_path && strstr(support_path, "-Q4K") ? 0.52f : 0.53f;
+}
+
 int deepseek_v4_ds4_spec_config_from_env(
     DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size) {
     if (!config) return 0;
     config->draft_tokens = 3;
     config->margin = 3.0f;
-    config->confidence_threshold = 0.53f;
+    config->confidence_threshold =
+        deepseek_v4_ds4_default_confidence_threshold(NULL);
 
     const char *draft = getenv("DRAFT");
     if (draft && *draft) {
@@ -183,9 +188,9 @@ int deepseek_v4_ds4_find_dspark_support(
     else snprintf(directory, sizeof(directory), ".");
 
     const char *patterns[] = {
+        "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-Q4K*.gguf",
         "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4-F16Attn.gguf",
         "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4.gguf",
-        "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-Q4K*.gguf",
     };
     int saw_incomplete = 0;
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
@@ -346,6 +351,13 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {
         free(result);
         return NULL;
+    }
+    const char *threshold_override =
+        getenv("FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD");
+    if (spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK &&
+        (!threshold_override || !*threshold_override)) {
+        spec.confidence_threshold =
+            deepseek_v4_ds4_default_confidence_threshold(dspark_path);
     }
     ds4_engine_options options = {
         .model_path = model_path,
