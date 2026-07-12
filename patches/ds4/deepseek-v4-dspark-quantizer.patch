@@ -1,0 +1,150 @@
+diff --git a/gguf-tools/deepseek4-quantize.c b/gguf-tools/deepseek4-quantize.c
+index 3955b43..802e854 100644
+--- a/gguf-tools/deepseek4-quantize.c
++++ b/gguf-tools/deepseek4-quantize.c
+@@ -874,6 +874,7 @@ typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
+ 
+ typedef struct {
+     bool is_expert;
++    bool is_mtp;
+     int layer;
+     expert_part part;
+ } expert_tensor;
+@@ -883,11 +884,18 @@ static expert_tensor parse_expert_tensor(const char *name) {
+     int layer = -1;
+     char kind[16];
+     int rest = 0;
+-    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+-        && rest == (int)strlen(name))
++    bool is_mtp = false;
++    int matched = sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest);
++    if (matched != 2 || rest != (int)strlen(name)) {
++        rest = 0;
++        matched = sscanf(name, "mtp.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest);
++        is_mtp = matched == 2 && rest == (int)strlen(name);
++    }
++    if (matched == 2 && rest == (int)strlen(name))
+     {
+         if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+             e.is_expert = true;
++            e.is_mtp = is_mtp;
+             e.layer = layer;
+             e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+         }
+@@ -959,18 +967,43 @@ static char *hf_name_for_regular(const char *gguf_name) {
+         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
+     }
+     int layer = -1;
++    bool is_mtp = false;
+     const char *p = gguf_name;
+     if (sscanf(p, "blk.%d.", &layer) != 1) {
++        if (sscanf(p, "mtp.%d.", &layer) == 1) is_mtp = true;
++        else {
+         fprintf(stderr, "error: cannot map GGUF tensor to HF tensor: %s\n", gguf_name);
+         exit(1);
++        }
+     }
+     const char *rest = strchr(p + 4, '.');
+     if (!rest) die("bad layer tensor name");
+     rest++;
++    if (is_mtp) {
++        static const name_map special[] = {
++            { "main_proj.weight", "main_proj.weight" },
++            { "main_norm.weight", "main_norm.weight" },
++            { "norm.weight", "norm.weight" },
++            { "hc_head_base.weight", "hc_head_base" },
++            { "hc_head_fn.weight", "hc_head_fn" },
++            { "hc_head_scale.weight", "hc_head_scale" },
++            { "markov_head.markov_w1.weight", "markov_head.markov_w1.weight" },
++            { "markov_head.markov_w2.weight", "markov_head.markov_w2.weight" },
++            { "confidence_head.proj.weight", "confidence_head.proj.weight" },
++        };
++        for (size_t i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
++            if (strcmp(rest, special[i].gguf) == 0) {
++                char buf[512];
++                snprintf(buf, sizeof(buf), "mtp.%d.%s", layer, special[i].hf);
++                return xstrdup(buf);
++            }
++        }
++    }
+     for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
+         if (strcmp(rest, layer_map[i].gguf) == 0) {
+             char buf[512];
+-            snprintf(buf, sizeof(buf), "layers.%d.%s", layer, layer_map[i].hf);
++            snprintf(buf, sizeof(buf), "%s.%d.%s", is_mtp ? "mtp" : "layers",
++                     layer, layer_map[i].hf);
+             return xstrdup(buf);
+         }
+     }
+@@ -1223,7 +1256,8 @@ typedef struct {
+ 
+ static void generate_one_expert(expert_job *j, int xid) {
+     char prefix[256];
+-    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
++    snprintf(prefix, sizeof(prefix), "%s.%d.ffn.experts.%d.%s",
++             j->expert.is_mtp ? "mtp" : "layers", j->expert.layer, xid, j->wid);
+     char weight_name[320];
+     char scale_name[320];
+     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
+@@ -1684,6 +1718,7 @@ typedef struct {
+     char *out_gguf;
+     char *compare_gguf;
+     char *compare_tensor;
++    char *map_tensor;
+     char *imatrix_file;
+     quant_policy policy;
+     int n_experts;
+@@ -1702,6 +1737,7 @@ static void usage(const char *argv0) {
+     printf("  --out FILE             output GGUF path\n");
+     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
+     printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
++    printf("  --map-tensor NAME      print the corresponding HF tensor and exit\n");
+     printf("  --overwrite            replace --out if it already exists\n");
+     printf("  --dry-run              print output plan without reading HF tensor data\n");
+     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
+@@ -1760,6 +1796,8 @@ static params parse_args(int argc, char **argv) {
+             p.compare_gguf = need_value(argc, argv, &i, arg);
+         } else if (strcmp(arg, "--compare-tensor") == 0) {
+             p.compare_tensor = need_value(argc, argv, &i, arg);
++        } else if (strcmp(arg, "--map-tensor") == 0) {
++            p.map_tensor = need_value(argc, argv, &i, arg);
+         } else if (strcmp(arg, "--overwrite") == 0) {
+             p.overwrite = true;
+         } else if (strcmp(arg, "--dry-run") == 0) {
+@@ -1807,7 +1845,8 @@ static params parse_args(int argc, char **argv) {
+     }
+     if (!p.hf_dir) die("--hf is required");
+     if (!p.template_gguf) die("--template is required");
+-    if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
++    if (!p.dry_run && !p.compare_tensor && !p.map_tensor && !p.out_gguf)
++        die("--out is required unless --dry-run, --compare-tensor, or --map-tensor is used");
+     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
+     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
+     return p;
+@@ -1870,6 +1909,26 @@ int main(int argc, char **argv) {
+     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
+ 
+     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
++    if (p.map_tensor) {
++        if (hmap_get(&tmpl.tensor_map, p.map_tensor) < 0) {
++            fprintf(stderr, "error: tensor not found in template: %s\n", p.map_tensor);
++            return 1;
++        }
++        expert_tensor e = parse_expert_tensor(p.map_tensor);
++        char *hf_name = NULL;
++        if (e.is_expert) {
++            char buf[512];
++            snprintf(buf, sizeof(buf), "%s.%d.ffn.experts.0.%s.weight",
++                     e.is_mtp ? "mtp" : "layers", e.layer, expert_part_name(e.part));
++            hf_name = xstrdup(buf);
++        } else {
++            hf_name = hf_name_for_regular(p.map_tensor);
++        }
++        printf("%s -> %s\n", p.map_tensor, hf_name);
++        free(hf_name);
++        free_gguf_file(&tmpl);
++        return 0;
++    }
+     if (p.n_experts <= 0) {
+         if (tmpl.n_experts > 0) {
+             p.n_experts = tmpl.n_experts;

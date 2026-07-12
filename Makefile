@@ -45,6 +45,7 @@ LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
 DS4_DIR ?= .deps/ds4
 DS4_REPO ?= https://github.com/antirez/ds4.git
 DS4_REV ?= 80ebbc396aee40eedc1d829222f3362d10fa4c6c
+DS4_PATCHES = patches/ds4/deepseek-v4-dspark-quantizer.patch
 DS4_REV_STAMP = $(DS4_DIR)/.floyd-revision-$(DS4_REV)
 DS4_CORE_OBJS = $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_distributed.o \
 	$(DS4_DIR)/ds4_ssd.o $(DS4_DIR)/ds4_metal.o
@@ -118,7 +119,7 @@ $(LLAMA_BUILD_DIR)/src/libllama.a: $(LLAMA_REV_STAMP)
 deepseek_v4_ggml.o: deepseek_v4_ggml.cpp deepseek_v4_ggml.h deepseek_v4_chat_format.h $(LLAMA_BUILD_DIR)/src/libllama.a
 	$(CXX) -O3 -std=c++17 -DFLOYD_DEEPSEEK_V4_GGML $(LLAMA_INCLUDES) -c $< -o $@
 
-$(DS4_REV_STAMP):
+$(DS4_REV_STAMP): $(DS4_PATCHES)
 	@test -f "$(DS4_DIR)/Makefile" || \
 		git clone --filter=blob:none "$(DS4_REPO)" "$(DS4_DIR)"
 	@current=$$(git -C "$(DS4_DIR)" rev-parse HEAD); \
@@ -126,6 +127,13 @@ $(DS4_REV_STAMP):
 			git -C "$(DS4_DIR)" fetch --depth 1 "$(DS4_REPO)" "$(DS4_REV)"; \
 			git -C "$(DS4_DIR)" checkout --detach "$(DS4_REV)"; \
 		fi
+	@for patch in $(DS4_PATCHES); do \
+		if git -C "$(DS4_DIR)" apply --reverse --check "$(CURDIR)/$$patch" 2>/dev/null; then \
+			:; \
+		else \
+			git -C "$(DS4_DIR)" apply "$(CURDIR)/$$patch"; \
+		fi; \
+	done
 	@touch "$@"
 
 $(DS4_CORE_OBJS): $(DS4_REV_STAMP)
@@ -343,7 +351,7 @@ test-deepseek-v4-dspark-manifest:
 	PYTHONPATH=.:.deps/llama.cpp/gguf-py DSPARK="$(DSPARK)" DSPARK_MTP="$(DSPARK_MTP)" \
 	  $(PYTHON) tests/test_deepseek_v4_dspark_manifest.py
 
-test-deepseek-v4-dspark-quantizer:
+test-deepseek-v4-dspark-quantizer: $(DS4_REV_STAMP)
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	@test -n "$(DSPARK_MTP)" || (echo "set DSPARK_MTP=/path/to/DeepSeek-V4-Flash-MTP.gguf"; exit 2)
 	PYTHON="$(PYTHON)" DS4_DIR="$(DS4_DIR)" DSPARK="$(DSPARK)" DSPARK_MTP="$(DSPARK_MTP)" \
