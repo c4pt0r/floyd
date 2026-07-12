@@ -20,6 +20,7 @@ tests/test_st_probe
 tests/test_deepseek_v4_quant
 tests/test_deepseek_v4_native_quant
 tests/test_deepseek_v4_native_quant_metal
+tests/test_deepseek_v4_mxfp4
 tests/test_deepseek_v4_model_manifest
 tests/test_deepseek_v4_forward
 tests/test_deepseek_v4_decode

@@ -1,5 +1,5 @@
 diff --git a/gguf-tools/deepseek4-quantize.c b/gguf-tools/deepseek4-quantize.c
-index 3955b43..39fe64e 100644
+index 3955b43..7abf6a0 100644
 --- a/gguf-tools/deepseek4-quantize.c
 +++ b/gguf-tools/deepseek4-quantize.c
 @@ -874,6 +874,7 @@ typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
@@ -91,7 +91,18 @@ index 3955b43..39fe64e 100644
              return xstrdup(buf);
          }
      }
-@@ -1152,6 +1193,7 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
+@@ -1075,7 +1116,9 @@ static ds4q_type parse_type(const char *raw) {
+ }
+
+ static bool is_quantizable_target(ds4q_type type) {
+-    return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 || ds4q_can_quantize(type);
++    return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 ||
++           type == DS4Q_TYPE_BF16 || type == DS4Q_TYPE_MXFP4 ||
++           ds4q_can_quantize(type);
+ }
+
+ /* =====
+@@ -1152,6 +1195,7 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
 
  static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
      int nd = tensor_n_dims(tmpl);
@@ -99,8 +110,8 @@ index 3955b43..39fe64e 100644
      if (info->n_dims != nd) {
          fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
          exit(1);
-@@ -1223,7 +1265,8 @@ typedef struct {
- 
+@@ -1223,7 +1267,8 @@ typedef struct {
+
  static void generate_one_expert(expert_job *j, int xid) {
      char prefix[256];
 -    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
@@ -109,22 +120,46 @@ index 3955b43..39fe64e 100644
      char weight_name[320];
      char scale_name[320];
      snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
-@@ -1233,8 +1276,13 @@ static void generate_one_expert(expert_job *j, int xid) {
+@@ -1231,15 +1276,32 @@ static void generate_one_expert(expert_job *j, int xid) {
+     st_value w = db_read(j->db, weight_name);
+     st_value s = db_read(j->db, scale_name);
      if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
-     int64_t n = 0;
-     float *f32 = dequant_fp4_weight(&w, &s, &n);
-+    char imatrix_proxy[256];
-     const char *names[3] = { j->gguf_name, weight_name, NULL };
+-    int64_t n = 0;
+-    float *f32 = dequant_fp4_weight(&w, &s, &n);
+-    const char *names[3] = { j->gguf_name, weight_name, NULL };
 -    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
-+    if (dspark_imatrix_proxy_name(j->gguf_name, imatrix_proxy, sizeof(imatrix_proxy))) {
-+        names[2] = imatrix_proxy;
+-    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
++    byte_buf q = {0};
++    if (j->target == DS4Q_TYPE_MXFP4) {
++        if (strcmp(w.dtype, "I8") != 0 || strcmp(s.dtype, "F8_E8M0") != 0 ||
++            s.n_dims != 2 || s.shape[0] != j->nrows || s.shape[1] != j->ncols / 32)
++            die("bad DeepSeek FP4 expert layout");
++        q.size = (size_t)j->nrows * ds4q_row_size(j->target, j->ncols);
++        q.data = xmalloc(q.size);
++        if (!ds4q_deepseek_fp4_to_mxfp4(q.data, w.data, s.data,
++                                         j->nrows, j->ncols))
++            die("DeepSeek FP4 to MXFP4 transcode failed");
++    } else {
++        int64_t n = 0;
++        float *f32 = dequant_fp4_weight(&w, &s, &n);
++        char imatrix_proxy[256];
++        const char *names[3] = { j->gguf_name, weight_name, NULL };
++        if (dspark_imatrix_proxy_name(j->gguf_name, imatrix_proxy, sizeof(imatrix_proxy))) {
++            names[2] = imatrix_proxy;
++        }
++        const float *imat = imatrix_find(j->imatrix, names, names[2] ? 3 : 2,
++                                         j->ncols, xid, j->n_experts);
++        q = f32_to_type(f32, n, j->target, j->ncols, imat);
++        free(f32);
 +    }
-+    const float *imat = imatrix_find(j->imatrix, names, names[2] ? 3 : 2,
-+                                     j->ncols, xid, j->n_experts);
-     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
      if (q.size != j->per_expert) die("expert quantized size mismatch");
      memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
-@@ -1684,6 +1732,8 @@ typedef struct {
+     free(q.data);
+-    free(f32);
+     st_value_free(&w);
+     st_value_free(&s);
+ }
+@@ -1684,6 +1746,8 @@ typedef struct {
      char *out_gguf;
      char *compare_gguf;
      char *compare_tensor;
@@ -133,7 +168,7 @@ index 3955b43..39fe64e 100644
      char *imatrix_file;
      quant_policy policy;
      int n_experts;
-@@ -1702,6 +1752,8 @@ static void usage(const char *argv0) {
+@@ -1702,6 +1766,8 @@ static void usage(const char *argv0) {
      printf("  --out FILE             output GGUF path\n");
      printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
      printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
@@ -142,7 +177,7 @@ index 3955b43..39fe64e 100644
      printf("  --overwrite            replace --out if it already exists\n");
      printf("  --dry-run              print output plan without reading HF tensor data\n");
      printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
-@@ -1760,6 +1812,10 @@ static params parse_args(int argc, char **argv) {
+@@ -1760,6 +1826,10 @@ static params parse_args(int argc, char **argv) {
              p.compare_gguf = need_value(argc, argv, &i, arg);
          } else if (strcmp(arg, "--compare-tensor") == 0) {
              p.compare_tensor = need_value(argc, argv, &i, arg);
@@ -153,7 +188,7 @@ index 3955b43..39fe64e 100644
          } else if (strcmp(arg, "--overwrite") == 0) {
              p.overwrite = true;
          } else if (strcmp(arg, "--dry-run") == 0) {
-@@ -1807,7 +1863,8 @@ static params parse_args(int argc, char **argv) {
+@@ -1807,7 +1877,8 @@ static params parse_args(int argc, char **argv) {
      }
      if (!p.hf_dir) die("--hf is required");
      if (!p.template_gguf) die("--template is required");
@@ -163,9 +198,9 @@ index 3955b43..39fe64e 100644
      if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
      if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
      return p;
-@@ -1870,6 +1927,40 @@ int main(int argc, char **argv) {
+@@ -1870,6 +1941,40 @@ int main(int argc, char **argv) {
      if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
- 
+
      gguf_file tmpl = load_gguf_metadata(p.template_gguf);
 +    if (p.map_imatrix) {
 +        if (hmap_get(&tmpl.tensor_map, p.map_imatrix) < 0) {
@@ -204,3 +239,53 @@ index 3955b43..39fe64e 100644
      if (p.n_experts <= 0) {
          if (tmpl.n_experts > 0) {
              p.n_experts = tmpl.n_experts;
+diff --git a/gguf-tools/quants.c b/gguf-tools/quants.c
+index 4e7ce5b..7f8e86e 100644
+--- a/gguf-tools/quants.c
++++ b/gguf-tools/quants.c
+@@ -23,6 +23,32 @@
+
+ static pthread_mutex_t ds4q_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
++bool ds4q_deepseek_fp4_to_mxfp4(uint8_t *dst, const uint8_t *packed,
++                                const uint8_t *scales, int64_t nrows,
++                                int64_t ncols) {
++    if (!dst || !packed || !scales || nrows <= 0 || ncols <= 0 || ncols % 32)
++        return false;
++    const int64_t blocks_per_row = ncols / 32;
++    for (int64_t row = 0; row < nrows; row++) {
++        const uint8_t *src_row = packed + row * (ncols / 2);
++        const uint8_t *scale_row = scales + row * blocks_per_row;
++        uint8_t *dst_row = dst + row * blocks_per_row * 17;
++        for (int64_t block = 0; block < blocks_per_row; block++) {
++            const uint8_t *src = src_row + block * 16;
++            uint8_t *out = dst_row + block * 17;
++            out[0] = scale_row[block];
++            for (int i = 0; i < 16; i++) {
++                uint8_t low_source = src[i / 2];
++                uint8_t high_source = src[8 + i / 2];
++                uint8_t low = (i & 1) ? low_source >> 4 : low_source & 15;
++                uint8_t high = (i & 1) ? high_source >> 4 : high_source & 15;
++                out[1 + i] = (uint8_t)(low | (high << 4));
++            }
++        }
++    }
++    return true;
++}
++
+ typedef struct {
+     const char *name;
+     int64_t block_size;
+diff --git a/gguf-tools/quants.h b/gguf-tools/quants.h
+index 554b775..e1a4983 100644
+--- a/gguf-tools/quants.h
++++ b/gguf-tools/quants.h
+@@ -71,5 +71,8 @@ float ds4q_f16_to_f32(uint16_t bits);
+ float ds4q_bf16_to_f32(uint16_t bits);
+ void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);
+ void ds4q_f32_to_bf16_row(const float *src, uint16_t *dst, int64_t n);
++bool ds4q_deepseek_fp4_to_mxfp4(uint8_t *dst, const uint8_t *packed,
++                                const uint8_t *scales, int64_t nrows,
++                                int64_t ncols);
+
+ #endif
