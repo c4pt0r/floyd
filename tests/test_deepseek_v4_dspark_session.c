@@ -22,6 +22,9 @@ int main(int argc, char **argv) {
     }
 
     const float confidence_cases[] = {2.0f, -1.0f, 3.0f};
+    CHECK(ds4_dspark_prefix1_capture_mask(20, 3) == 0);
+    CHECK(ds4_dspark_prefix1_capture_mask(33, 3) == 4);
+    CHECK(ds4_dspark_prefix1_capture_mask(125, 3) == (4 | 128));
     CHECK(ds4_dspark_confident_prefix_length(
               confidence_cases, 3, 0.0f) == 3);
     CHECK(ds4_dspark_confident_prefix_length(

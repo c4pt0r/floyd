@@ -34,6 +34,7 @@ typedef struct {
     int speculative_tokens;
     int speculative_proposed;
     int speculative_direct_accepted;
+    int speculative_prefix1_accepted;
     double speculative_target_ms;
     double speculative_proposal_ms;
     double speculative_verify_ms;

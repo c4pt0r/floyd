@@ -477,6 +477,9 @@ int deepseek_v4_ds4_generate_user(
             stats->speculative_direct_accepted =
                 (int)(spec_after.direct_accepted_tokens -
                       spec_before.direct_accepted_tokens);
+            stats->speculative_prefix1_accepted =
+                (int)(spec_after.prefix1_accepted_tokens -
+                      spec_before.prefix1_accepted_tokens);
             stats->speculative_target_ms =
                 spec_after.target_ms - spec_before.target_ms;
             stats->speculative_proposal_ms =
