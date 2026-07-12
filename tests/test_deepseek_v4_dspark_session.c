@@ -25,6 +25,10 @@ int main(int argc, char **argv) {
     CHECK(ds4_dspark_prefix1_capture_mask(20, 3) == 0);
     CHECK(ds4_dspark_prefix1_capture_mask(33, 3) == 4);
     CHECK(ds4_dspark_prefix1_capture_mask(125, 3) == (4 | 128));
+    CHECK(ds4_dspark_snapshot_required(20, 3) == 0);
+    CHECK(ds4_dspark_snapshot_required(33, 3) == 1);
+    CHECK(ds4_dspark_snapshot_required(125, 3) == 1);
+    CHECK(ds4_dspark_snapshot_required(125, 2) == 0);
     CHECK(ds4_dspark_confident_prefix_length(
               confidence_cases, 3, 0.0f) == 3);
     CHECK(ds4_dspark_confident_prefix_length(

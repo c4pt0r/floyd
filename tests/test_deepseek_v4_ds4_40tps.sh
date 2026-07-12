@@ -28,15 +28,18 @@ tps=$(printf '%s\n' "$perf" | sed -n 's/.* decode_tps=\([0-9.]*\).*/\1/p')
 replay=$(printf '%s\n' "$perf" | sed -n 's/.* replay_ms=\([0-9.]*\).*/\1/p')
 direct=$(printf '%s\n' "$perf" | sed -n 's/.* direct_accepted=\([0-9][0-9]*\).*/\1/p')
 prefix1=$(printf '%s\n' "$perf" | sed -n 's/.* prefix1_accepted=\([0-9][0-9]*\).*/\1/p')
+snapshots=$(printf '%s\n' "$perf" | sed -n 's/.* frontier_snapshots=\([0-9][0-9]*\).*/\1/p')
 printf '%s\n' "$perf"
-printf 'tokens=%s decode_tps=%s replay_ms=%s direct_accepted=%s prefix1_accepted=%s\n' \
-    "$count" "$tps" "$replay" "$direct" "$prefix1"
+printf 'tokens=%s decode_tps=%s replay_ms=%s direct_accepted=%s prefix1_accepted=%s snapshots=%s\n' \
+    "$count" "$tps" "$replay" "$direct" "$prefix1" "$snapshots"
 
 test "$count" -eq "$tokens"
 test -n "$direct"
 test "$direct" -gt 0
 test -n "$prefix1"
 test "$prefix1" -gt 0
+test -n "$snapshots"
+test "$snapshots" -le 2
 test "$replay" = "0.000"
 test "$(grep -c '^DEEPSEEK_V4_TOKEN ' "$greedy_trace")" -eq "$tokens"
 grep '^DEEPSEEK_V4_TOKEN ' "$trace" | sed 's/.* /token /' >"$spec_ids"
