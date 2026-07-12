@@ -22,6 +22,7 @@
 static float max_abs(const float *actual, const float *expected, size_t count) {
     float result = 0.0f;
     for (size_t i = 0; i < count; i++) {
+        if (!isfinite(actual[i]) || !isfinite(expected[i])) return INFINITY;
         float error = fabsf(actual[i] - expected[i]);
         if (error > result) result = error;
     }

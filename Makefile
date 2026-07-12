@@ -373,7 +373,8 @@ tests/test_deepseek_v4_dspark_metal: tests/test_deepseek_v4_dspark_metal.c st.h 
 test-deepseek-v4-dspark-metal: tests/test_deepseek_v4_dspark_metal
 	@test -n "$(DS4_GGUF)" || (echo "set DS4_GGUF=/path/to/base.gguf"; exit 2)
 	@test -n "$(DSPARK_SUPPORT)" || (echo "set DSPARK_SUPPORT=/path/to/three-stage-dspark.gguf"; exit 2)
-	./tests/test_deepseek_v4_dspark_metal "$(DS4_GGUF)" "$(DSPARK_SUPPORT)" fixture_dspark_dspark_decode
+	cd "$(DS4_DIR)" && "$(abspath $<)" "$(abspath $(DS4_GGUF))" \
+	  "$(abspath $(DSPARK_SUPPORT))" "$(abspath fixture_dspark_dspark_decode)"
 
 fixture_dspark_layer0/oracle.safetensors: tools/make_deepseek_v4_forward_oracle.py
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
