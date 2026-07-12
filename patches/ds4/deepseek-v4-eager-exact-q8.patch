@@ -1,0 +1,60 @@
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -28,6 +28,7 @@
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
+     uint64_t tiny_batch_exact_q8_calls;
++    uint64_t exact_q8_pipeline_warmups;
+     uint64_t fast_argmax_calls;
+ } ds4_gpu_kernel_stats;
+ 
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -347,6 +347,7 @@
+ static uint64_t g_tiny_batch_raw_store_calls;
+ static uint64_t g_tiny_batch_exact_attn_calls;
+ static uint64_t g_tiny_batch_exact_q8_calls;
++static uint64_t g_exact_q8_pipeline_warmups;
+ static uint64_t g_fast_argmax_calls;
+ 
+ void ds4_gpu_get_kernel_stats(ds4_gpu_kernel_stats *out) {
+@@ -361,6 +362,7 @@
+     out->tiny_batch_raw_store_calls = g_tiny_batch_raw_store_calls;
+     out->tiny_batch_exact_attn_calls = g_tiny_batch_exact_attn_calls;
+     out->tiny_batch_exact_q8_calls = g_tiny_batch_exact_q8_calls;
++    out->exact_q8_pipeline_warmups = g_exact_q8_pipeline_warmups;
+     out->fast_argmax_calls = g_fast_argmax_calls;
+ }
+ 
+@@ -6315,6 +6317,23 @@
+             g_queue = nil;
+             g_device = nil;
+             return 0;
++        }
++
++        static const char *exact_q8_pipeline_names[] = {
++            "kernel_mul_mv_q8_0_f32_exact_rows2",
++            "kernel_mul_mv_q8_0_f32_exact_rows3",
++            "kernel_mul_mv_q8_0_f32_exact_rows4",
++        };
++        g_exact_q8_pipeline_warmups = 0;
++        for (size_t i = 0;
++             i < sizeof(exact_q8_pipeline_names) / sizeof(exact_q8_pipeline_names[0]);
++             i++) {
++            if (!ds4_gpu_get_mul_mv_pipeline(exact_q8_pipeline_names[i], 4)) {
++                g_queue = nil;
++                g_device = nil;
++                return 0;
++            }
++            g_exact_q8_pipeline_warmups++;
+         }
+ 
+         g_initialized = 1;
+@@ -7008,6 +7027,7 @@
+         g_library = nil;
+         g_queue = nil;
+         g_device = nil;
++        g_exact_q8_pipeline_warmups = 0;
+         g_initialized = 0;
+     }
+ }

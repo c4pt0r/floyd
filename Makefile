@@ -51,7 +51,8 @@ DS4_PATCHES = patches/ds4/deepseek-v4-dspark-quantizer.patch \
 	patches/ds4/deepseek-v4-dspark-metal.patch \
 	patches/ds4/deepseek-v4-fast-argmax.patch \
 	patches/ds4/deepseek-v4-exact-tiny-q8.patch \
-	patches/ds4/deepseek-v4-prefix2-frontier.patch
+	patches/ds4/deepseek-v4-prefix2-frontier.patch \
+	patches/ds4/deepseek-v4-eager-exact-q8.patch
 DS4_REV_STAMP = $(DS4_DIR)/.floyd-revision-$(DS4_REV)
 DS4_CORE_OBJS = $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_distributed.o \
 	$(DS4_DIR)/ds4_ssd.o $(DS4_DIR)/ds4_metal.o
