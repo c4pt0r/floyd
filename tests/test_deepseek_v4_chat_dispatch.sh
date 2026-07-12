@@ -18,6 +18,7 @@ output=$(printf ':exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
 printf '%s\n' "$output"
 printf '%s\n' "$output" | grep -q 'floyd chat \[DeepSeek V4\]'
 printf '%s\n' "$output" | grep -q 'DEEPSEEK_V4_BACKEND backend='
+printf '%s\n' "$output" | grep -q 'DEEPSEEK_V4_SPEC backend=dspark draft=3'
 printf '%s\n' "$output" | grep -q '›'
 
 draft_output=$(printf ':exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
