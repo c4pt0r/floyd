@@ -142,9 +142,12 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_get_kernel_stats(speculative, &kernel_stats));
     CHECK(kernel_stats.tiny_batch_pair_swiglu_calls >= 43);
     CHECK(kernel_stats.tiny_batch_activation_fallback_calls == 0);
-    printf("DeepSeek V4 DSpark tiny batch fusion: calls=%llu fallback=%llu\n",
+    CHECK(kernel_stats.tiny_batch_shared_swiglu_calls >= 43);
+    printf("DeepSeek V4 DSpark tiny batch fusion: moe_calls=%llu "
+           "moe_fallback=%llu shared_calls=%llu\n",
            (unsigned long long)kernel_stats.tiny_batch_pair_swiglu_calls,
-           (unsigned long long)kernel_stats.tiny_batch_activation_fallback_calls);
+           (unsigned long long)kernel_stats.tiny_batch_activation_fallback_calls,
+           (unsigned long long)kernel_stats.tiny_batch_shared_swiglu_calls);
     printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
            "verify=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
            spec_stats.target_ms, spec_stats.proposal_ms,
