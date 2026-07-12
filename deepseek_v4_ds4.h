@@ -33,6 +33,9 @@ int deepseek_v4_ds4_spec_config_from_env(
 int deepseek_v4_ds4_find_model(const char *checkpoint_dir,
                                char *model_path, size_t model_path_size,
                                char *error, size_t error_size);
+int deepseek_v4_ds4_find_dspark_support(
+    const char *model_path, char *support_path, size_t support_path_size,
+    char *error, size_t error_size);
 DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     const char *model_path, int max_context, int use_spec,
     char *error, size_t error_size);

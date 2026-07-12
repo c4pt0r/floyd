@@ -42,7 +42,7 @@ const char *deepseek_v4_ds4_backend_name(void) {
 int deepseek_v4_ds4_spec_config_from_env(
     DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size) {
     if (!config) return 0;
-    config->draft_tokens = 2;
+    config->draft_tokens = 5;
     config->margin = 3.0f;
 
     const char *draft = getenv("DRAFT");
@@ -128,6 +128,78 @@ int deepseek_v4_ds4_find_model(const char *checkpoint_dir,
         else
             snprintf(error, error_size, "prepared DS4 GGUF not found under %s-DS4",
                      checkpoint_dir);
+    }
+    return 0;
+}
+
+int deepseek_v4_ds4_find_dspark_support(
+    const char *model_path, char *support_path, size_t support_path_size,
+    char *error, size_t error_size) {
+    if (!model_path || !support_path || !support_path_size) return 0;
+
+    const char *override = getenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK");
+    const char *override_name = "FLOYD_DEEPSEEK_V4_DS4_DSPARK";
+    if (!override || !*override) {
+        override = getenv("FLOYD_DEEPSEEK_V4_DS4_MTP");
+        override_name = "FLOYD_DEEPSEEK_V4_DS4_MTP";
+    }
+    if (override && *override) {
+        if (!ds4_regular_file(override)) {
+            if (error && error_size)
+                snprintf(error, error_size, "%s is not a file: %s",
+                         override_name, override);
+            return 0;
+        }
+        if (ds4_incomplete(override)) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "DSpark support GGUF download is incomplete: %s", override);
+            return 0;
+        }
+        return ds4_copy(support_path, support_path_size, override);
+    }
+
+    char directory[4096];
+    if (!ds4_copy(directory, sizeof(directory), model_path)) return 0;
+    char *slash = strrchr(directory, '/');
+    if (slash) *slash = 0;
+    else snprintf(directory, sizeof(directory), ".");
+
+    const char *patterns[] = {
+        "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4-F16Attn.gguf",
+        "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4.gguf",
+        "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-Q4K*.gguf",
+    };
+    int saw_incomplete = 0;
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        char pattern[4096];
+        int count = snprintf(pattern, sizeof(pattern), patterns[i], directory);
+        if (count < 0 || (size_t)count >= sizeof(pattern)) continue;
+        glob_t matches = {0};
+        int result = glob(pattern, 0, NULL, &matches);
+        if (result == 0) {
+            for (size_t j = 0; j < matches.gl_pathc; j++) {
+                const char *candidate = matches.gl_pathv[j];
+                if (strstr(candidate, "-template.gguf") ||
+                    !ds4_regular_file(candidate)) continue;
+                if (ds4_incomplete(candidate)) {
+                    saw_incomplete = 1;
+                    continue;
+                }
+                int copied = ds4_copy(support_path, support_path_size, candidate);
+                globfree(&matches);
+                return copied;
+            }
+        }
+        globfree(&matches);
+    }
+    if (error && error_size) {
+        if (saw_incomplete)
+            snprintf(error, error_size,
+                     "DSpark support GGUF download is incomplete under %s", directory);
+        else
+            snprintf(error, error_size,
+                     "three-stage DSpark support GGUF not found under %s", directory);
     }
     return 0;
 }
