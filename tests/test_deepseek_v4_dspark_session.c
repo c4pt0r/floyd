@@ -21,6 +21,16 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    const float confidence_cases[] = {2.0f, -1.0f, 3.0f};
+    CHECK(ds4_dspark_confident_prefix_length(
+              confidence_cases, 3, 0.0f) == 3);
+    CHECK(ds4_dspark_confident_prefix_length(
+              confidence_cases, 3, 0.5f) == 1);
+    CHECK(ds4_dspark_confident_prefix_length(
+              confidence_cases, 3, 0.9f) == 0);
+    CHECK(ds4_dspark_confident_prefix_length(
+              confidence_cases, 3, 0.2f) == 3);
+
     shards oracle;
     st_init(&oracle, argv[3]);
     int64_t first_id = -1, input_id = -1, expected[6];

@@ -355,6 +355,7 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         .warm_weights = true,
         .mtp_draft_tokens = spec.draft_tokens,
         .mtp_margin = spec.margin,
+        .dspark_confidence_threshold = spec.confidence_threshold,
     };
     double started = ds4_now_ms();
     if (ds4_engine_open(&result->engine, &options) != 0 ||
@@ -375,8 +376,9 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         } else {
             const char *backend = spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK
                 ? "dspark" : "mtp";
-            fprintf(stderr, "DEEPSEEK_V4_SPEC backend=%s draft=%d\n",
-                    backend, spec.draft_tokens);
+            fprintf(stderr,
+                    "DEEPSEEK_V4_SPEC backend=%s draft=%d confidence_threshold=%.3f\n",
+                    backend, spec.draft_tokens, spec.confidence_threshold);
         }
     }
     return result;
