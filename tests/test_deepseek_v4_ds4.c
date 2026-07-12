@@ -27,7 +27,7 @@ int main(void) {
     unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
     CHECK(deepseek_v4_ds4_spec_config_from_env(
         &spec, spec_error, sizeof(spec_error)));
-    CHECK(spec.draft_tokens == 2);
+    CHECK(spec.draft_tokens == 5);
     CHECK(spec.margin == 3.0f);
 
     CHECK(setenv("DRAFT", "4", 1) == 0);
@@ -61,12 +61,17 @@ int main(void) {
     CHECK(mkdtemp(root) != NULL);
 
     char checkpoint[1024], prepared[1024], model[2048], sidecar[2064];
+    char support[2048], support_sidecar[2064];
     snprintf(checkpoint, sizeof(checkpoint), "%s/checkpoint", root);
     snprintf(prepared, sizeof(prepared), "%s-DS4", checkpoint);
     snprintf(model, sizeof(model),
              "%s/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
              prepared);
     snprintf(sidecar, sizeof(sidecar), "%s.aria2", model);
+    snprintf(support, sizeof(support),
+             "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4-F16Attn.gguf",
+             prepared);
+    snprintf(support_sidecar, sizeof(support_sidecar), "%s.part", support);
     CHECK(mkdir(checkpoint, 0700) == 0);
     CHECK(mkdir(prepared, 0700) == 0);
     CHECK(touch_file(model));
@@ -82,6 +87,27 @@ int main(void) {
                                      error, sizeof(error)));
     CHECK(strcmp(found, model) == 0);
     CHECK(strcmp(deepseek_v4_ds4_backend_name(), "metal-ds4") == 0);
+
+    CHECK(touch_file(support));
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK");
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP");
+    CHECK(deepseek_v4_ds4_find_dspark_support(
+        model, found, sizeof(found), error, sizeof(error)));
+    CHECK(strcmp(found, support) == 0);
+    CHECK(touch_file(support_sidecar));
+    CHECK(!deepseek_v4_ds4_find_dspark_support(
+        model, found, sizeof(found), error, sizeof(error)));
+    CHECK(strstr(error, "incomplete") != NULL);
+    CHECK(unlink(support_sidecar) == 0);
+    CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK", support, 1) == 0);
+    CHECK(deepseek_v4_ds4_find_dspark_support(
+        model, found, sizeof(found), error, sizeof(error)));
+    CHECK(strcmp(found, support) == 0);
+    CHECK(unlink(support) == 0);
+    CHECK(!deepseek_v4_ds4_find_dspark_support(
+        model, found, sizeof(found), error, sizeof(error)));
+    CHECK(strstr(error, "FLOYD_DEEPSEEK_V4_DS4_DSPARK") != NULL);
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK");
 
     CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_GGUF", model, 1) == 0);
     CHECK(deepseek_v4_ds4_find_model(checkpoint, found, sizeof(found),
