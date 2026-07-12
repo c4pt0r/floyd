@@ -1,5 +1,5 @@
 diff --git a/ds4.c b/ds4.c
-index a55d4c9..15ec9ed 100644
+index a55d4c9..ce3795a 100644
 --- a/ds4.c
 +++ b/ds4.c
 @@ -3723,15 +3723,18 @@ static void dspark_block_validate_layout(const ds4_layer_weights *l) {
@@ -778,15 +778,16 @@ index a55d4c9..15ec9ed 100644
  };
 
  static bool cpu_directional_steering_enabled(
-@@ -23418,6 +23935,7 @@ struct ds4_session {
+@@ -23418,6 +23935,8 @@ struct ds4_session {
      float *logits;
      float *mtp_logits;
      int mtp_draft_token;
 +    int dspark_proposals[6];
++    ds4_session_spec_stats spec_stats;
      uint64_t mtp_probe_total;
      uint64_t mtp_probe_hit;
      ds4_session_progress_fn progress;
-@@ -23430,6 +23948,7 @@ struct ds4_session {
+@@ -23430,6 +23949,7 @@ struct ds4_session {
      int ctx_size;
      bool checkpoint_valid;
      bool mtp_draft_valid;
@@ -794,7 +795,7 @@ index a55d4c9..15ec9ed 100644
  };
 
  /* =========================================================================
-@@ -24193,7 +24712,13 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
+@@ -24193,7 +24713,13 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
  bool ds4_engine_has_mtp(ds4_engine *e) {
      return e && e->backend != DS4_BACKEND_CPU &&
             e->distributed.role == DS4_DISTRIBUTED_NONE &&
@@ -809,7 +810,7 @@ index a55d4c9..15ec9ed 100644
  }
 
  int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-@@ -25829,19 +26354,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+@@ -25829,19 +26355,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          *out = NULL;
          return 1;
      }
@@ -851,7 +852,7 @@ index a55d4c9..15ec9ed 100644
                  e->mtp_draft_tokens);
      }
 
-@@ -26052,7 +26592,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+@@ -26052,7 +26593,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
              *out = NULL;
              return 1;
          }
@@ -860,7 +861,7 @@ index a55d4c9..15ec9ed 100644
              !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                             e->mtp_model.size,
                                             e->mtp_model.tensor_data_pos,
-@@ -26095,7 +26635,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+@@ -26095,7 +26636,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          free(load_sizes);
          /* Also apply explicit optional Q8 preload settings to the MTP support
           * model when loaded. */
@@ -869,7 +870,7 @@ index a55d4c9..15ec9ed 100644
              (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
              if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                   NULL, NULL, 0)) {
-@@ -26174,7 +26714,7 @@ void ds4_engine_close(ds4_engine *e) {
+@@ -26174,7 +26715,7 @@ void ds4_engine_close(ds4_engine *e) {
      weights_free(&e->weights);
      vocab_free(&e->vocab);
      ds4_threads_shutdown();
@@ -878,7 +879,7 @@ index a55d4c9..15ec9ed 100644
      model_close(&e->model);
  #ifndef DS4_NO_GPU
      ds4_gpu_cleanup();
-@@ -26222,11 +26762,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -26222,11 +26763,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          return 1;
      }
      if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
@@ -900,7 +901,7 @@ index a55d4c9..15ec9ed 100644
      s->graph.quality = e->quality;
      s->graph.ssd_streaming = e->ssd_streaming;
      s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
-@@ -26241,7 +26790,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -26241,7 +26791,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          return 1;
      }
      s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -909,7 +910,7 @@ index a55d4c9..15ec9ed 100644
          s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
          s->mtp_draft_token = -1;
      }
-@@ -27255,6 +27804,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -27255,6 +27805,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
      return 1;
  #else
      ds4_engine *e = s->engine;
@@ -917,12 +918,13 @@ index a55d4c9..15ec9ed 100644
      const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
      const bool mtp_should_draft =
          probe_mtp && e->mtp_ready && s->mtp_logits &&
-@@ -27299,6 +27849,22 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -27299,6 +27850,24 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
              fprintf(stderr, "ds4: mtp probe draft failed\n");
          }
      }
 +    if (probe_mtp && e->dspark_ready) {
 +        const int input_token = sample_argmax(s->logits, DS4_N_VOCAB);
++        const double proposal_started = now_sec();
 +        if (input_token >= 0 && metal_graph_eval_dspark_proposals(
 +                &s->graph,
 +                &e->model,
@@ -936,11 +938,12 @@ index a55d4c9..15ec9ed 100644
 +            snprintf(err, errlen, "DSpark proposal failed");
 +            return 1;
 +        }
++        s->spec_stats.proposal_ms += (now_sec() - proposal_started) * 1000.0;
 +    }
      return 0;
  #endif
  }
-@@ -27307,6 +27873,124 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+@@ -27307,6 +27876,138 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
      return ds4_session_eval_internal(s, token, true, err, errlen);
  }
 
@@ -948,6 +951,12 @@ index a55d4c9..15ec9ed 100644
 +    if (!s || !out || cap < 6 || !s->dspark_proposals_valid) return 0;
 +    memcpy(out, s->dspark_proposals, sizeof(s->dspark_proposals));
 +    return 6;
++}
++
++int ds4_session_get_spec_stats(const ds4_session *s, ds4_session_spec_stats *out) {
++    if (!s || !out) return 0;
++    *out = s->spec_stats;
++    return 1;
 +}
 +
 +#ifndef DS4_NO_GPU
@@ -979,6 +988,8 @@ index a55d4c9..15ec9ed 100644
 +        s->dspark_proposals_valid = false;
 +        return n_accept;
 +    }
++    s->spec_stats.rounds++;
++    s->spec_stats.proposed_tokens += (uint64_t)draft_n;
 +
 +    ds4_spec_frontier frontier;
 +    memset(&frontier, 0, sizeof(frontier));
@@ -989,6 +1000,7 @@ index a55d4c9..15ec9ed 100644
 +    if (ok) {
 +        for (int i = 0; i < draft_n; i++)
 +            token_vec_push(&s->checkpoint, s->dspark_proposals[i]);
++        const double verify_started = now_sec();
 +        ok = metal_graph_verify_suffix_tops(&s->graph,
 +                                             &s->engine->model,
 +                                             &s->engine->weights,
@@ -998,6 +1010,7 @@ index a55d4c9..15ec9ed 100644
 +                                             false,
 +                                             row_tops,
 +                                             NULL);
++        s->spec_stats.verify_ms += (now_sec() - verify_started) * 1000.0;
 +    }
 +
 +    int commit = ok ? 1 : 0;
@@ -1020,6 +1033,7 @@ index a55d4c9..15ec9ed 100644
 +                   (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
 +            for (int i = 0; i < draft_n; i++)
 +                accepted[n_accept++] = s->dspark_proposals[i];
++            s->spec_stats.accepted_tokens += (uint64_t)draft_n;
 +            s->checkpoint_valid = true;
 +            s->dspark_proposals_valid = false;
 +            spec_frontier_free(&frontier);
@@ -1030,6 +1044,7 @@ index a55d4c9..15ec9ed 100644
 +
 +    s->checkpoint.len = start;
 +    if (!spec_frontier_restore(&frontier, s)) ok = false;
++    const double replay_started = now_sec();
 +    if (ok && commit > 0) {
 +        for (int i = 0; ok && i < commit; i++) {
 +            ok = metal_graph_eval_token_raw_swa(
@@ -1050,6 +1065,8 @@ index a55d4c9..15ec9ed 100644
 +            s->checkpoint_valid = true;
 +        }
 +    }
++    s->spec_stats.replay_ms += (now_sec() - replay_started) * 1000.0;
++    if (ok) s->spec_stats.accepted_tokens += (uint64_t)commit;
 +    s->dspark_proposals_valid = false;
 +    spec_frontier_free(&frontier);
 +    free(last_logits);
@@ -1065,7 +1082,18 @@ index a55d4c9..15ec9ed 100644
  /* Speculative decode state machine:
   * 1. commit the normal target token and use its logits to validate draft[0];
   * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
-@@ -27354,6 +28038,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+@@ -27349,11 +28050,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+      * several proposed positions together; running ordinary decode once per
+      * draft token is correctness-safe but cannot be faster than baseline.
+      */
++    const double target_started = now_sec();
++    const double proposal_before = s->spec_stats.proposal_ms;
+     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
++    const double proposal_delta = s->spec_stats.proposal_ms - proposal_before;
++    double target_ms = (now_sec() - target_started) * 1000.0 - proposal_delta;
++    if (target_ms < 0.0) target_ms = 0.0;
++    s->spec_stats.target_ms += target_ms;
+     int n_accept = 0;
      accepted[n_accept++] = first_token;
      if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
@@ -1078,7 +1106,7 @@ index a55d4c9..15ec9ed 100644
      if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
      int draft_cap = e->mtp_draft_tokens;
-@@ -27919,6 +28609,7 @@ void ds4_session_invalidate(ds4_session *s) {
+@@ -27919,6 +28632,7 @@ void ds4_session_invalidate(ds4_session *s) {
      s->checkpoint_valid = false;
      s->checkpoint.len = 0;
      s->mtp_draft_valid = false;
@@ -1086,7 +1114,7 @@ index a55d4c9..15ec9ed 100644
  }
 
  void ds4_session_rewind(ds4_session *s, int pos) {
-@@ -27926,6 +28617,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
+@@ -27926,6 +28640,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      if (pos > s->checkpoint.len) pos = s->checkpoint.len;
      s->checkpoint.len = pos;
      s->mtp_draft_valid = false;
@@ -1095,10 +1123,27 @@ index a55d4c9..15ec9ed 100644
 
  int ds4_session_pos(ds4_session *s) {
 diff --git a/ds4.h b/ds4.h
-index 07ba0f0..7f4ca70 100644
+index 07ba0f0..01fac0d 100644
 --- a/ds4.h
 +++ b/ds4.h
-@@ -94,6 +94,7 @@ typedef struct {
+@@ -52,6 +52,16 @@ typedef struct {
+     float logprob;
+ } ds4_token_score;
+
++typedef struct {
++    uint64_t rounds;
++    uint64_t proposed_tokens;
++    uint64_t accepted_tokens;
++    double target_ms;
++    double proposal_ms;
++    double verify_ms;
++    double replay_ms;
++} ds4_session_spec_stats;
++
+ #define DS4_DEFAULT_TEMPERATURE 1.0f
+ #define DS4_DEFAULT_TOP_P 1.0f
+ #define DS4_DEFAULT_MIN_P 0.05f
+@@ -94,6 +104,7 @@ typedef struct {
  typedef struct {
      const char *model_path;
      const char *mtp_path;
@@ -1106,15 +1151,16 @@ index 07ba0f0..7f4ca70 100644
      ds4_backend backend;
      int n_threads;
      uint32_t prefill_chunk;
-@@ -266,6 +267,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+@@ -266,6 +277,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                          int max_tokens, int eos_token,
                                          int *accepted, int accepted_cap,
                                          char *err, size_t errlen);
 +int ds4_session_copy_dspark_proposals(ds4_session *s, int *out, int cap);
++int ds4_session_get_spec_stats(const ds4_session *s, ds4_session_spec_stats *out);
  void ds4_session_invalidate(ds4_session *s);
  void ds4_session_rewind(ds4_session *s, int pos);
  int ds4_session_pos(ds4_session *s);
-@@ -274,8 +276,13 @@ int ds4_session_prefill_cap(ds4_session *s);
+@@ -274,8 +287,13 @@ int ds4_session_prefill_cap(ds4_session *s);
  int ds4_engine_routed_quant_bits(ds4_engine *e);
  bool ds4_engine_has_output_head(ds4_engine *e);
  bool ds4_engine_has_mtp(ds4_engine *e);

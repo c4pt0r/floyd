@@ -31,6 +31,11 @@ typedef struct {
     int generated_tokens;
     int speculative_rounds;
     int speculative_tokens;
+    int speculative_proposed;
+    double speculative_target_ms;
+    double speculative_proposal_ms;
+    double speculative_verify_ms;
+    double speculative_replay_ms;
 } DeepSeekV4Ds4Stats;
 
 const char *deepseek_v4_ds4_backend_name(void);

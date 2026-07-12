@@ -388,6 +388,8 @@ int deepseek_v4_ds4_generate_user(
     int common = ds4_session_common_prefix(session->session, &session->transcript);
     int cached = common == old_pos && session->transcript.len >= old_pos ? common : 0;
     int suffix = session->transcript.len - cached;
+    ds4_session_spec_stats spec_before = {0}, spec_after = {0};
+    (void)ds4_session_get_spec_stats(session->session, &spec_before);
     double prompt_started = ds4_now_ms();
     if (ds4_session_sync(session->session, &session->transcript,
                          error, error_size) != 0) {
@@ -446,6 +448,18 @@ int deepseek_v4_ds4_generate_user(
         stats->generated_tokens = generated;
         stats->speculative_rounds = spec_rounds;
         stats->speculative_tokens = spec_tokens;
+        if (ds4_session_get_spec_stats(session->session, &spec_after)) {
+            stats->speculative_proposed =
+                (int)(spec_after.proposed_tokens - spec_before.proposed_tokens);
+            stats->speculative_target_ms =
+                spec_after.target_ms - spec_before.target_ms;
+            stats->speculative_proposal_ms =
+                spec_after.proposal_ms - spec_before.proposal_ms;
+            stats->speculative_verify_ms =
+                spec_after.verify_ms - spec_before.verify_ms;
+            stats->speculative_replay_ms =
+                spec_after.replay_ms - spec_before.replay_ms;
+        }
     }
     return generated;
 }
