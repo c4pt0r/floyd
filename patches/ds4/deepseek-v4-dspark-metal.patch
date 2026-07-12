@@ -4212,7 +4212,7 @@ index 7e8cbd8..345ba79 100644
              device const int32_t *src = hash + row * 6u;
              for (uint i = 0; i < 6; i++) {
 diff --git a/metal/moe.metal b/metal/moe.metal
-index d47fab2..f3fafb7 100644
+index d47fab2..e6ab32c 100644
 --- a/metal/moe.metal
 +++ b/metal/moe.metal
 @@ -1,9 +1,16 @@
@@ -4336,3 +4336,16 @@ index d47fab2..f3fafb7 100644
 
  // DS4 attention output low projection, specialized for the fixed block
  // diagonal mapping used by the model:
+@@ -1148,8 +1238,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
+                 g = min(g, c);
+                 u = clamp(u, -c, c);
+             }
+-            dst_gate_f32[out_row] = gate;
+-            dst_up_f32[out_row] = up;
++            if (act.write_clamped != 0) {
++                dst_gate_f32[out_row] = gate;
++                dst_up_f32[out_row] = up;
++            }
+             const float silu = g / (1.0f + exp(-g));
+             dst_mid_f32[out_row] = silu * u * route_weight;
+         }
