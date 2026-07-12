@@ -87,8 +87,18 @@ int main(int argc, char **argv) {
     int id_hits = 0;
     for (int i = 0; i < 6; i++) if (output_ids[i] == expected_ids[i]) id_hits++;
     printf("DeepSeek V4 DSpark Metal proposals: ids=%d/6\n", id_hits);
-    CHECK(rmses[0] < 1.5f && rmses[1] < 4.0f && rmses[2] < 7.0f);
-    CHECK(cosines[0] > 0.94f && cosines[1] > 0.79f && cosines[2] > 0.70f);
+    printf("  actual=%d,%d,%d,%d,%d,%d expected=%lld,%lld,%lld,%lld,%lld,%lld\n",
+           output_ids[0], output_ids[1], output_ids[2], output_ids[3],
+           output_ids[4], output_ids[5],
+           (long long)expected_ids[0], (long long)expected_ids[1],
+           (long long)expected_ids[2], (long long)expected_ids[3],
+           (long long)expected_ids[4], (long long)expected_ids[5]);
+    CHECK(rmses[0] < 0.02f);
+    CHECK(rmses[1] < 4.0f);
+    CHECK(rmses[2] < 7.0f);
+    CHECK(cosines[0] > 0.999f);
+    CHECK(cosines[1] > 0.79f);
+    CHECK(cosines[2] > 0.70f);
     CHECK(id_hits == 6);
     free(expected);
     free(actual);
