@@ -132,7 +132,9 @@ $(DS4_CORE_OBJS): $(DS4_REV_STAMP)
 	$(MAKE) -C "$(DS4_DIR)" ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 
 deepseek_v4_ds4.o: deepseek_v4_ds4.c deepseek_v4_ds4.h $(DS4_CORE_OBJS)
-	$(CC) -O3 -std=c99 -DFLOYD_DEEPSEEK_V4_DS4 -I$(DS4_DIR) -c $< -o $@
+	$(CC) -O3 -std=c99 -DFLOYD_DEEPSEEK_V4_DS4 \
+		-DFLOYD_DS4_SOURCE_DIR=\"$(abspath $(DS4_DIR))\" \
+		-I$(DS4_DIR) -c $< -o $@
 
 backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 	clang -O2 -fobjc-arc -c backend_metal.m -o $@

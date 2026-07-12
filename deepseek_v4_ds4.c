@@ -112,10 +112,56 @@ static double ds4_now_ms(void) {
     return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
 }
 
+static int ds4_configure_metal_sources(char *error, size_t error_size) {
+#ifdef FLOYD_DS4_SOURCE_DIR
+    static const struct {
+        const char *environment;
+        const char *file;
+    } sources[] = {
+        {"DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"},
+        {"DS4_METAL_DENSE_SOURCE", "dense.metal"},
+        {"DS4_METAL_MOE_SOURCE", "moe.metal"},
+        {"DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"},
+        {"DS4_METAL_UNARY_SOURCE", "unary.metal"},
+        {"DS4_METAL_DSV4_KV_SOURCE", "dsv4_kv.metal"},
+        {"DS4_METAL_DSV4_ROPE_SOURCE", "dsv4_rope.metal"},
+        {"DS4_METAL_DSV4_MISC_SOURCE", "dsv4_misc.metal"},
+        {"DS4_METAL_ARGSORT_SOURCE", "argsort.metal"},
+        {"DS4_METAL_CPY_SOURCE", "cpy.metal"},
+        {"DS4_METAL_CONCAT_SOURCE", "concat.metal"},
+        {"DS4_METAL_GET_ROWS_SOURCE", "get_rows.metal"},
+        {"DS4_METAL_SUM_ROWS_SOURCE", "sum_rows.metal"},
+        {"DS4_METAL_SOFTMAX_SOURCE", "softmax.metal"},
+        {"DS4_METAL_REPEAT_SOURCE", "repeat.metal"},
+        {"DS4_METAL_GLU_SOURCE", "glu.metal"},
+        {"DS4_METAL_NORM_SOURCE", "norm.metal"},
+        {"DS4_METAL_BIN_SOURCE", "bin.metal"},
+        {"DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"},
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        if (getenv(sources[i].environment)) continue;
+        char path[4096];
+        int count = snprintf(path, sizeof(path), "%s/metal/%s",
+                             FLOYD_DS4_SOURCE_DIR, sources[i].file);
+        if (count < 0 || (size_t)count >= sizeof(path) ||
+            setenv(sources[i].environment, path, 0) != 0) {
+            if (error && error_size)
+                snprintf(error, error_size, "failed to configure DS4 Metal sources");
+            return 0;
+        }
+    }
+#else
+    (void)error;
+    (void)error_size;
+#endif
+    return 1;
+}
+
 DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     const char *model_path, int max_context, int use_spec,
     char *error, size_t error_size) {
     if (!model_path || max_context <= 0) return NULL;
+    if (!ds4_configure_metal_sources(error, error_size)) return NULL;
     DeepSeekV4Ds4Session *result = calloc(1, sizeof(*result));
     if (!result) return NULL;
     const char *mtp_path = use_spec ? getenv("FLOYD_DEEPSEEK_V4_DS4_MTP") : NULL;
@@ -123,6 +169,7 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         .model_path = model_path,
         .mtp_path = mtp_path,
         .backend = DS4_BACKEND_METAL,
+        .warm_weights = true,
         .mtp_draft_tokens = mtp_path && *mtp_path ? 2 : 1,
         .mtp_margin = 3.0f,
     };
