@@ -1,5 +1,5 @@
 diff --git a/ds4.c b/ds4.c
-index a55d4c9..ce3795a 100644
+index a55d4c9..5a3bdf2 100644
 --- a/ds4.c
 +++ b/ds4.c
 @@ -3723,15 +3723,18 @@ static void dspark_block_validate_layout(const ds4_layer_weights *l) {
@@ -407,7 +407,7 @@ index a55d4c9..ce3795a 100644
      return ok;
  }
 
-@@ -20209,6 +20397,322 @@ static bool metal_graph_eval_mtp_draft(
+@@ -20209,6 +20397,329 @@ static bool metal_graph_eval_mtp_draft(
                                                top_id);
  }
 
@@ -466,19 +466,26 @@ index a55d4c9..ce3795a 100644
 +        const ds4_model *support_model,
 +        const ds4_dspark_weights *dspark,
 +        int input_token,
++        int proposal_count,
 +        int output_ids[6]) {
-+    enum { DSPARK_DRAFT = 5, DSPARK_NOISE = 128799 };
++    enum { DSPARK_MAX_STAGE_TOKENS = 5, DSPARK_NOISE = 128799 };
 +    if (!g || !g->dspark_enabled || !support_model || !dspark ||
-+        !output_ids || g->dspark_position == 0) return false;
++        !output_ids || proposal_count < 2 || proposal_count > 6 ||
++        g->dspark_position == 0) return false;
++    const int stage_tokens = proposal_count - 1;
 +
-+    int draft_ids[DSPARK_DRAFT] = {
++    int draft_ids[DSPARK_MAX_STAGE_TOKENS] = {
 +        input_token, DSPARK_NOISE, DSPARK_NOISE, DSPARK_NOISE, DSPARK_NOISE,
 +    };
-+    token_vec draft = {.v = draft_ids, .len = DSPARK_DRAFT, .cap = DSPARK_DRAFT};
++    token_vec draft = {
++        .v = draft_ids,
++        .len = stage_tokens,
++        .cap = DSPARK_MAX_STAGE_TOKENS,
++    };
 +    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens,
 +                                                &draft,
 +                                                0,
-+                                                DSPARK_DRAFT);
++                                                (uint32_t)stage_tokens);
 +    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(
 +            g->batch_cur_hc,
 +            g->prefill_tokens,
@@ -486,7 +493,7 @@ index a55d4c9..ce3795a 100644
 +            base_weights,
 +            &draft,
 +            0,
-+            DSPARK_DRAFT);
++            (uint32_t)stage_tokens);
 +
 +    ds4_gpu_tensor *saved_cache = g->layer_raw_cache[0];
 +    const uint32_t saved_raw_cap = g->raw_cap;
@@ -506,19 +513,19 @@ index a55d4c9..ce3795a 100644
 +                                             &dspark->stage[stage],
 +                                             0,
 +                                             g->dspark_position,
-+                                             DSPARK_DRAFT);
++                                             (uint32_t)stage_tokens);
 +    }
 +    if (ok) ok = metal_graph_encode_dspark_head_batch(g,
 +                                                       base_model,
 +                                                       base_weights,
 +                                                       support_model,
 +                                                       dspark,
-+                                                       DSPARK_DRAFT);
++                                                       (uint32_t)stage_tokens);
 +    if (ok) ok = ds4_gpu_end_commands() != 0;
 +    else (void)ds4_gpu_synchronize();
 +
 +    output_ids[0] = input_token;
-+    for (int position = 0; ok && position < DSPARK_DRAFT; position++) {
++    for (int position = 0; ok && position < stage_tokens; position++) {
 +        ds4_gpu_tensor *row_logits = ds4_gpu_tensor_view(
 +                g->spec_logits,
 +                (uint64_t)position * DS4_N_VOCAB * sizeof(float),
@@ -730,7 +737,7 @@ index a55d4c9..ce3795a 100644
  /* =========================================================================
   * Imatrix Collection.
   * =========================================================================
-@@ -20422,6 +20926,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
+@@ -20422,6 +20933,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
      memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
      memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
      g->mtp_n_raw = 0;
@@ -738,7 +745,7 @@ index a55d4c9..ce3795a 100644
      for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
          const uint32_t ratio = ds4_layer_compress_ratio(il);
          if (ratio == 0) continue;
-@@ -20536,6 +21041,8 @@ static bool metal_graph_prefill_layer_major(
+@@ -20536,6 +21048,8 @@ static bool metal_graph_prefill_layer_major(
              display_progress(display_progress_ud, "prefill_display",
                               (int)(start + n_tokens), prompt->len);
 
@@ -747,7 +754,7 @@ index a55d4c9..ce3795a 100644
          const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
          uint32_t output_row = (uint32_t)n_tokens - 1u;
          const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
-@@ -20968,6 +21475,14 @@ static bool metal_graph_prefill_layer_major(
+@@ -20968,6 +21482,14 @@ static bool metal_graph_prefill_layer_major(
          return false;
      }
 
@@ -762,7 +769,7 @@ index a55d4c9..ce3795a 100644
      const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
      uint32_t output_row = (uint32_t)n_tokens - 1u;
      const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
-@@ -21961,6 +22476,7 @@ struct ds4_engine {
+@@ -21961,6 +22483,7 @@ struct ds4_engine {
      ds4_vocab vocab;
      ds4_weights weights;
      ds4_mtp_weights mtp_weights;
@@ -770,7 +777,7 @@ index a55d4c9..ce3795a 100644
      ds4_backend backend;
      int mtp_draft_tokens;
      float mtp_margin;
-@@ -21980,6 +22496,7 @@ struct ds4_engine {
+@@ -21980,6 +22503,7 @@ struct ds4_engine {
      ds4_distributed_options distributed;
      bool metal_ready;
      bool mtp_ready;
@@ -778,16 +785,17 @@ index a55d4c9..ce3795a 100644
  };
 
  static bool cpu_directional_steering_enabled(
-@@ -23418,6 +23935,8 @@ struct ds4_session {
+@@ -23418,6 +23942,9 @@ struct ds4_session {
      float *logits;
      float *mtp_logits;
      int mtp_draft_token;
 +    int dspark_proposals[6];
++    int dspark_proposal_count;
 +    ds4_session_spec_stats spec_stats;
      uint64_t mtp_probe_total;
      uint64_t mtp_probe_hit;
      ds4_session_progress_fn progress;
-@@ -23430,6 +23949,7 @@ struct ds4_session {
+@@ -23430,6 +23957,7 @@ struct ds4_session {
      int ctx_size;
      bool checkpoint_valid;
      bool mtp_draft_valid;
@@ -795,7 +803,7 @@ index a55d4c9..ce3795a 100644
  };
 
  /* =========================================================================
-@@ -24193,7 +24713,13 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
+@@ -24193,7 +24721,13 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
  bool ds4_engine_has_mtp(ds4_engine *e) {
      return e && e->backend != DS4_BACKEND_CPU &&
             e->distributed.role == DS4_DISTRIBUTED_NONE &&
@@ -810,7 +818,7 @@ index a55d4c9..ce3795a 100644
  }
 
  int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-@@ -25829,19 +26355,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+@@ -25829,19 +26363,34 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          *out = NULL;
          return 1;
      }
@@ -852,7 +860,7 @@ index a55d4c9..ce3795a 100644
                  e->mtp_draft_tokens);
      }
 
-@@ -26052,7 +26593,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+@@ -26052,7 +26601,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
              *out = NULL;
              return 1;
          }
@@ -861,7 +869,7 @@ index a55d4c9..ce3795a 100644
              !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                             e->mtp_model.size,
                                             e->mtp_model.tensor_data_pos,
-@@ -26095,7 +26636,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+@@ -26095,7 +26644,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          free(load_sizes);
          /* Also apply explicit optional Q8 preload settings to the MTP support
           * model when loaded. */
@@ -870,7 +878,7 @@ index a55d4c9..ce3795a 100644
              (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
              if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                   NULL, NULL, 0)) {
-@@ -26174,7 +26715,7 @@ void ds4_engine_close(ds4_engine *e) {
+@@ -26174,7 +26723,7 @@ void ds4_engine_close(ds4_engine *e) {
      weights_free(&e->weights);
      vocab_free(&e->vocab);
      ds4_threads_shutdown();
@@ -879,7 +887,7 @@ index a55d4c9..ce3795a 100644
      model_close(&e->model);
  #ifndef DS4_NO_GPU
      ds4_gpu_cleanup();
-@@ -26222,11 +26763,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -26222,11 +26771,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          return 1;
      }
      if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
@@ -901,7 +909,7 @@ index a55d4c9..ce3795a 100644
      s->graph.quality = e->quality;
      s->graph.ssd_streaming = e->ssd_streaming;
      s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
-@@ -26241,7 +26791,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -26241,7 +26799,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          return 1;
      }
      s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -910,7 +918,7 @@ index a55d4c9..ce3795a 100644
          s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
          s->mtp_draft_token = -1;
      }
-@@ -27255,6 +27805,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -27255,6 +27813,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
      return 1;
  #else
      ds4_engine *e = s->engine;
@@ -918,12 +926,14 @@ index a55d4c9..ce3795a 100644
      const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
      const bool mtp_should_draft =
          probe_mtp && e->mtp_ready && s->mtp_logits &&
-@@ -27299,6 +27850,24 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+@@ -27299,6 +27858,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
              fprintf(stderr, "ds4: mtp probe draft failed\n");
          }
      }
 +    if (probe_mtp && e->dspark_ready) {
 +        const int input_token = sample_argmax(s->logits, DS4_N_VOCAB);
++        int proposal_count = e->mtp_draft_tokens;
++        if (proposal_count > 6) proposal_count = 6;
 +        const double proposal_started = now_sec();
 +        if (input_token >= 0 && metal_graph_eval_dspark_proposals(
 +                &s->graph,
@@ -932,7 +942,9 @@ index a55d4c9..ce3795a 100644
 +                &e->mtp_model,
 +                &e->dspark_weights,
 +                input_token,
++                proposal_count,
 +                s->dspark_proposals)) {
++            s->dspark_proposal_count = proposal_count;
 +            s->dspark_proposals_valid = true;
 +        } else {
 +            snprintf(err, errlen, "DSpark proposal failed");
@@ -943,14 +955,16 @@ index a55d4c9..ce3795a 100644
      return 0;
  #endif
  }
-@@ -27307,6 +27876,138 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+@@ -27307,6 +27888,143 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
      return ds4_session_eval_internal(s, token, true, err, errlen);
  }
 
 +int ds4_session_copy_dspark_proposals(ds4_session *s, int *out, int cap) {
-+    if (!s || !out || cap < 6 || !s->dspark_proposals_valid) return 0;
-+    memcpy(out, s->dspark_proposals, sizeof(s->dspark_proposals));
-+    return 6;
++    if (!s || !out || !s->dspark_proposals_valid ||
++        cap < s->dspark_proposal_count) return 0;
++    memcpy(out, s->dspark_proposals,
++           (size_t)s->dspark_proposal_count * sizeof(s->dspark_proposals[0]));
++    return s->dspark_proposal_count;
 +}
 +
 +int ds4_session_get_spec_stats(const ds4_session *s, ds4_session_spec_stats *out) {
@@ -972,7 +986,10 @@ index a55d4c9..ce3795a 100644
 +    if (!s->dspark_proposals_valid || max_tokens <= n_accept ||
 +        accepted_cap <= n_accept) return n_accept;
 +
-+    int draft_n = 6;
++    int draft_n = s->engine->mtp_draft_tokens;
++    if (draft_n > 6) draft_n = 6;
++    if (draft_n > s->dspark_proposal_count)
++        draft_n = s->dspark_proposal_count;
 +    if (draft_n > max_tokens - n_accept) draft_n = max_tokens - n_accept;
 +    if (draft_n > accepted_cap - n_accept) draft_n = accepted_cap - n_accept;
 +    int room = s->ctx_size - s->checkpoint.len;
@@ -1082,7 +1099,7 @@ index a55d4c9..ce3795a 100644
  /* Speculative decode state machine:
   * 1. commit the normal target token and use its logits to validate draft[0];
   * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
-@@ -27349,11 +28050,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+@@ -27349,11 +28067,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
       * several proposed positions together; running ordinary decode once per
       * draft token is correctness-safe but cannot be faster than baseline.
       */
@@ -1106,7 +1123,7 @@ index a55d4c9..ce3795a 100644
      if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
      int draft_cap = e->mtp_draft_tokens;
-@@ -27919,6 +28632,7 @@ void ds4_session_invalidate(ds4_session *s) {
+@@ -27919,6 +28649,7 @@ void ds4_session_invalidate(ds4_session *s) {
      s->checkpoint_valid = false;
      s->checkpoint.len = 0;
      s->mtp_draft_valid = false;
@@ -1114,7 +1131,7 @@ index a55d4c9..ce3795a 100644
  }
 
  void ds4_session_rewind(ds4_session *s, int pos) {
-@@ -27926,6 +28640,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
+@@ -27926,6 +28657,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      if (pos > s->checkpoint.len) pos = s->checkpoint.len;
      s->checkpoint.len = pos;
      s->mtp_draft_valid = false;
