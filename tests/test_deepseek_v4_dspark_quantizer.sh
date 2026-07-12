@@ -21,6 +21,11 @@ map_tensor() {
         --map-tensor "$1"
 }
 
+map_imatrix() {
+    "$QUANTIZER" --hf "$DSPARK" --template "$TMP/template.gguf" \
+        --map-imatrix "$1"
+}
+
 test "$(map_tensor mtp.0.main_norm.weight)" = \
     "mtp.0.main_norm.weight -> mtp.0.main_norm.weight"
 test "$(map_tensor mtp.1.attn_q_a.weight)" = \
@@ -29,6 +34,13 @@ test "$(map_tensor mtp.2.ffn_down_exps.weight)" = \
     "mtp.2.ffn_down_exps.weight -> mtp.2.ffn.experts.0.w2.weight"
 test "$(map_tensor mtp.2.markov_head.markov_w2.weight)" = \
     "mtp.2.markov_head.markov_w2.weight -> mtp.2.markov_head.markov_w2.weight"
+
+test "$(map_imatrix mtp.0.ffn_gate_exps.weight)" = \
+    "mtp.0.ffn_gate_exps.weight -> blk.40.ffn_gate_exps.weight"
+test "$(map_imatrix mtp.1.ffn_up_exps.weight)" = \
+    "mtp.1.ffn_up_exps.weight -> blk.41.ffn_up_exps.weight"
+test "$(map_imatrix mtp.2.ffn_down_exps.weight)" = \
+    "mtp.2.ffn_down_exps.weight -> blk.42.ffn_down_exps.weight"
 
 confidence_probe=$(
     "$QUANTIZER" --hf "$DSPARK" --template "$TMP/template.gguf" \

@@ -1,9 +1,9 @@
 diff --git a/gguf-tools/deepseek4-quantize.c b/gguf-tools/deepseek4-quantize.c
-index 3955b43..802e854 100644
+index 3955b43..39fe64e 100644
 --- a/gguf-tools/deepseek4-quantize.c
 +++ b/gguf-tools/deepseek4-quantize.c
 @@ -874,6 +874,7 @@ typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
- 
+
  typedef struct {
      bool is_expert;
 +    bool is_mtp;
@@ -31,7 +31,22 @@ index 3955b43..802e854 100644
              e.layer = layer;
              e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
          }
-@@ -959,18 +967,43 @@ static char *hf_name_for_regular(const char *gguf_name) {
+@@ -905,6 +913,14 @@ static const char *expert_part_name(expert_part p) {
+     return "";
+ }
+
++static bool dspark_imatrix_proxy_name(const char *gguf_name, char *out, size_t out_size) {
++    expert_tensor e = parse_expert_tensor(gguf_name);
++    if (!e.is_expert || !e.is_mtp || e.layer < 0 || e.layer > 2) return false;
++    const char *kind = e.part == EXP_W1 ? "gate" : e.part == EXP_W2 ? "down" : "up";
++    snprintf(out, out_size, "blk.%d.ffn_%s_exps.weight", 40 + e.layer, kind);
++    return true;
++}
++
+ typedef struct {
+     const char *gguf;
+     const char *hf;
+@@ -959,18 +975,43 @@ static char *hf_name_for_regular(const char *gguf_name) {
          if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
      }
      int layer = -1;
@@ -76,15 +91,15 @@ index 3955b43..802e854 100644
              return xstrdup(buf);
          }
      }
-@@ -1153,6 +1186,7 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, cons
+@@ -1152,6 +1193,7 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
+
  static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
      int nd = tensor_n_dims(tmpl);
 +    if (info->n_dims == tmpl->n_dims) nd = tmpl->n_dims;
      if (info->n_dims != nd) {
          fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
          exit(1);
-     }
-@@ -1223,7 +1256,8 @@ typedef struct {
+@@ -1223,7 +1265,8 @@ typedef struct {
  
  static void generate_one_expert(expert_job *j, int xid) {
      char prefix[256];
@@ -94,45 +109,78 @@ index 3955b43..802e854 100644
      char weight_name[320];
      char scale_name[320];
      snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
-@@ -1684,6 +1718,7 @@ typedef struct {
+@@ -1233,8 +1276,13 @@ static void generate_one_expert(expert_job *j, int xid) {
+     if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
+     int64_t n = 0;
+     float *f32 = dequant_fp4_weight(&w, &s, &n);
++    char imatrix_proxy[256];
+     const char *names[3] = { j->gguf_name, weight_name, NULL };
+-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
++    if (dspark_imatrix_proxy_name(j->gguf_name, imatrix_proxy, sizeof(imatrix_proxy))) {
++        names[2] = imatrix_proxy;
++    }
++    const float *imat = imatrix_find(j->imatrix, names, names[2] ? 3 : 2,
++                                     j->ncols, xid, j->n_experts);
+     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
+     if (q.size != j->per_expert) die("expert quantized size mismatch");
+     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
+@@ -1684,6 +1732,8 @@ typedef struct {
      char *out_gguf;
      char *compare_gguf;
      char *compare_tensor;
 +    char *map_tensor;
++    char *map_imatrix;
      char *imatrix_file;
      quant_policy policy;
      int n_experts;
-@@ -1702,6 +1737,7 @@ static void usage(const char *argv0) {
+@@ -1702,6 +1752,8 @@ static void usage(const char *argv0) {
      printf("  --out FILE             output GGUF path\n");
      printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
      printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
 +    printf("  --map-tensor NAME      print the corresponding HF tensor and exit\n");
++    printf("  --map-imatrix NAME     print the DSpark imatrix proxy tensor and exit\n");
      printf("  --overwrite            replace --out if it already exists\n");
      printf("  --dry-run              print output plan without reading HF tensor data\n");
      printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
-@@ -1760,6 +1796,8 @@ static params parse_args(int argc, char **argv) {
+@@ -1760,6 +1812,10 @@ static params parse_args(int argc, char **argv) {
              p.compare_gguf = need_value(argc, argv, &i, arg);
          } else if (strcmp(arg, "--compare-tensor") == 0) {
              p.compare_tensor = need_value(argc, argv, &i, arg);
 +        } else if (strcmp(arg, "--map-tensor") == 0) {
 +            p.map_tensor = need_value(argc, argv, &i, arg);
++        } else if (strcmp(arg, "--map-imatrix") == 0) {
++            p.map_imatrix = need_value(argc, argv, &i, arg);
          } else if (strcmp(arg, "--overwrite") == 0) {
              p.overwrite = true;
          } else if (strcmp(arg, "--dry-run") == 0) {
-@@ -1807,7 +1845,8 @@ static params parse_args(int argc, char **argv) {
+@@ -1807,7 +1863,8 @@ static params parse_args(int argc, char **argv) {
      }
      if (!p.hf_dir) die("--hf is required");
      if (!p.template_gguf) die("--template is required");
 -    if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
-+    if (!p.dry_run && !p.compare_tensor && !p.map_tensor && !p.out_gguf)
-+        die("--out is required unless --dry-run, --compare-tensor, or --map-tensor is used");
++    if (!p.dry_run && !p.compare_tensor && !p.map_tensor && !p.map_imatrix && !p.out_gguf)
++        die("--out is required unless --dry-run, --compare-tensor, --map-tensor, or --map-imatrix is used");
      if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
      if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
      return p;
-@@ -1870,6 +1909,26 @@ int main(int argc, char **argv) {
+@@ -1870,6 +1927,40 @@ int main(int argc, char **argv) {
      if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
  
      gguf_file tmpl = load_gguf_metadata(p.template_gguf);
++    if (p.map_imatrix) {
++        if (hmap_get(&tmpl.tensor_map, p.map_imatrix) < 0) {
++            fprintf(stderr, "error: tensor not found in template: %s\n", p.map_imatrix);
++            return 1;
++        }
++        char proxy[256];
++        if (!dspark_imatrix_proxy_name(p.map_imatrix, proxy, sizeof(proxy))) {
++            fprintf(stderr, "error: no DSpark imatrix proxy for tensor: %s\n", p.map_imatrix);
++            return 1;
++        }
++        printf("%s -> %s\n", p.map_imatrix, proxy);
++        free_gguf_file(&tmpl);
++        return 0;
++    }
 +    if (p.map_tensor) {
 +        if (hmap_get(&tmpl.tensor_map, p.map_tensor) < 0) {
 +            fprintf(stderr, "error: tensor not found in template: %s\n", p.map_tensor);
