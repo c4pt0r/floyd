@@ -92,6 +92,16 @@ def _q8_nbytes(shape: tuple[int, ...]) -> int:
     return rows * (columns // 32) * 34
 
 
+def _mxfp4_nbytes(shape: tuple[int, ...]) -> int:
+    columns = shape[-1]
+    if columns % 32:
+        raise ValueError(f"MXFP4 columns must be divisible by 32: {shape}")
+    rows = 1
+    for dim in shape[:-1]:
+        rows *= dim
+    return rows * (columns // 32) * 17
+
+
 def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
     from gguf import GGMLQuantizationType, GGUFReader
 
@@ -114,6 +124,11 @@ def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
         shape = tuple(reversed(tuple(int(dim) for dim in tensor.shape)))
         quant_type = GGMLQuantizationType(tensor.tensor_type).name
         nbytes = int(tensor.n_bytes)
+        if suffix in {
+            "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+        }:
+            quant_type = "MXFP4"
+            nbytes = _mxfp4_nbytes(shape)
         if suffix in {"hc_attn_fn.weight", "hc_ffn_fn.weight", "hc_head_fn.weight"}:
             quant_type = "F16"
             nbytes = 2

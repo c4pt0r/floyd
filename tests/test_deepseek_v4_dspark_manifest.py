@@ -41,6 +41,9 @@ def test_three_stage_template_reuses_ds4_quant_layout():
                  for stage in range(3)) == (26, 24, 31)
     assert by_name["mtp.0.main_proj.weight"].shape == (4096, 12288)
     assert by_name["mtp.0.main_proj.weight"].quant_type == "Q8_0"
+    assert by_name["mtp.0.ffn_gate_exps.weight"].quant_type == "MXFP4"
+    assert by_name["mtp.1.ffn_up_exps.weight"].quant_type == "MXFP4"
+    assert by_name["mtp.2.ffn_down_exps.weight"].quant_type == "MXFP4"
     assert by_name["mtp.0.hc_attn_fn.weight"].quant_type == "F16"
     assert by_name["mtp.1.hc_ffn_fn.weight"].quant_type == "F16"
     assert by_name["mtp.2.hc_head_fn.weight"].quant_type == "F16"
