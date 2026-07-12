@@ -114,7 +114,7 @@ def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
         shape = tuple(reversed(tuple(int(dim) for dim in tensor.shape)))
         quant_type = GGMLQuantizationType(tensor.tensor_type).name
         nbytes = int(tensor.n_bytes)
-        if suffix in {"hc_attn_fn.weight", "hc_ffn_fn.weight"}:
+        if suffix in {"hc_attn_fn.weight", "hc_ffn_fn.weight", "hc_head_fn.weight"}:
             quant_type = "F16"
             nbytes = 2
             for dim in shape:
@@ -145,7 +145,7 @@ def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
             markov_shape = (129280, 256)
             specs.extend((
                 TensorSpec("mtp.2.markov_head.markov_w1.weight", markov_shape,
-                           "Q8_0", _q8_nbytes(markov_shape)),
+                           "F16", 2 * markov_shape[0] * markov_shape[1]),
                 TensorSpec("mtp.2.markov_head.markov_w2.weight", markov_shape,
                            "Q8_0", _q8_nbytes(markov_shape)),
                 TensorSpec("mtp.2.confidence_head.proj.weight", (1, 4352),
