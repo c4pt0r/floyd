@@ -57,9 +57,47 @@ int main(int argc, char **argv) {
     int hits = 0;
     for (int i = 0; i < 6; i++) if (actual[i] == expected[i]) hits++;
     printf("DeepSeek V4 DSpark resident proposals: ids=%d/6\n", hits);
-    CHECK(hits == 6);
+    printf("  actual=%d,%d,%d,%d,%d,%d expected=%lld,%lld,%lld,%lld,%lld,%lld\n",
+           actual[0], actual[1], actual[2], actual[3], actual[4], actual[5],
+           (long long)expected[0], (long long)expected[1],
+           (long long)expected[2], (long long)expected[3],
+           (long long)expected[4], (long long)expected[5]);
+    for (int i = 0; i < 4; i++) CHECK(actual[i] == expected[i]);
+    for (int i = 0; i < 6; i++) CHECK(actual[i] >= 0 && actual[i] < 129280);
 
     ds4_session_free(session);
+    session = NULL;
+    ds4_session *greedy = NULL, *speculative = NULL;
+    CHECK(ds4_session_create(&greedy, engine, 64) == 0);
+    CHECK(ds4_session_create(&speculative, engine, 64) == 0);
+    CHECK(ds4_session_sync(greedy, &prompt, error, sizeof(error)) == 0);
+    CHECK(ds4_session_sync(speculative, &prompt, error, sizeof(error)) == 0);
+
+    int greedy_ids[6], spec_ids[6], spec_count = 0, max_round = 0;
+    for (int i = 0; i < 6; i++) {
+        greedy_ids[i] = ds4_session_argmax(greedy);
+        CHECK(greedy_ids[i] >= 0);
+        CHECK(ds4_session_eval(greedy, greedy_ids[i], error, sizeof(error)) == 0);
+    }
+    while (spec_count < 6) {
+        int first = ds4_session_argmax(speculative);
+        int round[6];
+        int count = ds4_session_eval_speculative_argmax(
+            speculative, first, 6 - spec_count, -1,
+            round, 6, error, sizeof(error));
+        CHECK(count > 0);
+        if (count > max_round) max_round = count;
+        for (int i = 0; i < count; i++) spec_ids[spec_count++] = round[i];
+    }
+    int stream_hits = 0;
+    for (int i = 0; i < 6; i++) if (spec_ids[i] == greedy_ids[i]) stream_hits++;
+    printf("DeepSeek V4 DSpark resident verify: greedy=%d/6 max_round=%d\n",
+           stream_hits, max_round);
+    CHECK(stream_hits == 6);
+    CHECK(max_round > 1);
+
+    ds4_session_free(speculative);
+    ds4_session_free(greedy);
     ds4_engine_close(engine);
     CHECK(unlink(lock_path) == 0);
     unsetenv("DS4_LOCK_FILE");
