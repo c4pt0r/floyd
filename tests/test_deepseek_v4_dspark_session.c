@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -23,9 +24,11 @@ int main(int argc, char **argv) {
     shards oracle;
     st_init(&oracle, argv[3]);
     int64_t first_id = -1, input_id = -1, expected[6];
+    float expected_confidence[5];
     st_read_raw(&oracle, "base.first_id", &first_id, 0);
     st_read_raw(&oracle, "base.input_id", &input_id, 0);
     st_read_raw(&oracle, "dspark.output_ids", expected, 0);
+    st_read_raw(&oracle, "dspark.confidence", expected_confidence, 0);
 
     char lock_path[] = "/tmp/floyd-dspark-session.XXXXXX";
     int lock_fd = mkstemp(lock_path);
@@ -68,6 +71,19 @@ int main(int argc, char **argv) {
     for (int i = 0; i < proposal_count; i++)
         CHECK(actual[i] >= 0 && actual[i] < 129280);
     for (int i = proposal_count; i < 6; i++) CHECK(actual[i] == -1);
+    float confidence[5] = {NAN, NAN, NAN, NAN, NAN};
+    int confidence_count = ds4_session_copy_dspark_confidence(
+        session, confidence, 5);
+    CHECK(confidence_count == proposal_count - 1);
+    float confidence_max_abs = 0.0f;
+    for (int i = 0; i < confidence_count; i++) {
+        CHECK(isfinite(confidence[i]));
+        float error = fabsf(confidence[i] - expected_confidence[i]);
+        if (error > confidence_max_abs) confidence_max_abs = error;
+    }
+    printf("DeepSeek V4 DSpark resident confidence: max_abs=%.9g\n",
+           confidence_max_abs);
+    CHECK(confidence_max_abs < 0.5f);
 
     ds4_session_free(session);
     session = NULL;
