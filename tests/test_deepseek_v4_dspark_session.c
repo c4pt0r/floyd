@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
         .model_path = argv[1],
         .dspark_path = argv[2],
         .backend = DS4_BACKEND_METAL,
-        .mtp_draft_tokens = 5,
+        .mtp_draft_tokens = 4,
     };
     ds4_engine *engine = NULL;
     ds4_session *session = NULL;
@@ -101,11 +101,13 @@ int main(int argc, char **argv) {
     ds4_session_spec_stats spec_stats;
     CHECK(ds4_session_get_spec_stats(speculative, &spec_stats));
     CHECK(spec_stats.rounds > 0);
+    CHECK(spec_stats.proposed_tokens == 4);
     CHECK(spec_stats.proposed_tokens >= spec_stats.accepted_tokens);
     CHECK(spec_stats.accepted_tokens == (uint64_t)(spec_count - eval_rounds));
     CHECK(spec_stats.target_ms > 0.0);
     CHECK(spec_stats.proposal_ms > 0.0);
     CHECK(spec_stats.verify_ms > 0.0);
+    CHECK(spec_stats.replay_ms == 0.0);
     printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
            "verify=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
            spec_stats.target_ms, spec_stats.proposal_ms,
