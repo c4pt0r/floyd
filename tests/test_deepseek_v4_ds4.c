@@ -25,17 +25,21 @@ int main(void) {
     char spec_error[256] = {0};
     unsetenv("DRAFT");
     unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD");
     CHECK(deepseek_v4_ds4_spec_config_from_env(
         &spec, spec_error, sizeof(spec_error)));
     CHECK(spec.draft_tokens == 3);
     CHECK(spec.margin == 3.0f);
+    CHECK(spec.confidence_threshold == 0.0f);
 
     CHECK(setenv("DRAFT", "4", 1) == 0);
     CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN", "2.5", 1) == 0);
+    CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD", "0.625", 1) == 0);
     CHECK(deepseek_v4_ds4_spec_config_from_env(
         &spec, spec_error, sizeof(spec_error)));
     CHECK(spec.draft_tokens == 4);
     CHECK(spec.margin == 2.5f);
+    CHECK(spec.confidence_threshold == 0.625f);
 
     const char *bad_drafts[] = {"1", "17", "4x"};
     for (size_t i = 0; i < sizeof(bad_drafts) / sizeof(bad_drafts[0]); i++) {
@@ -54,8 +58,19 @@ int main(void) {
             &spec, spec_error, sizeof(spec_error)));
         CHECK(strstr(spec_error, "MTP_MARGIN") != NULL);
     }
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
+    const char *bad_thresholds[] = {"-0.1", "1.1", "nan", "0.5x"};
+    for (size_t i = 0; i < sizeof(bad_thresholds) / sizeof(bad_thresholds[0]); i++) {
+        CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD",
+                     bad_thresholds[i], 1) == 0);
+        spec_error[0] = 0;
+        CHECK(!deepseek_v4_ds4_spec_config_from_env(
+            &spec, spec_error, sizeof(spec_error)));
+        CHECK(strstr(spec_error, "CONFIDENCE_THRESHOLD") != NULL);
+    }
     unsetenv("DRAFT");
     unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN");
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD");
 
     char root[] = "/tmp/floyd-dsv4-ds4.XXXXXX";
     CHECK(mkdtemp(root) != NULL);

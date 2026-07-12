@@ -12,6 +12,7 @@ typedef struct DeepSeekV4Ds4Session DeepSeekV4Ds4Session;
 typedef struct {
     int draft_tokens;
     float margin;
+    float confidence_threshold;
 } DeepSeekV4Ds4SpecConfig;
 
 typedef enum {

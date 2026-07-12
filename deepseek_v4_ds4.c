@@ -44,6 +44,7 @@ int deepseek_v4_ds4_spec_config_from_env(
     if (!config) return 0;
     config->draft_tokens = 3;
     config->margin = 3.0f;
+    config->confidence_threshold = 0.0f;
 
     const char *draft = getenv("DRAFT");
     if (draft && *draft) {
@@ -70,6 +71,22 @@ int deepseek_v4_ds4_spec_config_from_env(
             return 0;
         }
         config->margin = value;
+    }
+
+    const char *threshold =
+        getenv("FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD");
+    if (threshold && *threshold) {
+        char *end = NULL;
+        errno = 0;
+        float value = strtof(threshold, &end);
+        if (errno || !end || *end || !isfinite(value) ||
+            value < 0.0f || value > 1.0f) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD must be finite and in 0..1");
+            return 0;
+        }
+        config->confidence_threshold = value;
     }
     return 1;
 }
@@ -320,7 +337,11 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         ? support_path : NULL;
     const char *dspark_path = spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK
         ? support_path : NULL;
-    DeepSeekV4Ds4SpecConfig spec = {.draft_tokens = 1, .margin = 3.0f};
+    DeepSeekV4Ds4SpecConfig spec = {
+        .draft_tokens = 1,
+        .margin = 3.0f,
+        .confidence_threshold = 0.0f,
+    };
     if (spec_kind != DEEPSEEK_V4_DS4_SPEC_NONE &&
         !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {
         free(result);
