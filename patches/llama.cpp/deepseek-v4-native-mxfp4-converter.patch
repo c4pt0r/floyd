@@ -4,7 +4,7 @@ index ba6ca41c..307d4da8 100755
 +++ b/convert_hf_to_gguf.py
 @@ -9380,6 +9380,7 @@ class DeepseekV4Model(TextModel):
      ], dtype=torch.float32)
- 
+
      _qtype_aliases: dict[str, gguf.GGMLQuantizationType] = {
 +        "mxfp4": gguf.GGMLQuantizationType.MXFP4,
          "q8_0": gguf.GGMLQuantizationType.Q8_0,
@@ -13,7 +13,7 @@ index ba6ca41c..307d4da8 100755
 @@ -9390,6 +9391,9 @@ class DeepseekV4Model(TextModel):
      def __init__(self, *args, **kwargs):
          super().__init__(*args, **kwargs)
- 
+
 +        with open(self.dir_model / "config.json", encoding="utf-8") as handle:
 +            self.hparams.update(json.load(handle))
 +
@@ -23,10 +23,10 @@ index ba6ca41c..307d4da8 100755
 @@ -9414,8 +9418,8 @@ class DeepseekV4Model(TextModel):
      def set_gguf_parameters(self):
          self.hparams["num_key_value_heads"] = self.hparams.get("num_key_value_heads", 1)
- 
+
 +        hparams = dict(self.hparams)
          super().set_gguf_parameters()
 -        hparams = self.hparams
- 
+
          self.gguf_writer.add_vocab_size(hparams["vocab_size"])
          self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
