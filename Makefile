@@ -45,7 +45,8 @@ LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
 DS4_DIR ?= .deps/ds4
 DS4_REPO ?= https://github.com/antirez/ds4.git
 DS4_REV ?= 80ebbc396aee40eedc1d829222f3362d10fa4c6c
-DS4_PATCHES = patches/ds4/deepseek-v4-dspark-quantizer.patch
+DS4_PATCHES = patches/ds4/deepseek-v4-dspark-quantizer.patch \
+	patches/ds4/deepseek-v4-dspark-support.patch
 DS4_REV_STAMP = $(DS4_DIR)/.floyd-revision-$(DS4_REV)
 DS4_CORE_OBJS = $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_distributed.o \
 	$(DS4_DIR)/ds4_ssd.o $(DS4_DIR)/ds4_metal.o
