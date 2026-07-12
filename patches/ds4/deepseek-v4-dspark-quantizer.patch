@@ -76,6 +76,14 @@ index 3955b43..802e854 100644
              return xstrdup(buf);
          }
      }
+@@ -1153,6 +1186,7 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, cons
+ static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
+     int nd = tensor_n_dims(tmpl);
++    if (info->n_dims == tmpl->n_dims) nd = tmpl->n_dims;
+     if (info->n_dims != nd) {
+         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
+         exit(1);
+     }
 @@ -1223,7 +1256,8 @@ typedef struct {
  
  static void generate_one_expert(expert_job *j, int xid) {
