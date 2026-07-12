@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -145,15 +146,59 @@ def build_template_specs(single_stage_gguf: Path) -> tuple[TensorSpec, ...]:
     return tuple(specs)
 
 
+def write_sparse_template(specs: tuple[TensorSpec, ...], output: Path) -> None:
+    import numpy as np
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    writer = GGUFWriter(output, "deepseek4_dspark_support")
+    writer.add_name("DeepSeek V4 Flash three-stage DSpark support")
+    writer.add_uint32("deepseek4.dspark_stage_count", 3)
+    writer.add_uint32("deepseek4.expert_count", 256)
+    for spec in specs:
+        writer.add_tensor_info(
+            spec.name,
+            spec.shape,
+            np.dtype(np.float32),
+            spec.nbytes,
+            raw_dtype=GGMLQuantizationType[spec.quant_type],
+        )
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_ti_data_to_file()
+    writer.flush()
+    assert writer.fout is not None
+    metadata_end = writer.fout[0].tell()
+    alignment = writer.data_alignment
+    writer.close()
+
+    data_offset = (metadata_end + alignment - 1) // alignment * alignment
+    tensor_bytes = sum((spec.nbytes + alignment - 1) // alignment * alignment
+                       for spec in specs)
+    os.truncate(output, data_offset + tensor_bytes)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect DeepSeek V4 DSpark weights")
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--support-gguf", type=Path)
+    parser.add_argument("--template-out", type=Path)
     args = parser.parse_args()
 
     result = {"checkpoint": asdict(inspect_checkpoint(args.checkpoint))}
     if args.support_gguf:
         result["support_gguf"] = asdict(inspect_support_gguf(args.support_gguf))
+    if args.template_out:
+        if not args.support_gguf:
+            parser.error("--template-out requires --support-gguf")
+        specs = build_template_specs(args.support_gguf)
+        write_sparse_template(specs, args.template_out)
+        result["template"] = {
+            "path": str(args.template_out),
+            "tensor_count": len(specs),
+            "logical_bytes": args.template_out.stat().st_size,
+        }
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
