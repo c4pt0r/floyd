@@ -427,6 +427,11 @@ int deepseek_v4_chat_run(const DeepSeekV4ChatOptions *options) {
     }
     const char *reference = getenv("FLOYD_DEEPSEEK_V4_REFERENCE");
     if (!reference || atoi(reference) == 0) {
+#ifdef FLOYD_DEEPSEEK_V4_GGML
+        /* An explicit exact-runtime model selection overrides DS4 auto-discovery. */
+        if (getenv("FLOYD_DEEPSEEK_V4_GGUF"))
+            return deepseek_v4_chat_run_ggml(options);
+#endif
 #ifdef FLOYD_DEEPSEEK_V4_DS4
         char ds4_model[4096], ds4_error[4096];
         if (deepseek_v4_ds4_find_model(options->model_dir, ds4_model,
