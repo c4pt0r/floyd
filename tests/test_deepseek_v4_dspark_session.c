@@ -159,10 +159,11 @@ int main(int argc, char **argv) {
     CHECK(kernel_stats.tiny_batch_raw_store_calls >= 43);
     CHECK(kernel_stats.tiny_batch_exact_attn_calls >= 43);
     CHECK(kernel_stats.tiny_batch_exact_q8_calls > 0);
+    CHECK(kernel_stats.fused_verifier_head_calls > 0);
     printf("DeepSeek V4 DSpark tiny batch fusion: moe_calls=%llu "
            "moe_fallback=%llu shared_calls=%llu router_calls=%llu "
            "attn_hc_calls=%llu raw_store_calls=%llu exact_attn_calls=%llu "
-           "exact_q8_calls=%llu\n",
+           "exact_q8_calls=%llu fused_head_calls=%llu\n",
            (unsigned long long)kernel_stats.tiny_batch_pair_swiglu_calls,
            (unsigned long long)kernel_stats.tiny_batch_activation_fallback_calls,
            (unsigned long long)kernel_stats.tiny_batch_shared_swiglu_calls,
@@ -170,7 +171,8 @@ int main(int argc, char **argv) {
            (unsigned long long)kernel_stats.tiny_batch_attn_hc_calls,
            (unsigned long long)kernel_stats.tiny_batch_raw_store_calls,
            (unsigned long long)kernel_stats.tiny_batch_exact_attn_calls,
-           (unsigned long long)kernel_stats.tiny_batch_exact_q8_calls);
+           (unsigned long long)kernel_stats.tiny_batch_exact_q8_calls,
+           (unsigned long long)kernel_stats.fused_verifier_head_calls);
     printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
            "verify=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
            spec_stats.target_ms, spec_stats.proposal_ms,
