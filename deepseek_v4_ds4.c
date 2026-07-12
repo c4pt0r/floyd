@@ -204,6 +204,41 @@ int deepseek_v4_ds4_find_dspark_support(
     return 0;
 }
 
+int deepseek_v4_ds4_resolve_spec_model(
+    const char *model_path, int use_spec,
+    char *support_path, size_t support_path_size,
+    DeepSeekV4Ds4SpecKind *kind, char *error, size_t error_size) {
+    if (!model_path || !support_path || !support_path_size || !kind) return 0;
+    support_path[0] = 0;
+    *kind = DEEPSEEK_V4_DS4_SPEC_NONE;
+    if (!use_spec) return 1;
+
+    const char *dspark = getenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK");
+    const char *mtp = getenv("FLOYD_DEEPSEEK_V4_DS4_MTP");
+    if (dspark && *dspark) {
+        if (!deepseek_v4_ds4_find_dspark_support(
+                model_path, support_path, support_path_size,
+                error, error_size)) return 0;
+        *kind = DEEPSEEK_V4_DS4_SPEC_DSPARK;
+        return 1;
+    }
+    if (mtp && *mtp) {
+        if (!deepseek_v4_ds4_find_dspark_support(
+                model_path, support_path, support_path_size,
+                error, error_size)) return 0;
+        *kind = DEEPSEEK_V4_DS4_SPEC_MTP;
+        return 1;
+    }
+    if (deepseek_v4_ds4_find_dspark_support(
+            model_path, support_path, support_path_size,
+            error, error_size)) {
+        *kind = DEEPSEEK_V4_DS4_SPEC_DSPARK;
+    } else if (error && error_size) {
+        error[0] = 0;
+    }
+    return 1;
+}
+
 #ifdef FLOYD_DEEPSEEK_V4_DS4
 
 struct DeepSeekV4Ds4Session {
@@ -273,9 +308,20 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     if (!ds4_configure_metal_sources(error, error_size)) return NULL;
     DeepSeekV4Ds4Session *result = calloc(1, sizeof(*result));
     if (!result) return NULL;
-    const char *mtp_path = use_spec ? getenv("FLOYD_DEEPSEEK_V4_DS4_MTP") : NULL;
+    char support_path[4096];
+    DeepSeekV4Ds4SpecKind spec_kind;
+    if (!deepseek_v4_ds4_resolve_spec_model(
+            model_path, use_spec, support_path, sizeof(support_path),
+            &spec_kind, error, error_size)) {
+        free(result);
+        return NULL;
+    }
+    const char *mtp_path = spec_kind == DEEPSEEK_V4_DS4_SPEC_MTP
+        ? support_path : NULL;
+    const char *dspark_path = spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK
+        ? support_path : NULL;
     DeepSeekV4Ds4SpecConfig spec = {.draft_tokens = 1, .margin = 3.0f};
-    if (mtp_path && *mtp_path &&
+    if (spec_kind != DEEPSEEK_V4_DS4_SPEC_NONE &&
         !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {
         free(result);
         return NULL;
@@ -283,6 +329,7 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     ds4_engine_options options = {
         .model_path = model_path,
         .mtp_path = mtp_path,
+        .dspark_path = dspark_path,
         .backend = DS4_BACKEND_METAL,
         .warm_weights = true,
         .mtp_draft_tokens = spec.draft_tokens,
@@ -301,6 +348,16 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     result->max_context = max_context;
     result->use_spec = ds4_engine_mtp_draft_tokens(result->engine) > 1;
     result->load_ms = ds4_now_ms() - started;
+    if (use_spec) {
+        if (!result->use_spec) {
+            fprintf(stderr, "DEEPSEEK_V4_SPEC disabled=dspark-not-prepared\n");
+        } else {
+            const char *backend = spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK
+                ? "dspark" : "mtp";
+            fprintf(stderr, "DEEPSEEK_V4_SPEC backend=%s draft=%d\n",
+                    backend, spec.draft_tokens);
+        }
+    }
     return result;
 }
 

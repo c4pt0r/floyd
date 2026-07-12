@@ -80,8 +80,6 @@ static int deepseek_v4_chat_run_ds4(const DeepSeekV4ChatOptions *options,
     char error[4096];
     fprintf(stderr, "DEEPSEEK_V4_BACKEND backend=%s gguf=%s\n",
             deepseek_v4_ds4_backend_name(), model_path);
-    if (options->use_spec && !getenv("FLOYD_DEEPSEEK_V4_DS4_MTP"))
-        fprintf(stderr, "DEEPSEEK_V4_SPEC disabled=mtp-not-prepared\n");
 
     DeepSeekV4Ds4Session *session = deepseek_v4_ds4_open(
         model_path, options->max_context, options->use_spec,

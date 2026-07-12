@@ -2,6 +2,8 @@
 set -eu
 
 model=$1
+lock=$(mktemp /tmp/floyd-deepseek-v4-dispatch.XXXXXX)
+trap 'rm -f "$lock"' EXIT
 if ! nm floyd | grep -q 'deepseek_v4_chat_run'; then
     echo "floyd is missing built-in deepseek_v4_chat_run" >&2
     exit 1
@@ -12,17 +14,17 @@ if [ -e deepseek_v4_chat ]; then
 fi
 
 output=$(printf ':exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
-    ./floyd --model "$model" --ctx 64 --ngen 1 2>&1)
+    DS4_LOCK_FILE="$lock" ./floyd --model "$model" --ctx 64 --ngen 1 2>&1)
 printf '%s\n' "$output"
 printf '%s\n' "$output" | grep -q 'floyd chat \[DeepSeek V4\]'
 printf '%s\n' "$output" | grep -q 'DEEPSEEK_V4_BACKEND backend='
 printf '%s\n' "$output" | grep -q '›'
 
 draft_output=$(printf ':exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
-    ./floyd --model "$model" --ctx 64 --ngen 1 --draft 3 2>&1)
+    DS4_LOCK_FILE="$lock" ./floyd --model "$model" --ctx 64 --ngen 1 --draft 3 2>&1)
 printf '%s\n' "$draft_output"
 printf '%s\n' "$draft_output" |
-    grep -q 'DEEPSEEK_V4_SPEC disabled=mtp-not-prepared'
+    grep -q 'DEEPSEEK_V4_SPEC backend=dspark draft=3'
 
 for option in temp top-p system; do
     case "$option" in
@@ -31,7 +33,7 @@ for option in temp top-p system; do
         system) value=test ;;
     esac
     set +e
-    rejected=$(./floyd --model "$model" "--$option" "$value" 2>&1)
+    rejected=$(DS4_LOCK_FILE="$lock" ./floyd --model "$model" "--$option" "$value" 2>&1)
     status=$?
     set -e
     printf '%s\n' "$rejected"
