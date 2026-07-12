@@ -1,0 +1,71 @@
+diff --git a/ds4.c b/ds4.c
+index d2530b0..a55d4c9 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -368,11 +368,17 @@ typedef struct {
+     uint16_t qs[QK_K / 8];
+ } block_iq2_xxs;
+
++typedef struct {
++    uint8_t e;
++    uint8_t qs[16];
++} block_mxfp4;
++
+ #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
+ DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+ DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
+ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
+ DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
++DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
+
+ typedef struct {
+     uint32_t ctx_size;
+@@ -1584,6 +1590,7 @@ static const gguf_type_info gguf_types[] = {
+     [28] = {"f64",      1,   8},
+     [29] = {"iq1_m",  256,  56},
+     [30] = {"bf16",     1,   2},
++    [39] = {"mxfp4",   32,  17},
+ };
+
+ enum {
+@@ -1594,6 +1601,7 @@ enum {
+     DS4_TENSOR_Q4_K     = 12,
+     DS4_TENSOR_IQ2_XXS  = 16,
+     DS4_TENSOR_I32      = 26,
++    DS4_TENSOR_MXFP4    = 39,
+ };
+
+ typedef struct {
+@@ -3240,7 +3248,12 @@ static void tensor_expect_f16_or_q8_0_layout(
+ static bool tensor_is_routed_expert_type(uint32_t type) {
+     return type == DS4_TENSOR_IQ2_XXS ||
+            type == DS4_TENSOR_Q2_K ||
+-           type == DS4_TENSOR_Q4_K;
++           type == DS4_TENSOR_Q4_K ||
++           type == DS4_TENSOR_MXFP4;
++}
++
++static DS4_MAYBE_UNUSED uint64_t routed_expert_block_elems(uint32_t type) {
++    return type == DS4_TENSOR_MXFP4 ? 32 : QK_K;
+ }
+
+ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
+@@ -3248,14 +3261,16 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
+     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
++    case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+     default:                 ds4_die("unsupported routed expert tensor type");
+     }
+     return 0;
+ }
+
+ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+-    if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
+-    return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
++    const uint64_t block_elems = routed_expert_block_elems(t->type);
++    if ((t->dim[0] % block_elems) != 0) ds4_die("routed expert row is not block aligned");
++    return (t->dim[0] / block_elems) * routed_expert_block_bytes(t->type);
+ }
+
+ static bool streaming_layer_routed_expert_bytes(
