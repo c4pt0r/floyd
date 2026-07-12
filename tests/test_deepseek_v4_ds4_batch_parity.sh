@@ -13,7 +13,7 @@ env SNAP="$model" CHAT=1 DSPARK_SPEC=0 \
     DS4_LOCK_FILE="$tmp/greedy.lock" \
     DS4_METAL_GRAPH_DUMP_PREFIX="$tmp/greedy" \
     DS4_METAL_GRAPH_DUMP_NAME="$names" \
-    DS4_METAL_GRAPH_DUMP_LAYER=0 \
+    DS4_METAL_GRAPH_DUMP_LAYER=all \
     ./floyd >"$tmp/greedy.out" 2>"$tmp/greedy.trace"
 
 env SNAP="$model" CHAT=1 DRAFT=3 \
@@ -21,7 +21,7 @@ env SNAP="$model" CHAT=1 DRAFT=3 \
     DS4_LOCK_FILE="$tmp/spec.lock" \
     DS4_METAL_GRAPH_DUMP_PREFIX="$tmp/spec" \
     DS4_METAL_GRAPH_DUMP_NAME="$names" \
-    DS4_METAL_GRAPH_DUMP_LAYER=0 \
+    DS4_METAL_GRAPH_DUMP_LAYER=all \
     ./floyd >"$tmp/spec.out" 2>"$tmp/spec.trace"
 
 grep '^DEEPSEEK_V4_TOKEN ' "$tmp/greedy.trace" >"$tmp/greedy.ids"
@@ -60,4 +60,13 @@ for name in ("Qcur", "KVcur", "kqv_out", "hc_attn_post", "hc_ffn_post"):
     print(f"DeepSeek V4 DS4 batch parity {name}: max_abs={maximum:.9g}")
     if maximum != 0.0:
         raise SystemExit(f"{name}: batch/decode reduction order differs")
+
+for layer in range(43):
+    greedy = read_f32(f"{root}/greedy_hc_ffn_post-{layer}_pos{position}.bin")
+    batch = read_f32(f"{root}/spec_verify_hc_ffn_post-{layer}_pos{position}.bin")
+    maximum = max(abs(actual - expected)
+                  for actual, expected in zip(batch[:len(greedy)], greedy))
+    print(f"DeepSeek V4 DS4 layer parity {layer}: max_abs={maximum:.9g}")
+    if maximum != 0.0:
+        raise SystemExit(f"layer {layer}: batch/decode block state differs")
 PY
