@@ -56,6 +56,9 @@ int main(int argc, char **argv) {
     argmax_logits[17] = 3.0f;
     argmax_logits[42] = 3.0f;
     CHECK(ds4_gpu_init());
+    ds4_gpu_kernel_stats init_stats;
+    ds4_gpu_get_kernel_stats(&init_stats);
+    CHECK(init_stats.exact_q8_pipeline_warmups == 3);
     ds4_gpu_tensor *argmax_input =
         ds4_gpu_tensor_alloc((uint64_t)VOCAB * sizeof(*argmax_logits));
     ds4_gpu_tensor *argmax_output = ds4_gpu_tensor_alloc(sizeof(int32_t));
