@@ -76,7 +76,7 @@ int main(void) {
     CHECK(mkdtemp(root) != NULL);
 
     char checkpoint[1024], prepared[1024], model[2048], sidecar[2064];
-    char support[2048], support_sidecar[2064];
+    char support[2048], support_q4[2048], support_sidecar[2064];
     snprintf(checkpoint, sizeof(checkpoint), "%s/checkpoint", root);
     snprintf(prepared, sizeof(prepared), "%s-DS4", checkpoint);
     snprintf(model, sizeof(model),
@@ -85,6 +85,9 @@ int main(void) {
     snprintf(sidecar, sizeof(sidecar), "%s.aria2", model);
     snprintf(support, sizeof(support),
              "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4-F16Attn.gguf",
+             prepared);
+    snprintf(support_q4, sizeof(support_q4),
+             "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-Q4K-imatrix.gguf",
              prepared);
     snprintf(support_sidecar, sizeof(support_sidecar), "%s.part", support);
     CHECK(mkdir(checkpoint, 0700) == 0);
@@ -109,6 +112,14 @@ int main(void) {
     CHECK(deepseek_v4_ds4_find_dspark_support(
         model, found, sizeof(found), error, sizeof(error)));
     CHECK(strcmp(found, support) == 0);
+    CHECK(deepseek_v4_ds4_default_confidence_threshold(support) == 0.53f);
+
+    CHECK(touch_file(support_q4));
+    CHECK(deepseek_v4_ds4_find_dspark_support(
+        model, found, sizeof(found), error, sizeof(error)));
+    CHECK(strcmp(found, support_q4) == 0);
+    CHECK(deepseek_v4_ds4_default_confidence_threshold(support_q4) == 0.52f);
+    CHECK(unlink(support_q4) == 0);
 
     DeepSeekV4Ds4SpecKind kind = DEEPSEEK_V4_DS4_SPEC_NONE;
     CHECK(deepseek_v4_ds4_resolve_spec_model(
