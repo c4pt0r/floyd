@@ -75,16 +75,25 @@ sqrt-softplus routing; it is a correctness target, not a performance model.
 Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
 CSA/Lightning Indexer block integration point is layer 2.
 
-Prepare and run the resident DeepSeek V4 Metal chat path against the official
-checkpoint. Conversion and the pinned llama.cpp checkout are local ignored
+Prepare the optimized resident DeepSeek V4 Metal chat path against the official
+checkpoint. Model files and pinned runtime checkouts are local ignored
 artifacts; neither is committed:
 
 ```bash
-PYTHON=.venv/bin/python make prepare-deepseek-v4-gguf \
-  DSPARK=/path/to/DeepSeek-V4-Flash-DSpark
+make prepare-deepseek-v4-ds4 DSPARK=/path/to/DeepSeek-V4-Flash-DSpark
 
 make METAL=1 floyd
 ./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
+
+# hardware performance gate (defaults to 16 generated tokens and 30 tok/s)
+make METAL=1 test-deepseek-v4-ds4-official \
+  DSPARK=/path/to/DeepSeek-V4-Flash-DSpark NGEN=128 MIN_TPS=30
+
+# prepare and explicitly select the slower exact native-MXFP4 fallback
+PYTHON=.venv/bin/python make prepare-deepseek-v4-gguf \
+  DSPARK=/path/to/DeepSeek-V4-Flash-DSpark
+FLOYD_DEEPSEEK_V4_GGUF=/path/to/model-mxfp4_moe-00001-of-00004.gguf \
+  ./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
 
 # explicit slow safetensors correctness path
 PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
@@ -92,16 +101,17 @@ PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
   SNAP=/path/to/DeepSeek-V4-Flash-DSpark CHAT=1 CTX=64 ./floyd
 ```
 
-The production path statically links a pinned ggml runtime, keeps the split GGUF
-mmap-resident, and offloads the full DeepSeek4 graph and MXFP4 MoE to Metal. It
-implements the official chat-mode prompt, incremental compressed KV state,
-streaming decode, `:reset`, and `:exit` (`/clear` and `/exit` remain aliases),
-without Python or an inference subprocess. Startup prints
-`DEEPSEEK_V4_BACKEND backend=metal-ggml`; each turn prints measured prompt and
-decode throughput. The old safetensors implementation remains available only
-through `FLOYD_DEEPSEEK_V4_REFERENCE=1` for oracle debugging. DSpark/MTP export
-is not yet enabled in the resident runtime, so `DSPARK_SPEC=1` currently reports
-`disabled=mtp-not-prepared` instead of claiming speculative acceleration.
+The default production path statically links the pinned DS4 engine, mmap-resides
+the Q2-imatrix GGUF, warms its mapped pages, and runs the full DeepSeek V4 graph
+on Metal. On a 512 GB M3 Ultra, the command above measured 35.998 tok/s over a
+128-token Chinese story (the exact MXFP4 fallback measured 19.884 tok/s over 16
+tokens). Startup prints `DEEPSEEK_V4_BACKEND backend=metal-ds4`; each turn prints
+measured prompt and decode throughput. It supports the official chat prompt,
+incremental compressed KV state, streaming decode, `:reset`, and `:exit`, with
+no Python or inference subprocess. Set `FLOYD_DEEPSEEK_V4_DS4_MTP` to a prepared
+DS4 MTP GGUF and pass `--draft` to opt into speculative decoding. The exact ggml
+runtime remains selectable through `FLOYD_DEEPSEEK_V4_GGUF`, and the old
+safetensors oracle remains behind `FLOYD_DEEPSEEK_V4_REFERENCE=1`.
 
 ## What's *not* here (scope)
 
