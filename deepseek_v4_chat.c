@@ -70,12 +70,14 @@ static void deepseek_v4_chat_ds4_perf(const DeepSeekV4Ds4Stats *stats) {
     fprintf(stderr,
             "DEEPSEEK_V4_PERF load_ms=%.3f prompt_tokens=%d prompt_tps=%.3f "
             "generated_tokens=%d decode_tps=%.3f spec_rounds=%d "
-            "spec_accepted=%d spec_proposed=%d target_ms=%.3f proposal_ms=%.3f "
+            "spec_accepted=%d spec_proposed=%d direct_accepted=%d "
+            "target_ms=%.3f proposal_ms=%.3f "
             "verify_ms=%.3f replay_ms=%.3f\n",
             stats->load_ms, stats->prompt_tokens, prompt_tps,
             stats->generated_tokens, decode_tps,
             stats->speculative_rounds, stats->speculative_tokens,
-            stats->speculative_proposed, stats->speculative_target_ms,
+            stats->speculative_proposed, stats->speculative_direct_accepted,
+            stats->speculative_target_ms,
             stats->speculative_proposal_ms, stats->speculative_verify_ms,
             stats->speculative_replay_ms);
 }
