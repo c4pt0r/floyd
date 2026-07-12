@@ -188,6 +188,7 @@ int deepseek_v4_ds4_find_dspark_support(
     else snprintf(directory, sizeof(directory), ".");
 
     const char *patterns[] = {
+        "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-Q4K-imatrix.gguf",
         "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-Q4K*.gguf",
         "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4-F16Attn.gguf",
         "%s/DeepSeek-V4-Flash-DSpark-DSpark-3Stage-MXFP4.gguf",
