@@ -14,6 +14,12 @@ typedef struct {
     float margin;
 } DeepSeekV4Ds4SpecConfig;
 
+typedef enum {
+    DEEPSEEK_V4_DS4_SPEC_NONE = 0,
+    DEEPSEEK_V4_DS4_SPEC_MTP,
+    DEEPSEEK_V4_DS4_SPEC_DSPARK,
+} DeepSeekV4Ds4SpecKind;
+
 typedef int (*DeepSeekV4Ds4TokenCallback)(int token, const char *piece,
                                           size_t piece_size, void *user_data);
 
@@ -36,6 +42,10 @@ int deepseek_v4_ds4_find_model(const char *checkpoint_dir,
 int deepseek_v4_ds4_find_dspark_support(
     const char *model_path, char *support_path, size_t support_path_size,
     char *error, size_t error_size);
+int deepseek_v4_ds4_resolve_spec_model(
+    const char *model_path, int use_spec,
+    char *support_path, size_t support_path_size,
+    DeepSeekV4Ds4SpecKind *kind, char *error, size_t error_size);
 DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     const char *model_path, int max_context, int use_spec,
     char *error, size_t error_size);

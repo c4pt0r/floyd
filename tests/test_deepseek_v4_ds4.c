@@ -94,6 +94,25 @@ int main(void) {
     CHECK(deepseek_v4_ds4_find_dspark_support(
         model, found, sizeof(found), error, sizeof(error)));
     CHECK(strcmp(found, support) == 0);
+
+    DeepSeekV4Ds4SpecKind kind = DEEPSEEK_V4_DS4_SPEC_NONE;
+    CHECK(deepseek_v4_ds4_resolve_spec_model(
+        model, 1, found, sizeof(found), &kind, error, sizeof(error)));
+    CHECK(kind == DEEPSEEK_V4_DS4_SPEC_DSPARK);
+    CHECK(strcmp(found, support) == 0);
+    CHECK(deepseek_v4_ds4_resolve_spec_model(
+        model, 0, found, sizeof(found), &kind, error, sizeof(error)));
+    CHECK(kind == DEEPSEEK_V4_DS4_SPEC_NONE);
+    CHECK(found[0] == 0);
+
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK");
+    CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_MTP", support, 1) == 0);
+    CHECK(deepseek_v4_ds4_resolve_spec_model(
+        model, 1, found, sizeof(found), &kind, error, sizeof(error)));
+    CHECK(kind == DEEPSEEK_V4_DS4_SPEC_MTP);
+    CHECK(strcmp(found, support) == 0);
+    unsetenv("FLOYD_DEEPSEEK_V4_DS4_MTP");
+
     CHECK(touch_file(support_sidecar));
     CHECK(!deepseek_v4_ds4_find_dspark_support(
         model, found, sizeof(found), error, sizeof(error)));
