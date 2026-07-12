@@ -2656,12 +2656,16 @@ int main(int argc, char **argv){
             fprintf(stderr,"DeepSeek V4 chat does not support --system\n");
             return 2;
         }
+        const char *dspark_spec = getenv("DSPARK_SPEC");
+        const char *draft = getenv("DRAFT");
+        int use_spec = 1;
+        if ((dspark_spec && atoi(dspark_spec) == 0) ||
+            (draft && atoi(draft) <= 1)) use_spec = 0;
         DeepSeekV4ChatOptions options = {
             .model_dir = snap,
             .max_context = getenv("CTX") ? atoi(getenv("CTX")) : 512,
             .max_new_tokens = getenv("NGEN") ? atoi(getenv("NGEN")) : 16,
-            .use_spec = (getenv("DSPARK_SPEC") && atoi(getenv("DSPARK_SPEC")) != 0) ||
-                        (getenv("DRAFT") && atoi(getenv("DRAFT")) > 1),
+            .use_spec = use_spec,
         };
         return deepseek_v4_chat_run(&options);
     }

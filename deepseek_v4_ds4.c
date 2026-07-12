@@ -42,7 +42,7 @@ const char *deepseek_v4_ds4_backend_name(void) {
 int deepseek_v4_ds4_spec_config_from_env(
     DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size) {
     if (!config) return 0;
-    config->draft_tokens = 5;
+    config->draft_tokens = 3;
     config->margin = 3.0f;
 
     const char *draft = getenv("DRAFT");
