@@ -444,7 +444,7 @@ index b58aca9..5d12ac4 100644
          ds4_gpu_tensor       *out_h,
          ds4_gpu_tensor       *low,
 diff --git a/ds4_metal.m b/ds4_metal.m
-index 7e3f8bd..5200a4d 100644
+index 7e3f8bd..7977b30 100644
 --- a/ds4_metal.m
 +++ b/ds4_metal.m
 @@ -37,6 +37,7 @@
@@ -744,6 +744,50 @@ index 7e3f8bd..5200a4d 100644
      default:                       return nil;
      }
  }
+@@ -26408,8 +26543,8 @@ int ds4_gpu_hc_expand_split_tensor(
+             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
+             .nb_post0 = sizeof(float),
+             .nb_post1 = mix_hc * sizeof(float),
+-            .nb_comb0 = sizeof(float),
+-            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb1 = sizeof(float),
+             .nb_comb2 = mix_hc * sizeof(float),
+             .nb0 = sizeof(float),
+             .nb1 = (uint64_t)n_embd * sizeof(float),
+@@ -26529,8 +26664,8 @@ int ds4_gpu_hc_expand_add_split_tensor(
+             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
+             .nb_post0 = sizeof(float),
+             .nb_post1 = mix_hc * sizeof(float),
+-            .nb_comb0 = sizeof(float),
+-            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb1 = sizeof(float),
+             .nb_comb2 = mix_hc * sizeof(float),
+             .nb0 = sizeof(float),
+             .nb1 = (uint64_t)n_embd * sizeof(float),
+@@ -26659,8 +26794,8 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
+             .nb_post0 = sizeof(float),
+             .nb_post1 = mix_hc * sizeof(float),
+-            .nb_comb0 = sizeof(float),
+-            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb1 = sizeof(float),
+             .nb_comb2 = mix_hc * sizeof(float),
+             .nb0 = sizeof(float),
+             .nb1 = (uint64_t)n_embd * sizeof(float),
+@@ -26775,8 +26910,8 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
+             .nb_post0 = sizeof(float),
+             .nb_post1 = mix_hc * sizeof(float),
+-            .nb_comb0 = sizeof(float),
+-            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
++            .nb_comb1 = sizeof(float),
+             .nb_comb2 = mix_hc * sizeof(float),
+             .nb0 = sizeof(float),
+             .nb1 = (uint64_t)n_embd * sizeof(float),
 diff --git a/metal/moe.metal b/metal/moe.metal
 index d47fab2..f3fafb7 100644
 --- a/metal/moe.metal
