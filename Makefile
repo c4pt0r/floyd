@@ -24,6 +24,7 @@ endif
 METAL    ?= 0
 METAL_OBJ =
 DEEPSEEK_V4_GGML_OBJ =
+DEEPSEEK_V4_DS4_OBJ =
 FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
@@ -39,6 +40,12 @@ LLAMA_STATIC_LIBS = $(LLAMA_BUILD_DIR)/src/libllama.a \
 	$(LLAMA_BUILD_DIR)/ggml/src/libggml-cpu.a \
 	$(LLAMA_BUILD_DIR)/ggml/src/ggml-blas/libggml-blas.a \
 	$(LLAMA_BUILD_DIR)/ggml/src/libggml-base.a
+DS4_DIR ?= .deps/ds4
+DS4_REPO ?= https://github.com/antirez/ds4.git
+DS4_REV ?= 80ebbc396aee40eedc1d829222f3362d10fa4c6c
+DS4_REV_STAMP = $(DS4_DIR)/.floyd-revision-$(DS4_REV)
+DS4_CORE_OBJS = $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_distributed.o \
+	$(DS4_DIR)/ds4_ssd.o $(DS4_DIR)/ds4_metal.o
 ifeq ($(METAL),1)
 ifneq ($(UNAME_S),Darwin)
 $(error METAL=1 e' supportato solo su macOS)
@@ -46,9 +53,11 @@ endif
 CFLAGS  += -DFLOYD_METAL
 METAL_OBJ = backend_metal.o
 CFLAGS  += -DFLOYD_DEEPSEEK_V4_GGML
+CFLAGS  += -DFLOYD_DEEPSEEK_V4_DS4
 DEEPSEEK_V4_GGML_OBJ = deepseek_v4_ggml.o
+DEEPSEEK_V4_DS4_OBJ = deepseek_v4_ds4.o
 FLOYD_LINK = $(CXX)
-LDFLAGS += -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
+LDFLAGS += -pthread -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
 endif
 
 TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_hc tests/test_deepseek_v4_quant tests/test_st_probe
@@ -57,9 +66,11 @@ all: floyd
 
 DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h
 
-floyd: floyd.o deepseek_v4_chat.o $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ)
+floyd: floyd.o deepseek_v4_chat.o $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
 	$(FLOYD_LINK) floyd.o deepseek_v4_chat.o $(METAL_OBJ) \
-		$(DEEPSEEK_V4_GGML_OBJ) $(if $(DEEPSEEK_V4_GGML_OBJ),$(LLAMA_STATIC_LIBS)) \
+		$(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) \
+		$(if $(DEEPSEEK_V4_GGML_OBJ),$(LLAMA_STATIC_LIBS)) \
+		$(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS)) \
 		-o floyd $(LDFLAGS)
 
 floyd.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
@@ -95,6 +106,22 @@ $(LLAMA_BUILD_DIR)/src/libllama.a: $(LLAMA_REV_STAMP)
 
 deepseek_v4_ggml.o: deepseek_v4_ggml.cpp deepseek_v4_ggml.h deepseek_v4_chat_format.h $(LLAMA_BUILD_DIR)/src/libllama.a
 	$(CXX) -O3 -std=c++17 -DFLOYD_DEEPSEEK_V4_GGML $(LLAMA_INCLUDES) -c $< -o $@
+
+$(DS4_REV_STAMP):
+	@test -f "$(DS4_DIR)/Makefile" || \
+		git clone --filter=blob:none "$(DS4_REPO)" "$(DS4_DIR)"
+	@current=$$(git -C "$(DS4_DIR)" rev-parse HEAD); \
+		if test "$$current" != "$(DS4_REV)"; then \
+			git -C "$(DS4_DIR)" fetch --depth 1 "$(DS4_REPO)" "$(DS4_REV)"; \
+			git -C "$(DS4_DIR)" checkout --detach "$(DS4_REV)"; \
+		fi
+	@touch "$@"
+
+$(DS4_CORE_OBJS): $(DS4_REV_STAMP)
+	$(MAKE) -C "$(DS4_DIR)" ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
+
+deepseek_v4_ds4.o: deepseek_v4_ds4.c deepseek_v4_ds4.h $(DS4_CORE_OBJS)
+	$(CC) -O3 -std=c99 -DFLOYD_DEEPSEEK_V4_DS4 -I$(DS4_DIR) -c $< -o $@
 
 backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 	clang -O2 -fobjc-arc -c backend_metal.m -o $@
