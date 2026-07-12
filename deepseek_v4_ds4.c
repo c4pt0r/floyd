@@ -44,7 +44,7 @@ int deepseek_v4_ds4_spec_config_from_env(
     if (!config) return 0;
     config->draft_tokens = 3;
     config->margin = 3.0f;
-    config->confidence_threshold = 0.0f;
+    config->confidence_threshold = 0.5f;
 
     const char *draft = getenv("DRAFT");
     if (draft && *draft) {
@@ -340,7 +340,7 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     DeepSeekV4Ds4SpecConfig spec = {
         .draft_tokens = 1,
         .margin = 3.0f,
-        .confidence_threshold = 0.0f,
+        .confidence_threshold = 0.5f,
     };
     if (spec_kind != DEEPSEEK_V4_DS4_SPEC_NONE &&
         !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {

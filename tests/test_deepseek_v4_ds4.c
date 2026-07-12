@@ -30,7 +30,7 @@ int main(void) {
         &spec, spec_error, sizeof(spec_error)));
     CHECK(spec.draft_tokens == 3);
     CHECK(spec.margin == 3.0f);
-    CHECK(spec.confidence_threshold == 0.0f);
+    CHECK(spec.confidence_threshold == 0.5f);
 
     CHECK(setenv("DRAFT", "4", 1) == 0);
     CHECK(setenv("FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN", "2.5", 1) == 0);
