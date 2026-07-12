@@ -7,8 +7,9 @@ tokens=${NGEN:-16}
 output=$(mktemp -t floyd-deepseek-v4-ds4-official.XXXXXX)
 trap 'rm -f "$output"' EXIT INT TERM
 
-PROMPT=${PROMPT_TEXT:-hello} ./floyd --model "$model" --ctx 512 --ngen "$tokens" \
-    >"$output" 2>&1
+prompt=${PROMPT_TEXT:-hello}
+printf '%s\n:exit\n' "$prompt" |
+    ./floyd --model "$model" --ctx 512 --ngen "$tokens" >"$output" 2>&1
 cat "$output"
 
 grep -q 'DEEPSEEK_V4_BACKEND backend=metal-ds4' "$output"
