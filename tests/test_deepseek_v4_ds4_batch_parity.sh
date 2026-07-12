@@ -6,7 +6,7 @@ tmp=$(mktemp -d /tmp/floyd-ds4-batch-parity.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 
 prompt='请写一个至少五百字的中文科幻故事，直接开始正文。'
-names='Qcur,KVcur,kqv_out,hc_attn_post'
+names='Qcur,KVcur,kqv_out,hc_attn_post,hc_ffn_post'
 
 env SNAP="$model" CHAT=1 DSPARK_SPEC=0 \
     PROMPT="$prompt" CTX=256 NGEN=4 DEEPSEEK_V4_CHAT_TRACE=1 \
@@ -50,7 +50,7 @@ def read_f32(path):
     return values
 
 
-for name in ("Qcur", "KVcur", "kqv_out", "hc_attn_post"):
+for name in ("Qcur", "KVcur", "kqv_out", "hc_attn_post", "hc_ffn_post"):
     greedy = read_f32(f"{root}/greedy_{name}-0_pos{position}.bin")
     batch = read_f32(f"{root}/spec_verify_{name}-0_pos{position}.bin")
     if len(batch) < len(greedy):
