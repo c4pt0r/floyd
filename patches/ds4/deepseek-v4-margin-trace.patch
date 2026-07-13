@@ -1,0 +1,168 @@
+--- a/ds4.h
++++ b/ds4.h
+@@ -308,6 +308,7 @@
+ int ds4_dspark_snapshot_required(uint32_t start, uint32_t draft_n);
+ int ds4_session_copy_dspark_proposals(ds4_session *s, int *out, int cap);
+ int ds4_session_copy_dspark_confidence(ds4_session *s, float *out, int cap);
++int ds4_session_copy_dspark_margins(ds4_session *s, float *out, int cap);
+ int ds4_session_get_spec_stats(const ds4_session *s, ds4_session_spec_stats *out);
+ int ds4_session_get_kernel_stats(const ds4_session *s,
+                                  ds4_session_kernel_stats *out);
+--- a/ds4.c
++++ b/ds4.c
+@@ -20722,10 +20722,12 @@
+         int input_token,
+         int proposal_count,
+         int output_ids[6],
+-        float output_confidence[5]) {
++        float output_confidence[5],
++        float output_margins[5]) {
+     enum { DSPARK_MAX_STAGE_TOKENS = 5, DSPARK_NOISE = 128799 };
+     if (!g || !g->dspark_enabled || !support_model || !dspark ||
+-        !output_ids || !output_confidence || proposal_count < 2 ||
++        !output_ids || !output_confidence || !output_margins ||
++        proposal_count < 2 ||
+         proposal_count > 6 ||
+         g->dspark_position == 0) return false;
+     const int stage_tokens = proposal_count - 1;
+@@ -20801,7 +20803,11 @@
+     ds4_gpu_tensor *selected_ids = ds4_gpu_tensor_view(
+             g->batch_router_selected, 0,
+             (uint64_t)stage_tokens * sizeof(int32_t));
+-    if (!selected_ids) ok = false;
++    ds4_gpu_tensor *selected_margins = ds4_gpu_tensor_view(
++            g->batch_router_selected,
++            (uint64_t)DSPARK_MAX_STAGE_TOKENS * sizeof(int32_t),
++            (uint64_t)stage_tokens * sizeof(float));
++    if (!selected_ids || !selected_margins) ok = false;
+     if (ok) ok = ds4_gpu_begin_commands() != 0;
+     for (int position = 0; ok && position < stage_tokens; position++) {
+         ds4_gpu_tensor *row_logits = ds4_gpu_tensor_view(
+@@ -20820,6 +20826,10 @@
+                 selected_ids,
+                 (uint64_t)position * sizeof(int32_t),
+                 sizeof(int32_t));
++        ds4_gpu_tensor *selected_margin = ds4_gpu_tensor_view(
++                selected_margins,
++                (uint64_t)position * sizeof(float),
++                sizeof(float));
+         ds4_gpu_tensor *previous_id = position > 0
+             ? ds4_gpu_tensor_view(
+                 selected_ids,
+@@ -20827,6 +20837,7 @@
+                 sizeof(int32_t))
+             : NULL;
+         ok = row_logits && hidden_score && markov_score && selected_id &&
++             selected_margin &&
+              (position == 0 || previous_id);
+         if (ok && position == 0) {
+             ok = ds4_gpu_embed_token_hc_tensor(
+@@ -20863,9 +20874,10 @@
+                                          row_logits,
+                                          g->logits,
+                                          DS4_N_VOCAB) != 0;
+-        if (ok) ok = ds4_gpu_argmax_tensor(selected_id,
+-                                            row_logits,
+-                                            DS4_N_VOCAB) != 0;
++        if (ok) ok = ds4_gpu_top2_tensor(selected_id,
++                                          selected_margin,
++                                          row_logits,
++                                          DS4_N_VOCAB) != 0;
+         if (ok) ok = ds4_gpu_matmul_f32_tensor(
+                 markov_score,
+                 support_model->map,
+@@ -20881,6 +20893,7 @@
+                                          markov_score,
+                                          1) != 0;
+         ds4_gpu_tensor_free(previous_id);
++        ds4_gpu_tensor_free(selected_margin);
+         ds4_gpu_tensor_free(selected_id);
+         ds4_gpu_tensor_free(markov_score);
+         ds4_gpu_tensor_free(hidden_score);
+@@ -20894,7 +20907,11 @@
+     if (ok) ok = ds4_gpu_tensor_read(
+             g->batch_router_weights, 0, output_confidence,
+             (uint64_t)stage_tokens * sizeof(output_confidence[0])) != 0;
++    if (ok) ok = ds4_gpu_tensor_read(
++            selected_margins, 0, output_margins,
++            (uint64_t)stage_tokens * sizeof(output_margins[0])) != 0;
+ 
++    ds4_gpu_tensor_free(selected_margins);
+     ds4_gpu_tensor_free(selected_ids);
+     ds4_gpu_tensor_free(confidence_hidden);
+     ds4_gpu_tensor_free(draft_hidden);
+@@ -24329,7 +24346,9 @@
+     int mtp_draft_token;
+     int dspark_proposals[6];
+     float dspark_confidence[5];
++    float dspark_margins[5];
+     int dspark_proposal_count;
++    uint64_t dspark_margin_round;
+     ds4_session_spec_stats spec_stats;
+     uint64_t mtp_probe_total;
+     uint64_t mtp_probe_hit;
+@@ -28371,7 +28390,8 @@
+                 input_token,
+                 proposal_count,
+                 s->dspark_proposals,
+-                s->dspark_confidence)) {
++                s->dspark_confidence,
++                s->dspark_margins)) {
+             const int sampled_count = proposal_count - 1;
+             const int confident_count = ds4_dspark_confident_prefix_length_staged(
+                     s->dspark_confidence,
+@@ -28381,6 +28401,21 @@
+             s->dspark_proposal_count = confident_count > 0
+                 ? 1 + confident_count : 0;
+             s->dspark_proposals_valid = s->dspark_proposal_count > 0;
++            s->dspark_margin_round++;
++            if (getenv("DS4_SPEC_MARGIN_TRACE")) {
++                fprintf(stderr,
++                        "ds4: margin_proposal round=%llu raw=%d keep=%d",
++                        (unsigned long long)s->dspark_margin_round,
++                        sampled_count, confident_count);
++                for (int i = 0; i < sampled_count; i++) {
++                    const float probability =
++                        1.0f / (1.0f + expf(-s->dspark_confidence[i]));
++                    fprintf(stderr, " p%d=%.6f m%d=%.6f",
++                            i + 1, probability, i + 1,
++                            s->dspark_margins[i]);
++                }
++                fputc('\n', stderr);
++            }
+         } else {
+             snprintf(err, errlen, "DSpark proposal failed");
+             return 1;
+@@ -28412,6 +28447,15 @@
+     return count;
+ }
+ 
++int ds4_session_copy_dspark_margins(ds4_session *s, float *out, int cap) {
++    const int count = s ? s->dspark_proposal_count - 1 : 0;
++    if (!s || !out || !s->dspark_proposals_valid || count <= 0 || cap < count)
++        return 0;
++    memcpy(out, s->dspark_margins,
++           (size_t)count * sizeof(s->dspark_margins[0]));
++    return count;
++}
++
+ int ds4_session_get_spec_stats(const ds4_session *s, ds4_session_spec_stats *out) {
+     if (!s || !out) return 0;
+     *out = s->spec_stats;
+@@ -28537,6 +28581,15 @@
+     if (draft_n >= 0 && draft_n <= 6 && commit >= 0 && commit <= 6) {
+         s->spec_stats.verify_outcome_calls[draft_n][commit]++;
+         s->spec_stats.verify_outcome_ms[draft_n][commit] += verify_elapsed_ms;
++    }
++    if (getenv("DS4_SPEC_MARGIN_TRACE")) {
++        fprintf(stderr, "ds4: margin_verify round=%llu draft=%d commit=%d",
++                (unsigned long long)s->dspark_margin_round, draft_n, commit);
++        for (int i = 0; i + 1 < draft_n; i++) {
++            fprintf(stderr, " a%d=%d m%d=%.6f", i + 1,
++                    commit > i + 1, i + 1, s->dspark_margins[i]);
++        }
++        fputc('\n', stderr);
+     }
+     if (ok && commit == draft_n) {
+         ok = metal_graph_read_spec_logits_row(&s->graph,
+
