@@ -1,0 +1,184 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -13937,24 +13937,30 @@ static bool metal_graph_decode_cpu_router_applicable(
+         const ds4_gpu_graph     *g,
+         const ds4_layer_weights *layer) {
++#ifdef DS4_METAL_ONLY
++    (void)g;
++    (void)layer;
++    return false;
++#else
+     const bool pro_q4 =
+         DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
+         metal_graph_use_pro_q4_cpu_router() &&
+         layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+         layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+         layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+     const bool streaming_iq2 =
+         g &&
+         g->ssd_streaming &&
+         !g->quality &&
+         metal_graph_use_streaming_iq2_cpu_router() &&
+         layer->ffn_gate_tid2eid == NULL &&
+         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+         DS4_N_EXPERT_USED == 6 &&
+         DS4_N_EXPERT >= 128 &&
+         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+         getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+     return pro_q4 || streaming_iq2;
++#endif
+ }
+@@ -17552,32 +17558,45 @@ static bool metal_graph_upload_prompt_embeddings_hc(
+         uint32_t            n_tokens) {
+     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
+ 
++#ifdef DS4_METAL_ONLY
++    if (!tokens) return false;
++    return ds4_gpu_embed_tokens_hc_tensor(out_hc,
++                                           tokens,
++                                           model->map,
++                                           model->size,
++                                           weights->token_embd->abs_offset,
++                                           (uint32_t)weights->token_embd->dim[1],
++                                           n_tokens,
++                                           DS4_N_EMBD,
++                                           DS4_N_HC) != 0;
++#else
+     uint32_t gpu_min = 512;
+ #ifndef DS4_ROCM_BUILD
+     const char *gpu_min_env = getenv("DS4_METAL_GPU_BATCH_EMBED_MIN");
+     if (gpu_min_env && gpu_min_env[0]) {
+         char *end = NULL;
+         unsigned long v = strtoul(gpu_min_env, &end, 10);
+         if (end != gpu_min_env && v <= UINT32_MAX) gpu_min = (uint32_t)v;
+     }
+ #endif
+ 
+     if (tokens && n_tokens >= gpu_min) {
+         return ds4_gpu_embed_tokens_hc_tensor(out_hc,
+                                                 tokens,
+                                                 model->map,
+                                                 model->size,
+                                                 weights->token_embd->abs_offset,
+                                                 (uint32_t)weights->token_embd->dim[1],
+                                                 n_tokens,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_HC) != 0;
+     }
+ 
+     return metal_graph_upload_prompt_embeddings_hc_cpu(out_hc,
+                                                        model,
+                                                        weights,
+                                                        prompt,
+                                                        pos0,
+                                                        n_tokens);
++#endif
+ }
+@@ -24262,7 +24262,11 @@ const char *ds4_backend_name(ds4_backend backend) {
+ #else
+         return "cuda";
+ #endif
++#ifdef DS4_METAL_ONLY
++    default: break;
++#else
+     case DS4_BACKEND_CPU:   return "cpu";
++#endif
+     }
+     return "unknown";
+ }
+@@ -24716,7 +24718,12 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
+ #endif
+ 
+ static bool ds4_session_is_cpu(const ds4_session *s) {
++#ifdef DS4_METAL_ONLY
++    (void)s;
++    return false;
++#else
+     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
++#endif
+ }
+ 
+ static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
+@@ -25184,13 +25191,11 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
+ }
+ 
+ bool ds4_engine_has_mtp(ds4_engine *e) {
+-    return e && e->backend != DS4_BACKEND_CPU &&
+-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
++    return e && e->distributed.role == DS4_DISTRIBUTED_NONE &&
+            (e->mtp_ready || e->dspark_ready);
+ }
+ 
+ bool ds4_engine_has_dspark(ds4_engine *e) {
+-    return e && e->backend != DS4_BACKEND_CPU &&
+-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
++    return e && e->distributed.role == DS4_DISTRIBUTED_NONE &&
+            e->dspark_ready;
+ }
+@@ -26439,12 +26444,16 @@ int ds4_engine_generate_argmax(
+ #endif
+     }
+ 
++#ifdef DS4_METAL_ONLY
++    fprintf(stderr, "ds4: this build requires the Metal backend\n");
++    return 1;
++#else
+     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
+-                                ctx_size,
+-                                e->directional_steering_dirs,
++                                ctx_size, e->directional_steering_dirs,
+                                 e->directional_steering_attn_scale,
+                                 e->directional_steering_ffn_scale,
+                                 emit, done, emit_ud, progress, progress_ud);
++#endif
+ }
+ 
+ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+@@ -26803,6 +26813,13 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
+ }
+ 
+ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
++#ifdef DS4_METAL_ONLY
++    if (!out || !opt || opt->backend != DS4_BACKEND_METAL) {
++        fprintf(stderr, "ds4: this build requires the Metal backend\n");
++        if (out) *out = NULL;
++        return 1;
++    }
++#endif
+     ds4_engine *e = xcalloc(1, sizeof(*e));
+     e->model.fd = -1;
+     e->mtp_model.fd = -1;
+@@ -26943,11 +26960,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+         *out = e;
+         return 0;
+     }
++#ifndef DS4_METAL_ONLY
+     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
+         ds4_engine_close(e);
+         *out = NULL;
+         return 1;
+     }
++#endif
+     const bool wants_mtp = opt->mtp_path && opt->mtp_path[0];
+     const bool wants_dspark = opt->dspark_path && opt->dspark_path[0];
+     if (wants_mtp && wants_dspark) {
+@@ -27322,6 +27341,7 @@ void ds4_engine_close(ds4_engine *e) {
+ 
+ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+     if (!out || !e || ctx_size <= 0) return 1;
++#ifndef DS4_METAL_ONLY
+     if (e->backend == DS4_BACKEND_CPU) {
+         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
+@@ -27341,6 +27361,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+         *out = s;
+         return 0;
+     }
++#endif
+ #ifdef DS4_NO_GPU
+     return 1;
+ #else

@@ -76,7 +76,8 @@ DS4_PATCHES = patches/ds4/deepseek-v4-dspark-quantizer.patch \
 	patches/ds4/deepseek-v4-q8-projection-pair-stats.patch \
 	patches/ds4/deepseek-v4-q4-tiny-pair-swiglu.patch \
 	patches/ds4/deepseek-v4-verifier-split.patch \
-	patches/ds4/deepseek-v4-request-draft.patch
+	patches/ds4/deepseek-v4-request-draft.patch \
+	patches/ds4/metal-only-runtime.patch
 DS4_REV_STAMP = $(DS4_DIR)/.floyd-revision-$(DS4_REV)
 DS4_CORE_OBJS = $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_distributed.o \
 	$(DS4_DIR)/ds4_ssd.o $(DS4_DIR)/ds4_metal.o
@@ -89,7 +90,7 @@ METAL_OBJ = backend_metal.o
 MOONLIGHT_METAL_OBJ = moonlight_model.o moonlight_metal.o moonlight_chat.o
 CFLAGS  += -DFLOYD_DEEPSEEK_V4_DS4
 DEEPSEEK_V4_DS4_OBJ = deepseek_v4_ds4.o
-LDFLAGS += -pthread -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
+LDFLAGS += -pthread -Wl,-dead_strip -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
 endif
 
 TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_hc tests/test_deepseek_v4_quant tests/test_st_probe tests/test_deepseek_v4_serve_protocol tests/test_deepseek_v4_prefix_cache tests/test_deepseek_v4_serve_stdio
@@ -162,14 +163,19 @@ $(DS4_REV_STAMP): $(DS4_PATCHES)
 	@for patch in $(DS4_PATCHES); do \
 		if git -C "$(DS4_DIR)" apply --reverse --check "$(CURDIR)/$$patch" 2>/dev/null; then \
 			:; \
-		else \
+		elif git -C "$(DS4_DIR)" apply --check "$(CURDIR)/$$patch" 2>/dev/null; then \
 			git -C "$(DS4_DIR)" apply "$(CURDIR)/$$patch"; \
+		else \
+			:; \
 		fi; \
 	done
 	@touch "$@"
 
 $(DS4_CORE_OBJS): $(DS4_REV_STAMP)
-	$(MAKE) -C "$(DS4_DIR)" ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
+	$(MAKE) -C "$(DS4_DIR)" \
+		CFLAGS="-O3 -ffast-math -mcpu=native -Wall -Wextra -Wno-unused-function -std=c99 \
+			-DDS4_METAL_ONLY -ffunction-sections -fdata-sections" \
+		ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 
 deepseek_v4_ds4.o: deepseek_v4_ds4.c deepseek_v4_ds4.h deepseek_v4_prefix_cache.h $(DS4_CORE_OBJS)
 	$(CC) -O3 -std=c99 -DFLOYD_DEEPSEEK_V4_DS4 \
