@@ -41,8 +41,10 @@ tests/test_deepseek_v4_prefix_cache
 tests/test_deepseek_v4_serve_stdio
 tests/test_deepseek_v4_ds4_cache_official
 tests/test_moonlight_oracle
+tests/test_moonlight_metal_runtime
 tools/probe_safetensors
 kernels_metal.h
+moonlight_kernels_metal.h
 fixture_tiny*/
 fixture_dspark*/
 fixture_moonlight*/
