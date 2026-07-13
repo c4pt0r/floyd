@@ -2539,27 +2539,27 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
 static void usage(int code){
     fputs(
 "floyd — Moonlight and DeepSeek V4 inference in pure C\n"
-"uso: floyd --model DIR [flags] | floyd <comando> [flags]\n"
+"usage: floyd --model DIR [flags] | floyd <command> [flags]\n"
 "      (legacy) SNAP=<dir> floyd <cap> <ebits> <dbits>\n\n"
-"comandi:\n"
-"  chat   conversazione interattiva     floyd --model DIR (predefinito)\n"
-"  run    generazione singola           floyd run  --model DIR --prompt \"...\"\n"
-"  serve  JSONL persistente su stdio    floyd serve --stdio --model DIR\n"
-"  tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json\n"
-"  gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json\n"
-"  help   questo testo\n\n"
-"flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)\n"
-"  --dbits 4|8|16 (8) | --ram GB | --metal\n"
+"commands:\n"
+"  chat   interactive chat              floyd --model DIR (default)\n"
+"  run    one-shot generation           floyd run  --model DIR --prompt \"...\"\n"
+"  serve  persistent JSONL over stdio   floyd serve --stdio --model DIR\n"
+"  tf     teacher-forcing vs oracle     floyd tf   --model DIR --ref ref.json\n"
+"  gen    greedy generation vs oracle   floyd gen  --model DIR --ref ref.json\n"
+"  help   show this text\n\n"
+"global:     --model DIR (required) | --cap N (64) | --ebits 4|8|16 (8)\n"
+"  --dbits 4|8|16 (8) | --ram GB\n"
 "chat/run:  --ngen N (chat Moonlight:512, DeepSeek V4:16; run:256)\n"
 "  --ctx N (Moonlight:4096, DeepSeek V4:512) | --draft N\n"
-"serve:     --stdio (obbligatorio) | --prefix-cache-mb N (256; 0 disattiva)\n"
+"serve:     --stdio (required) | --prefix-cache-mb N (256; 0 disables)\n"
 "DeepSeek V4: --ds4-model FILE | --ds4-support FILE | --trace\n"
 "Moonlight: --temp T (0.7) | --top-p P (0.90) | --system \"...\"\n"
-"run:       --prompt \"...\" (obbligatorio)\n"
-"chat:      --no-kvsave (Moonlight; DeepSeek V4 non persiste ancora la KV)\n"
-"tf/gen:    --ref FILE (obbligatorio)\n"
-"flag duplicati: l'ultima occorrenza vince\n\n"
-"variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ...)\n",
+"run:       --prompt \"...\" (required)\n"
+"chat:      --no-kvsave (accepted for legacy compatibility)\n"
+"tf/gen:    --ref FILE (required)\n"
+"duplicate flags: the last value wins\n\n"
+"environment variables are a legacy/debug interface (IDOT, DSA, MTP, PILOT, STATS, ...)\n",
     code?stderr:stdout); exit(code);
 }
 
@@ -2664,10 +2664,10 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
             long v=strtol(argv[i],&e,10); if(*e||(v!=4&&v!=8&&v!=16)) usage(2);
             *dbits=(int)v;
         } else {
-            fprintf(stderr,"flag sconosciuto: %s\n",a); usage(2);
+            fprintf(stderr,"unknown flag: %s\n",a); usage(2);
         }
     }
-    if(!have_model){ fprintf(stderr,"manca --model\n"); usage(2); }
+    if(!have_model){ fprintf(stderr,"missing --model\n"); usage(2); }
     if(!strcmp(cmd,"serve") && !have_stdio){
         fprintf(stderr,"serve requires --stdio\n"); usage(2);
     }
@@ -2684,7 +2684,7 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
         unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("PROMPT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     } else if(!strcmp(cmd,"run")){
-        if(!have_prompt){ fprintf(stderr,"run richiede --prompt\n"); usage(2); }
+        if(!have_prompt){ fprintf(stderr,"run requires --prompt\n"); usage(2); }
         if(!have_ngen) setenv("NGEN","256",0);   /* run_text legge NGEN con default 64: alziamolo qui,
                                                    * ma senza sovrascrivere un NGEN ereditato esplicito */
         unsetenv("FLOYD_STDIO_SERVE");
@@ -2694,12 +2694,12 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
         unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE");
         unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     } else if(!strcmp(cmd,"tf")){
-        if(!have_ref){ fprintf(stderr,"tf richiede --ref\n"); usage(2); }
+        if(!have_ref){ fprintf(stderr,"tf requires --ref\n"); usage(2); }
         setenv("TF","1",1);
         unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY");
     } else if(!strcmp(cmd,"gen")){
-        if(!have_ref){ fprintf(stderr,"gen richiede --ref\n"); usage(2); }
+        if(!have_ref){ fprintf(stderr,"gen requires --ref\n"); usage(2); }
         unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     }
@@ -2780,19 +2780,19 @@ int main(int argc, char **argv){
     }
 #endif
 #ifdef FLOYD_METAL
-    g_metal = (getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))) ? 1 : 0;
+    g_metal = 1;
     g_metal_min_s = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;
-    if(g_metal){
-        if(!fm_init()){ fprintf(stderr,"[METAL] richiesto ma non disponibile\n"); return 2; }
-        fprintf(stderr,"[METAL] attivo: %s (batch S>=%d)\n", fm_device_name(), g_metal_min_s);
+    {
+        if(!fm_init()){ fprintf(stderr,"Metal is unavailable\n"); return 2; }
+        fprintf(stderr,"[METAL] active: %s (batch S>=%d)\n", fm_device_name(), g_metal_min_s);
         /* policy hardening (chat-patch): il default FM_MIN_S=8 tiene il decode (S=1) su CPU
          * di proposito — il wrapper Metal generico (buffer x/y transienti + waitUntilCompleted
          * per chiamata) e' sperimentale e piu' lento del CPU path per S piccoli (misurato:
          * 1.66 tok/s vs 5.93 tok/s CPU forzando FM_MIN_S=1 su M3 Ultra). Chi abbassa la soglia
          * sotto 8 lo sta facendo consapevolmente: avvisiamo forte, ma non tocchiamo il default. */
         if(g_metal_min_s<8)
-            fprintf(stderr,"[METAL] FM_MIN_S=%d: S<8 (decode) su Metal e' SPERIMENTALE e piu' LENTO "
-                           "del CPU path nel backend attuale — sconsigliato per chat tok/s\n", g_metal_min_s);
+            fprintf(stderr,"[METAL] FM_MIN_S=%d enables the legacy transient Metal wrapper "
+                           "for S<8; use the resident model runtimes for chat decode\n", g_metal_min_s);
     }
 #else
     if(getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))){

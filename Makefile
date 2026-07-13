@@ -1,5 +1,13 @@
 UNAME_S := $(shell uname -s)
 PYTHON  ?= python3
+METAL   ?= 1
+
+ifneq ($(UNAME_S),Darwin)
+$(error floyd requires Apple Metal and can only be built on macOS)
+endif
+ifneq ($(METAL),1)
+$(error floyd is Metal-only; build with make or make METAL=1)
+endif
 
 ifeq ($(UNAME_S),Darwin)
 CC      = clang
@@ -21,7 +29,6 @@ CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-m
 LDFLAGS = -lm -fopenmp
 endif
 
-METAL    ?= 0
 METAL_OBJ =
 MOONLIGHT_METAL_OBJ =
 DEEPSEEK_V4_GGML_OBJ =
