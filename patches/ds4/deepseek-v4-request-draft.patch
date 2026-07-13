@@ -1,0 +1,27 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -25198,6 +25198,13 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+ }
+ 
++int ds4_engine_set_mtp_draft_tokens(ds4_engine *e, int draft_tokens) {
++    if (!ds4_engine_has_mtp(e) || draft_tokens < 2 || draft_tokens > 16)
++        return 0;
++    e->mtp_draft_tokens = draft_tokens;
++    return 1;
++}
++
+ int ds4_dspark_confident_prefix_length_staged(
+         const float *confidence_logits,
+         int block_size,
+diff --git a/ds4.h b/ds4.h
+--- a/ds4.h
++++ b/ds4.h
+@@ -324,5 +324,6 @@ bool ds4_engine_has_mtp(ds4_engine *e);
+ bool ds4_engine_has_dspark(ds4_engine *e);
+ int ds4_engine_mtp_draft_tokens(ds4_engine *e);
++int ds4_engine_set_mtp_draft_tokens(ds4_engine *e, int draft_tokens);
+ int ds4_dspark_confident_prefix_length(const float *confidence_logits,
+                                        int block_size, float threshold);
+ int ds4_dspark_confident_prefix_length_staged(
