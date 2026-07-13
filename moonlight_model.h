@@ -6,6 +6,13 @@
 
 typedef struct MoonlightModelData MoonlightModelData;
 
+enum {
+    MOONLIGHT_TENSOR_BF16 = 0,
+    MOONLIGHT_TENSOR_F16 = 1,
+    MOONLIGHT_TENSOR_F32 = 2,
+    MOONLIGHT_TENSOR_U8 = 3,
+};
+
 typedef struct {
     int hidden_size;
     int layer_count;
@@ -39,6 +46,7 @@ int moonlight_model_data_open(MoonlightModelData **out, const char *path,
 void moonlight_model_data_close(MoonlightModelData *data);
 const MoonlightConfig *moonlight_model_data_config(const MoonlightModelData *data);
 int moonlight_model_data_tensor_count(const MoonlightModelData *data);
+int moonlight_model_data_find(const MoonlightModelData *data, const char *name);
 MoonlightTensorInfo moonlight_model_data_tensor(const MoonlightModelData *data,
                                                 int index);
 int moonlight_model_data_read_raw(const MoonlightModelData *data, int index,

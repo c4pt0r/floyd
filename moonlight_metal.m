@@ -19,6 +19,11 @@ struct MoonlightModel {
     __strong id<MTLCommandQueue> queue;
     __strong id<MTLLibrary> library;
     __strong id<MTLComputePipelineState> noop;
+    __strong id<MTLComputePipelineState> embed_f32;
+    __strong id<MTLComputePipelineState> rmsnorm;
+    __strong id<MTLComputePipelineState> matmul_f32;
+    __strong id<MTLComputePipelineState> matmul_q8;
+    __strong id<MTLComputePipelineState> matmul_q4;
     MoonlightWeight *weights;
     int weight_count;
     uint64_t resident_bytes;
@@ -51,6 +56,29 @@ static int multiply_size(size_t left, size_t right, size_t *result) {
     if (right && left > SIZE_MAX / right) return 0;
     *result = left * right;
     return 1;
+}
+
+static id<MTLComputePipelineState> make_pipeline(MoonlightModel *model,
+                                                 NSString *name,
+                                                 NSError **error) {
+    id<MTLFunction> function = [model->library newFunctionWithName:name];
+    if (!function) return nil;
+    return [model->device newComputePipelineStateWithFunction:function error:error];
+}
+
+static int weight_index(const MoonlightModel *model, const char *name,
+                        MoonlightTensorInfo *info) {
+    int index = moonlight_model_data_find(model->data, name);
+    if (index < 0) return -1;
+    if (info) *info = moonlight_model_data_tensor(model->data, index);
+    return index;
+}
+
+static int finish_command(MoonlightSession *session, id<MTLCommandBuffer> command) {
+    [command commit];
+    [command waitUntilCompleted];
+    session->stats.command_buffers++;
+    return command.status == MTLCommandBufferStatusCompleted;
 }
 
 static id<MTLBuffer> allocate_buffer(MoonlightSession *session, size_t length,
@@ -109,10 +137,14 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
         moonlight_model_close(model);
         return 0;
     }
-    id<MTLFunction> function = [model->library newFunctionWithName:@"moonlight_noop"];
-    model->noop = [model->device newComputePipelineStateWithFunction:function
-                                                               error:&metal_error];
-    if (!model->noop) {
+    model->noop = make_pipeline(model, @"moonlight_noop", &metal_error);
+    model->embed_f32 = make_pipeline(model, @"moonlight_embed_f32", &metal_error);
+    model->rmsnorm = make_pipeline(model, @"moonlight_rmsnorm", &metal_error);
+    model->matmul_f32 = make_pipeline(model, @"moonlight_matmul_f32", &metal_error);
+    model->matmul_q8 = make_pipeline(model, @"moonlight_matmul_q8", &metal_error);
+    model->matmul_q4 = make_pipeline(model, @"moonlight_matmul_q4", &metal_error);
+    if (!model->noop || !model->embed_f32 || !model->rmsnorm ||
+        !model->matmul_f32 || !model->matmul_q8 || !model->matmul_q4) {
         NSString *message = metal_error.localizedDescription ?: @"unknown error";
         set_error(error, error_size, "Moonlight pipeline creation failed: %s",
                   message.UTF8String);
@@ -170,6 +202,11 @@ void moonlight_model_close(MoonlightModel *model) {
     }
     free(model->weights);
     model->noop = nil;
+    model->embed_f32 = nil;
+    model->rmsnorm = nil;
+    model->matmul_f32 = nil;
+    model->matmul_q8 = nil;
+    model->matmul_q4 = nil;
     model->library = nil;
     model->queue = nil;
     model->device = nil;
@@ -222,7 +259,9 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
         !multiply_size(rope_size, config->qk_rope_dim, &rope_size) ||
         !multiply_size(rope_size, sizeof(float), &rope_size) ||
         !multiply_size((size_t)options->max_batch, sizeof(int32_t), &token_size) ||
-        !multiply_size((size_t)config->vocab_size, sizeof(float), &logit_size))
+        !multiply_size((size_t)options->max_batch, config->vocab_size,
+                       &logit_size) ||
+        !multiply_size(logit_size, sizeof(float), &logit_size))
         return set_error(error, error_size, "Moonlight session size overflow");
 
     session = calloc(1, sizeof(*session));
@@ -274,4 +313,155 @@ int moonlight_session_position(const MoonlightSession *session) {
 MoonlightStats moonlight_session_stats(const MoonlightSession *session) {
     MoonlightStats result = {0};
     return session ? session->stats : result;
+}
+
+int moonlight_test_embed(MoonlightSession *session, const int *ids,
+                         int count, float *output) {
+    MoonlightTensorInfo info;
+    int index;
+    uint32_t shape[2];
+    size_t output_size;
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+
+    if (!session || !ids || !output || count <= 0 ||
+        count > session->options.max_batch) return 0;
+    const MoonlightConfig *config = moonlight_model_data_config(session->model->data);
+    index = weight_index(session->model, "model.embed_tokens.weight", &info);
+    if (index < 0 || info.dtype != MOONLIGHT_TENSOR_F32 ||
+        info.element_count != (int64_t)config->vocab_size * config->hidden_size)
+        return 0;
+    output_size = (size_t)count * config->hidden_size * sizeof(float);
+    if ((size_t)count * sizeof(int32_t) > session->token_ids.length ||
+        output_size > session->activation_a.length) return 0;
+    memcpy(session->token_ids.contents, ids, (size_t)count * sizeof(int32_t));
+    shape[0] = (uint32_t)count;
+    shape[1] = (uint32_t)config->hidden_size;
+    command = [session->model->queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:session->model->embed_f32];
+    [encoder setBuffer:session->model->weights[index].buffer offset:0 atIndex:0];
+    [encoder setBuffer:session->token_ids offset:0 atIndex:1];
+    [encoder setBuffer:session->activation_a offset:0 atIndex:2];
+    [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+    NSUInteger threads = MIN((NSUInteger)256,
+                             session->model->embed_f32.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake((NSUInteger)count * config->hidden_size, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+    memcpy(output, session->activation_a.contents, output_size);
+    return 1;
+}
+
+int moonlight_test_rmsnorm(MoonlightSession *session, const float *input,
+                           const char *weight_name, int rows, int width,
+                           float *output) {
+    MoonlightTensorInfo info;
+    int index;
+    uint32_t shape[2];
+    size_t byte_count;
+    float epsilon;
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+
+    if (!session || !input || !weight_name || !output || rows <= 0 || width <= 0 ||
+        rows > session->options.max_batch) return 0;
+    index = weight_index(session->model, weight_name, &info);
+    if (index < 0 || info.dtype != MOONLIGHT_TENSOR_F32 || info.element_count != width)
+        return 0;
+    byte_count = (size_t)rows * width * sizeof(float);
+    if (byte_count > session->activation_a.length ||
+        byte_count > session->activation_b.length) return 0;
+    memcpy(session->activation_a.contents, input, byte_count);
+    shape[0] = (uint32_t)rows;
+    shape[1] = (uint32_t)width;
+    epsilon = moonlight_model_data_config(session->model->data)->rms_norm_epsilon;
+    command = [session->model->queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:session->model->rmsnorm];
+    [encoder setBuffer:session->activation_a offset:0 atIndex:0];
+    [encoder setBuffer:session->model->weights[index].buffer offset:0 atIndex:1];
+    [encoder setBuffer:session->activation_b offset:0 atIndex:2];
+    [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+    [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:4];
+    NSUInteger threads = MIN((NSUInteger)rows,
+                             session->model->rmsnorm.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(MAX(threads, (NSUInteger)1), 1, 1)];
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+    memcpy(output, session->activation_b.contents, byte_count);
+    return 1;
+}
+
+int moonlight_test_matmul(MoonlightSession *session, const char *weight_name,
+                          const float *input, int rows, int input_width,
+                          int output_width, float *output) {
+    MoonlightTensorInfo info;
+    MoonlightTensorInfo scale_info;
+    int index;
+    int scale_index = -1;
+    char scale_name[512];
+    uint32_t shape[3];
+    size_t input_size;
+    size_t output_size;
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> pipeline;
+
+    if (!session || !weight_name || !input || !output || rows <= 0 ||
+        input_width <= 0 || output_width <= 0 ||
+        rows > session->options.max_batch) return 0;
+    index = weight_index(session->model, weight_name, &info);
+    if (index < 0) return 0;
+    if (info.dtype == MOONLIGHT_TENSOR_F32) {
+        if (info.element_count != (int64_t)input_width * output_width) return 0;
+        pipeline = session->model->matmul_f32;
+    } else if (info.dtype == MOONLIGHT_TENSOR_U8) {
+        if (snprintf(scale_name, sizeof(scale_name), "%s.qs", weight_name) >=
+            (int)sizeof(scale_name)) return 0;
+        scale_index = weight_index(session->model, scale_name, &scale_info);
+        if (scale_index < 0 || scale_info.dtype != MOONLIGHT_TENSOR_F32 ||
+            scale_info.element_count != output_width) return 0;
+        if (info.byte_count == (int64_t)output_width * input_width)
+            pipeline = session->model->matmul_q8;
+        else if (info.byte_count ==
+                 (int64_t)output_width * ((input_width + 1) / 2))
+            pipeline = session->model->matmul_q4;
+        else
+            return 0;
+    } else {
+        return 0;
+    }
+    input_size = (size_t)rows * input_width * sizeof(float);
+    output_size = (size_t)rows * output_width * sizeof(float);
+    if (input_size > session->activation_a.length ||
+        output_size > session->logits.length) return 0;
+    memcpy(session->activation_a.contents, input, input_size);
+    shape[0] = (uint32_t)output_width;
+    shape[1] = (uint32_t)input_width;
+    shape[2] = (uint32_t)rows;
+    command = [session->model->queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:session->model->weights[index].buffer offset:0 atIndex:0];
+    if (scale_index >= 0) {
+        [encoder setBuffer:session->model->weights[scale_index].buffer offset:0 atIndex:1];
+        [encoder setBuffer:session->activation_a offset:0 atIndex:2];
+        [encoder setBuffer:session->logits offset:0 atIndex:3];
+        [encoder setBytes:shape length:sizeof(shape) atIndex:4];
+    } else {
+        [encoder setBuffer:session->activation_a offset:0 atIndex:1];
+        [encoder setBuffer:session->logits offset:0 atIndex:2];
+        [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+    }
+    NSUInteger columns = MIN((NSUInteger)32, (NSUInteger)output_width);
+    NSUInteger row_threads = MIN((NSUInteger)8, (NSUInteger)rows);
+    [encoder dispatchThreads:MTLSizeMake(output_width, rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(columns, row_threads, 1)];
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+    memcpy(output, session->logits.contents, output_size);
+    return 1;
 }

@@ -150,6 +150,13 @@ int moonlight_model_data_tensor_count(const MoonlightModelData *data) {
     return data ? data->tensors.n : 0;
 }
 
+int moonlight_model_data_find(const MoonlightModelData *data, const char *name) {
+    st_tensor *tensor;
+    if (!data || !name) return -1;
+    tensor = st_find((shards *)&data->tensors, name);
+    return tensor ? (int)(tensor - data->tensors.t) : -1;
+}
+
 MoonlightTensorInfo moonlight_model_data_tensor(const MoonlightModelData *data,
                                                 int index) {
     MoonlightTensorInfo result = {0};

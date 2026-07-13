@@ -44,4 +44,13 @@ void moonlight_session_reset(MoonlightSession *session);
 int moonlight_session_position(const MoonlightSession *session);
 MoonlightStats moonlight_session_stats(const MoonlightSession *session);
 
+int moonlight_test_embed(MoonlightSession *session, const int *ids,
+                         int count, float *output);
+int moonlight_test_rmsnorm(MoonlightSession *session, const float *input,
+                           const char *weight_name, int rows, int width,
+                           float *output);
+int moonlight_test_matmul(MoonlightSession *session, const char *weight_name,
+                          const float *input, int rows, int input_width,
+                          int output_width, float *output);
+
 #endif
