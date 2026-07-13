@@ -56,6 +56,7 @@ def _install_hooks(model, captured):
         hooks.append(module.register_forward_pre_hook(_capture_input(captured, name)))
 
     output(model.model.embed_tokens, "embed")
+    input_(model.model.norm, "final_input")
     output(model.model.norm, "final_norm")
     output(model.lm_head, "logits")
     for layer_index, layer in enumerate(model.model.layers):

@@ -68,6 +68,7 @@ class MoonlightOracleTest(unittest.TestCase):
                     "layer.1.router_ids",
                     "layer.1.shared_mlp",
                     "layer.1.routed_mlp",
+                    "final_input",
                     "final_norm",
                     "logits",
                 }
