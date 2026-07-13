@@ -103,8 +103,14 @@ static int test_dense_q4_k(void **mapped_out) {
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
     CHECK(x && out);
     CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+    ds4_gpu_kernel_stats stats_before;
+    ds4_gpu_get_kernel_stats(&stats_before);
     CHECK(ds4_gpu_matmul_q4_k_tensor(out, mapped, MAP_BYTES, 0,
                                      COLS, ROWS, x, TOKENS));
+    ds4_gpu_kernel_stats stats_after;
+    ds4_gpu_get_kernel_stats(&stats_after);
+    CHECK(stats_after.tiny_batch_exact_q4_calls ==
+          stats_before.tiny_batch_exact_q4_calls + 1);
     CHECK(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
     const float error = max_abs(actual, expected, TOKENS * ROWS);
     printf("DeepSeek V4 dense Q4_K Metal: max_abs=%.9g\n", error);
