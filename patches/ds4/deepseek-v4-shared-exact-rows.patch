@@ -1,0 +1,443 @@
+diff --git a/ds4.c b/ds4.c
+index dba8582..d11be5d 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -28433,6 +28433,10 @@ int ds4_session_get_kernel_stats(const ds4_session *s,
+             gpu_stats.tiny_batch_activation_fallback_calls;
+         out->tiny_batch_shared_swiglu_calls =
+             gpu_stats.tiny_batch_shared_swiglu_calls;
++        out->tiny_batch_shared_gate_up_exact_rows_calls =
++            gpu_stats.tiny_batch_shared_gate_up_exact_rows_calls;
++        out->tiny_batch_shared_down_exact_rows_calls =
++            gpu_stats.tiny_batch_shared_down_exact_rows_calls;
+         out->tiny_batch_router_calls =
+             gpu_stats.tiny_batch_router_calls;
+         out->tiny_batch_attn_hc_calls =
+diff --git a/ds4.h b/ds4.h
+index 20bb584..2cc035d 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -75,6 +75,8 @@ typedef struct {
+     uint64_t tiny_batch_pair_swiglu_calls;
+     uint64_t tiny_batch_activation_fallback_calls;
+     uint64_t tiny_batch_shared_swiglu_calls;
++    uint64_t tiny_batch_shared_gate_up_exact_rows_calls;
++    uint64_t tiny_batch_shared_down_exact_rows_calls;
+     uint64_t tiny_batch_router_calls;
+     uint64_t tiny_batch_attn_hc_calls;
+     uint64_t tiny_batch_attn_hc_exact_rows_calls;
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index c272bd9..a468916 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -23,6 +23,8 @@ typedef struct {
+     uint64_t tiny_batch_pair_swiglu_calls;
+     uint64_t tiny_batch_activation_fallback_calls;
+     uint64_t tiny_batch_shared_swiglu_calls;
++    uint64_t tiny_batch_shared_gate_up_exact_rows_calls;
++    uint64_t tiny_batch_shared_down_exact_rows_calls;
+     uint64_t tiny_batch_router_calls;
+     uint64_t tiny_batch_attn_hc_calls;
+     uint64_t tiny_batch_attn_hc_exact_rows_calls;
+diff --git a/ds4_metal.m b/ds4_metal.m
+index f4aa8ef..2d3b290 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -344,6 +344,8 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
+ static uint64_t g_tiny_batch_pair_swiglu_calls;
+ static uint64_t g_tiny_batch_activation_fallback_calls;
+ static uint64_t g_tiny_batch_shared_swiglu_calls;
++static uint64_t g_tiny_batch_shared_gate_up_exact_rows_calls;
++static uint64_t g_tiny_batch_shared_down_exact_rows_calls;
+ static uint64_t g_tiny_batch_router_calls;
+ static uint64_t g_tiny_batch_attn_hc_calls;
+ static uint64_t g_tiny_batch_attn_hc_exact_rows_calls;
+@@ -361,6 +363,10 @@ void ds4_gpu_get_kernel_stats(ds4_gpu_kernel_stats *out) {
+         g_tiny_batch_activation_fallback_calls;
+     out->tiny_batch_shared_swiglu_calls =
+         g_tiny_batch_shared_swiglu_calls;
++    out->tiny_batch_shared_gate_up_exact_rows_calls =
++        g_tiny_batch_shared_gate_up_exact_rows_calls;
++    out->tiny_batch_shared_down_exact_rows_calls =
++        g_tiny_batch_shared_down_exact_rows_calls;
+     out->tiny_batch_router_calls = g_tiny_batch_router_calls;
+     out->tiny_batch_attn_hc_calls = g_tiny_batch_attn_hc_calls;
+     out->tiny_batch_attn_hc_exact_rows_calls =
+@@ -6395,6 +6401,24 @@ int ds4_gpu_init(void) {
+                 return 0;
+             }
+         }
++        static const char *shared_exact_pipeline_names[] = {
++            "kernel_dsv4_shared_gate_up_swiglu_q8_0_rows2",
++            "kernel_dsv4_shared_gate_up_swiglu_q8_0_rows3",
++            "kernel_dsv4_shared_gate_up_swiglu_q8_0_rows4",
++            "kernel_dsv4_shared_down_hc_expand4_q8_0_rows2",
++            "kernel_dsv4_shared_down_hc_expand4_q8_0_rows3",
++            "kernel_dsv4_shared_down_hc_expand4_q8_0_rows4",
++        };
++        for (size_t i = 0;
++             i < sizeof(shared_exact_pipeline_names) /
++                 sizeof(shared_exact_pipeline_names[0]);
++             i++) {
++            if (!ds4_gpu_get_mul_mv_pipeline(shared_exact_pipeline_names[i], 4)) {
++                g_queue = nil;
++                g_device = nil;
++                return 0;
++            }
++        }
+ 
+         g_initialized = 1;
+     }
+@@ -13350,9 +13374,15 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+         args.ne1 = (int32_t)n_tok;
+         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+         args.nr0 = mv_dispatch.nr0;
++        const bool exact_rows = n_tok >= 2 && n_tok <= 4 &&
++            getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_EXACT_ROWS") == NULL;
++        const char *pipeline_name = exact_rows
++            ? (n_tok == 2 ? "kernel_dsv4_shared_gate_up_swiglu_q8_0_rows2" :
++               (n_tok == 3 ? "kernel_dsv4_shared_gate_up_swiglu_q8_0_rows3" :
++                             "kernel_dsv4_shared_gate_up_swiglu_q8_0_rows4"))
++            : "kernel_dsv4_shared_gate_up_swiglu_q8_0";
+         id<MTLComputePipelineState> pipeline =
+-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_shared_gate_up_swiglu_q8_0",
+-                                          mv_dispatch.nsg);
++            ds4_gpu_get_mul_mv_pipeline(pipeline_name, mv_dispatch.nsg);
+         if (!pipeline) return 0;
+ 
+         int owned = 0;
+@@ -13372,7 +13402,7 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
+         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                                   (NSUInteger)mv_dispatch.nr0,
+-                                              (NSUInteger)n_tok,
++                                              exact_rows ? 1u : (NSUInteger)n_tok,
+                                               1)
+              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+         ds4_gpu_end_compute_encoder(cb, enc);
+@@ -13380,6 +13410,7 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+         if (!ds4_gpu_finish_command_buffer(cb, owned, "shared expert fused gate/up")) {
+             return 0;
+         }
++        if (exact_rows) g_tiny_batch_shared_gate_up_exact_rows_calls++;
+     }
+ 
+     return 1;
+@@ -27900,9 +27931,15 @@ static int ds4_gpu_shared_down_hc_expand_q8_0_rows_tensor(
+             .has_add = 1,
+         };
+ 
++        const bool exact_rows = n_tokens >= 2 && n_tokens <= 4 &&
++            getenv("DS4_METAL_DISABLE_SHARED_DOWN_EXACT_ROWS") == NULL;
++        const char *pipeline_name = exact_rows
++            ? (n_tokens == 2 ? "kernel_dsv4_shared_down_hc_expand4_q8_0_rows2" :
++               (n_tokens == 3 ? "kernel_dsv4_shared_down_hc_expand4_q8_0_rows3" :
++                                "kernel_dsv4_shared_down_hc_expand4_q8_0_rows4"))
++            : "kernel_dsv4_shared_down_hc_expand4_q8_0";
+         id<MTLComputePipelineState> pipeline =
+-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_shared_down_hc_expand4_q8_0",
+-                                          mv_dispatch.nsg);
++            ds4_gpu_get_mul_mv_pipeline(pipeline_name, mv_dispatch.nsg);
+         if (!pipeline) return 0;
+ 
+         int owned = 0;
+@@ -27924,12 +27961,13 @@ static int ds4_gpu_shared_down_hc_expand_q8_0_rows_tensor(
+         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                               (NSUInteger)mv_dispatch.nr0,
+-                                              (NSUInteger)n_tokens,
++                                              exact_rows ? 1u : (NSUInteger)n_tokens,
+                                               1)
+              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+         ds4_gpu_end_compute_encoder(cb, enc);
+ 
+         if (!ds4_gpu_finish_command_buffer(cb, owned, "shared-down HC expand fused")) return 0;
++        if (exact_rows) g_tiny_batch_shared_down_exact_rows_calls++;
+     }
+ 
+     return 1;
+diff --git a/metal/dense.metal b/metal/dense.metal
+index e7c076c..286ccac 100644
+--- a/metal/dense.metal
++++ b/metal/dense.metal
+@@ -420,6 +420,140 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
+     }
+ }
+ 
++template<short NR1>
++void kernel_dsv4_shared_gate_up_swiglu_q8_0_exact_rows_impl(
++        constant ds4_metal_args_mul_mv & args,
++        device const char * src0_gate,
++        device const char * src0_up,
++        device const char * src1,
++        device       char * dst_gate,
++        device       char * dst_up,
++        device       char * dst_mid,
++        constant     float &clamp_value,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NQ = 8;
++    constexpr short NR0 = N_R0_Q8_0;
++    const int nb = args.ne00 / QK8_0;
++    const int r0 = tgpig.x * NR0;
++    const short ix = tiisg / (NW / NQ);
++    const short il = tiisg % (NW / NQ);
++    const int ib0 = sgitg * NQ + ix;
++
++    device const block_q8_0 *ag[NR0];
++    device const block_q8_0 *au[NR0];
++    FOR_UNROLL(short row = 0; row < NR0; ++row) {
++        const uint64_t offset0 = (uint64_t)(r0 + row) * args.nb01;
++        ag[row] = (device const block_q8_0 *)(src0_gate + offset0);
++        au[row] = (device const block_q8_0 *)(src0_up + offset0);
++    }
++    device const float *yb[NR1];
++    FOR_UNROLL(short token = 0; token < NR1; ++token) {
++        device const float *y =
++            (device const float *)(src1 + (uint64_t)token * args.nb11);
++        yb[token] = y + ib0 * QK8_0 + il * NQ;
++    }
++
++    float sumg[NR1][NR0] = {{0.0f}};
++    float sumu[NR1][NR0] = {{0.0f}};
++    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
++        FOR_UNROLL(short token = 0; token < NR1; ++token) {
++            float yl[NQ];
++            FOR_UNROLL(short i = 0; i < NQ; ++i) yl[i] = yb[token][i];
++            FOR_UNROLL(short row = 0; row < NR0; ++row) {
++                device const int8_t *qg = ag[row][ib].qs + il * NQ;
++                device const int8_t *qu = au[row][ib].qs + il * NQ;
++                float sg = 0.0f;
++                float su = 0.0f;
++                FOR_UNROLL(short i = 0; i < NQ; ++i) {
++                    sg += qg[i] * yl[i];
++                    su += qu[i] * yl[i];
++                }
++                sumg[token][row] += sg * ag[row][ib].d;
++                sumu[token][row] += su * au[row][ib].d;
++            }
++            yb[token] += NSG * NQ * QK8_0;
++        }
++    }
++
++    threadgroup float *shmem_f32 = (threadgroup float *)shmem;
++    threadgroup float *sh_gate[NR0];
++    threadgroup float *sh_up[NR0];
++    FOR_UNROLL(short row = 0; row < NR0; ++row) {
++        sh_gate[row] = shmem_f32 + NW * row;
++        sh_up[row] = shmem_f32 + NW * (NR0 + row);
++    }
++    FOR_UNROLL(short token = 0; token < NR1; ++token) {
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            if (sgitg == 0) {
++                sh_gate[row][tiisg] = 0.0f;
++                sh_up[row][tiisg] = 0.0f;
++            }
++            sumg[token][row] = simd_sum(sumg[token][row]);
++            sumu[token][row] = simd_sum(sumu[token][row]);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            if (tiisg == 0) {
++                sh_gate[row][sgitg] = sumg[token][row];
++                sh_up[row][sgitg] = sumu[token][row];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        device float *gate_f32 = (device float *)dst_gate +
++            (uint64_t)token * args.ne0;
++        device float *up_f32 = (device float *)dst_up +
++            (uint64_t)token * args.ne0;
++        device float *mid_f32 = (device float *)dst_mid +
++            (uint64_t)token * args.ne0;
++        FOR_UNROLL(short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
++            const float gate = simd_sum(sh_gate[row][tiisg]);
++            const float up = simd_sum(sh_up[row][tiisg]);
++            if (tiisg == 0 && sgitg == 0) {
++                const uint out_row = r0 + row;
++                gate_f32[out_row] = gate;
++                up_f32[out_row] = up;
++                float g = gate;
++                float u = up;
++                if (clamp_value > 1.0e-6f) {
++                    g = min(g, clamp_value);
++                    u = clamp(u, -clamp_value, clamp_value);
++                }
++                mid_f32[out_row] = (g / (1.0f + exp(-g))) * u;
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++}
++
++#define DS4_SHARED_GATE_UP_EXACT_ROWS_KERNEL(NR1) \
++[[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_rows" #NR1)]] \
++kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0_rows##NR1( \
++        constant ds4_metal_args_mul_mv & args, \
++        device const char * src0_gate, device const char * src0_up, \
++        device const char * src1, device char * dst_gate, \
++        device char * dst_up, device char * dst_mid, \
++        constant float &clamp_value, \
++        threadgroup char * shmem [[threadgroup(0)]], \
++        uint3 tgpig [[threadgroup_position_in_grid]], \
++        ushort tiisg [[thread_index_in_simdgroup]], \
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    kernel_dsv4_shared_gate_up_swiglu_q8_0_exact_rows_impl<NR1>( \
++        args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, \
++        clamp_value, shmem, tgpig, tiisg, sgitg); \
++}
++
++DS4_SHARED_GATE_UP_EXACT_ROWS_KERNEL(2)
++DS4_SHARED_GATE_UP_EXACT_ROWS_KERNEL(3)
++DS4_SHARED_GATE_UP_EXACT_ROWS_KERNEL(4)
++
++#undef DS4_SHARED_GATE_UP_EXACT_ROWS_KERNEL
++
+ template<typename T0, typename T1, short NR0, typename args_t>
+ void kernel_mul_mv_t_t_impl(
+         args_t args,
+diff --git a/metal/dsv4_hc.metal b/metal/dsv4_hc.metal
+index 10ab50d..533a9cb 100644
+--- a/metal/dsv4_hc.metal
++++ b/metal/dsv4_hc.metal
+@@ -752,6 +752,135 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
+     }
+ }
+ 
++template<short NR1>
++void kernel_dsv4_shared_down_hc_expand4_q8_0_exact_rows_impl(
++        constant ds4_metal_args_mul_mv          & mv,
++        constant ds4_metal_args_dsv4_hc_expand & hc,
++        device  const char * weight,
++        device  const char * shared_mid,
++        device        char * shared_out,
++        device  const char * routed_out,
++        device  const char * residual,
++        device  const char * post,
++        device  const char * comb,
++        device        char * dst,
++        threadgroup   char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    if (hc.n_hc != 4 || hc.n_tokens != NR1) return;
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NQ = 8;
++    constexpr short NR0 = N_R0_Q8_0;
++    const int nb = mv.ne00 / QK8_0;
++    const int row0 = tgpig.x * NR0;
++    const short ix = tiisg / (NW / NQ);
++    const short il = tiisg % (NW / NQ);
++    const int ib0 = sgitg * NQ + ix;
++
++    device const block_q8_0 *ax[NR0];
++    FOR_UNROLL(short row = 0; row < NR0; ++row) {
++        const uint64_t off0 = (uint64_t)(row0 + row) * mv.nb01;
++        ax[row] = (device const block_q8_0 *)(weight + off0);
++    }
++    device const float *yb[NR1];
++    FOR_UNROLL(short token = 0; token < NR1; ++token) {
++        device const float *y =
++            (device const float *)(shared_mid + (uint64_t)token * mv.nb11);
++        yb[token] = y + ib0 * QK8_0 + il * NQ;
++    }
++    float sumf[NR1][NR0] = {{0.0f}};
++    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
++        FOR_UNROLL(short token = 0; token < NR1; ++token) {
++            float yl[NQ];
++            FOR_UNROLL(short i = 0; i < NQ; ++i) yl[i] = yb[token][i];
++            FOR_UNROLL(short row = 0; row < NR0; ++row) {
++                device const int8_t *qs = ax[row][ib].qs + il * NQ;
++                float sumq = 0.0f;
++                FOR_UNROLL(short i = 0; i < NQ; ++i) sumq += qs[i] * yl[i];
++                sumf[token][row] += sumq * ax[row][ib].d;
++            }
++            yb[token] += NSG * NQ * QK8_0;
++        }
++    }
++
++    threadgroup float *shmem_f32[NR0];
++    FOR_UNROLL(short row = 0; row < NR0; ++row)
++        shmem_f32[row] = (threadgroup float *)shmem + NW * row;
++    FOR_UNROLL(short token = 0; token < NR1; ++token) {
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
++            sumf[token][row] = simd_sum(sumf[token][row]);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            if (tiisg == 0) shmem_f32[row][sgitg] = sumf[token][row];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            const int d = row0 + row;
++            if (d >= mv.ne01) continue;
++            const float shared_v = simd_sum(shmem_f32[row][tiisg]);
++            if (tiisg == 0 && sgitg == 0) {
++                *((device float *)(shared_out +
++                    ((uint64_t)token * mv.ne0 + d) * sizeof(float))) = shared_v;
++                float block_v = *((device const float *)(routed_out +
++                    (uint64_t)d * hc.nb_block0 + token * hc.nb_block1));
++                block_v += shared_v;
++                const float r0 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1 + token * hc.nb_res2));
++                const float r1 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1 + token * hc.nb_res2));
++                const float r2 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1 + token * hc.nb_res2));
++                const float r3 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1 + token * hc.nb_res2));
++                for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
++                    float acc = block_v * *((device const float *)(post +
++                        dst_hc * hc.nb_post0 + token * hc.nb_post1));
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        0 * hc.nb_comb1 + token * hc.nb_comb2)) * r0;
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        1 * hc.nb_comb1 + token * hc.nb_comb2)) * r1;
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        2 * hc.nb_comb1 + token * hc.nb_comb2)) * r2;
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        3 * hc.nb_comb1 + token * hc.nb_comb2)) * r3;
++                    *((device float *)(dst + (uint64_t)d * hc.nb0 +
++                        dst_hc * hc.nb1 + token * hc.nb2)) = acc;
++                }
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++}
++
++#define DS4_SHARED_DOWN_EXACT_ROWS_KERNEL(NR1) \
++[[host_name("kernel_dsv4_shared_down_hc_expand4_q8_0_rows" #NR1)]] \
++kernel void kernel_dsv4_shared_down_hc_expand4_q8_0_rows##NR1( \
++        constant ds4_metal_args_mul_mv & mv, \
++        constant ds4_metal_args_dsv4_hc_expand & hc, \
++        device const char * weight, device const char * shared_mid, \
++        device char * shared_out, device const char * routed_out, \
++        device const char * residual, device const char * post, \
++        device const char * comb, device char * dst, \
++        threadgroup char * shmem [[threadgroup(0)]], \
++        uint3 tgpig [[threadgroup_position_in_grid]], \
++        ushort tiisg [[thread_index_in_simdgroup]], \
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    kernel_dsv4_shared_down_hc_expand4_q8_0_exact_rows_impl<NR1>( \
++        mv, hc, weight, shared_mid, shared_out, routed_out, residual, post, \
++        comb, dst, shmem, tgpig, tiisg, sgitg); \
++}
++
++DS4_SHARED_DOWN_EXACT_ROWS_KERNEL(2)
++DS4_SHARED_DOWN_EXACT_ROWS_KERNEL(3)
++DS4_SHARED_DOWN_EXACT_ROWS_KERNEL(4)
++
++#undef DS4_SHARED_DOWN_EXACT_ROWS_KERNEL
++
+ // Decode-time attention output tail fusion:
+ //
+ //     attn_out = attn_low @ Wob
