@@ -16,6 +16,13 @@ typedef struct {
     int hidden_size;
     int layer_count;
     int vocab_size;
+    int head_count;
+    int kv_lora_rank;
+    int qk_nope_dim;
+    int qk_rope_dim;
+    int value_dim;
+    float rms_norm_epsilon;
+    float rope_theta;
     uint64_t resident_bytes;
 } MoonlightModelInfo;
 
@@ -52,5 +59,11 @@ int moonlight_test_rmsnorm(MoonlightSession *session, const float *input,
 int moonlight_test_matmul(MoonlightSession *session, const char *weight_name,
                           const float *input, int rows, int input_width,
                           int output_width, float *output);
+int moonlight_test_attention(MoonlightSession *session, int layer,
+                             const float *input, int rows, int position,
+                             float *output);
+int moonlight_test_kv_length(const MoonlightSession *session, int layer);
+int moonlight_test_copy_kv(const MoonlightSession *session, int layer,
+                           float *latent, float *rope, int capacity);
 
 #endif

@@ -1,9 +1,11 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "moonlight_kernels_metal.h"
 #include "moonlight_metal.h"
@@ -24,6 +26,9 @@ struct MoonlightModel {
     __strong id<MTLComputePipelineState> matmul_f32;
     __strong id<MTLComputePipelineState> matmul_q8;
     __strong id<MTLComputePipelineState> matmul_q4;
+    __strong id<MTLComputePipelineState> cache_append;
+    __strong id<MTLComputePipelineState> rope_query;
+    __strong id<MTLComputePipelineState> attention_absorbed;
     MoonlightWeight *weights;
     int weight_count;
     uint64_t resident_bytes;
@@ -38,9 +43,20 @@ struct MoonlightSession {
     __strong id<MTLBuffer> rope_kv;
     __strong id<MTLBuffer> token_ids;
     __strong id<MTLBuffer> logits;
+    __strong id<MTLBuffer> query;
+    __strong id<MTLBuffer> compressed;
+    __strong id<MTLBuffer> context;
     MoonlightStats stats;
+    int *kv_lengths;
     int position;
 };
+
+typedef struct {
+    int weight_index;
+    int scale_index;
+    int format;
+    __unsafe_unretained id<MTLComputePipelineState> pipeline;
+} MoonlightMatrix;
 
 static int set_error(char *error, size_t error_size, const char *format, ...) {
     va_list arguments;
@@ -72,6 +88,66 @@ static int weight_index(const MoonlightModel *model, const char *name,
     if (index < 0) return -1;
     if (info) *info = moonlight_model_data_tensor(model->data, index);
     return index;
+}
+
+static int resolve_matrix(MoonlightModel *model, const char *name,
+                          int input_width, int output_width,
+                          MoonlightMatrix *matrix) {
+    MoonlightTensorInfo info;
+    MoonlightTensorInfo scale_info;
+    char scale_name[512];
+
+    memset(matrix, 0, sizeof(*matrix));
+    matrix->scale_index = -1;
+    matrix->weight_index = weight_index(model, name, &info);
+    if (matrix->weight_index < 0) return 0;
+    if (info.dtype == MOONLIGHT_TENSOR_F32) {
+        if (info.element_count != (int64_t)input_width * output_width) return 0;
+        matrix->pipeline = model->matmul_f32;
+        return 1;
+    }
+    if (info.dtype != MOONLIGHT_TENSOR_U8 ||
+        snprintf(scale_name, sizeof(scale_name), "%s.qs", name) >=
+        (int)sizeof(scale_name)) return 0;
+    matrix->scale_index = weight_index(model, scale_name, &scale_info);
+    if (matrix->scale_index < 0 || scale_info.dtype != MOONLIGHT_TENSOR_F32 ||
+        scale_info.element_count != output_width) return 0;
+    if (info.byte_count == (int64_t)output_width * input_width) {
+        matrix->format = 1;
+        matrix->pipeline = model->matmul_q8;
+        return 1;
+    }
+    if (info.byte_count == (int64_t)output_width * ((input_width + 1) / 2)) {
+        matrix->format = 2;
+        matrix->pipeline = model->matmul_q4;
+        return 1;
+    }
+    return 0;
+}
+
+static void encode_matmul(MoonlightModel *model,
+                          id<MTLComputeCommandEncoder> encoder,
+                          const MoonlightMatrix *matrix,
+                          id<MTLBuffer> input, id<MTLBuffer> output,
+                          int rows, int input_width, int output_width) {
+    uint32_t shape[3] = {(uint32_t)output_width, (uint32_t)input_width,
+                         (uint32_t)rows};
+    [encoder setComputePipelineState:matrix->pipeline];
+    [encoder setBuffer:model->weights[matrix->weight_index].buffer offset:0 atIndex:0];
+    if (matrix->scale_index >= 0) {
+        [encoder setBuffer:model->weights[matrix->scale_index].buffer offset:0 atIndex:1];
+        [encoder setBuffer:input offset:0 atIndex:2];
+        [encoder setBuffer:output offset:0 atIndex:3];
+        [encoder setBytes:shape length:sizeof(shape) atIndex:4];
+    } else {
+        [encoder setBuffer:input offset:0 atIndex:1];
+        [encoder setBuffer:output offset:0 atIndex:2];
+        [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+    }
+    NSUInteger columns = MIN((NSUInteger)32, (NSUInteger)output_width);
+    NSUInteger row_threads = MIN((NSUInteger)8, (NSUInteger)rows);
+    [encoder dispatchThreads:MTLSizeMake(output_width, rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(columns, row_threads, 1)];
 }
 
 static int finish_command(MoonlightSession *session, id<MTLCommandBuffer> command) {
@@ -143,8 +219,13 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
     model->matmul_f32 = make_pipeline(model, @"moonlight_matmul_f32", &metal_error);
     model->matmul_q8 = make_pipeline(model, @"moonlight_matmul_q8", &metal_error);
     model->matmul_q4 = make_pipeline(model, @"moonlight_matmul_q4", &metal_error);
+    model->cache_append = make_pipeline(model, @"moonlight_cache_append", &metal_error);
+    model->rope_query = make_pipeline(model, @"moonlight_rope_query", &metal_error);
+    model->attention_absorbed =
+        make_pipeline(model, @"moonlight_attention_absorbed", &metal_error);
     if (!model->noop || !model->embed_f32 || !model->rmsnorm ||
-        !model->matmul_f32 || !model->matmul_q8 || !model->matmul_q4) {
+        !model->matmul_f32 || !model->matmul_q8 || !model->matmul_q4 ||
+        !model->cache_append || !model->rope_query || !model->attention_absorbed) {
         NSString *message = metal_error.localizedDescription ?: @"unknown error";
         set_error(error, error_size, "Moonlight pipeline creation failed: %s",
                   message.UTF8String);
@@ -207,6 +288,9 @@ void moonlight_model_close(MoonlightModel *model) {
     model->matmul_f32 = nil;
     model->matmul_q8 = nil;
     model->matmul_q4 = nil;
+    model->cache_append = nil;
+    model->rope_query = nil;
+    model->attention_absorbed = nil;
     model->library = nil;
     model->queue = nil;
     model->device = nil;
@@ -225,6 +309,13 @@ MoonlightModelInfo moonlight_model_info(const MoonlightModel *model) {
     result.hidden_size = config->hidden_size;
     result.layer_count = config->layer_count;
     result.vocab_size = config->vocab_size;
+    result.head_count = config->head_count;
+    result.kv_lora_rank = config->kv_lora_rank;
+    result.qk_nope_dim = config->qk_nope_dim;
+    result.qk_rope_dim = config->qk_rope_dim;
+    result.value_dim = config->value_dim;
+    result.rms_norm_epsilon = config->rms_norm_epsilon;
+    result.rope_theta = config->rope_theta;
     result.resident_bytes = model->resident_bytes;
     return result;
 }
@@ -239,6 +330,9 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     size_t rope_size;
     size_t token_size;
     size_t logit_size;
+    size_t query_size;
+    size_t compressed_size;
+    size_t context_size;
 
     if (!out || !model || !options)
         return set_error(error, error_size, "model and session options are required");
@@ -261,8 +355,25 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
         !multiply_size((size_t)options->max_batch, sizeof(int32_t), &token_size) ||
         !multiply_size((size_t)options->max_batch, config->vocab_size,
                        &logit_size) ||
-        !multiply_size(logit_size, sizeof(float), &logit_size))
+        !multiply_size(logit_size, sizeof(float), &logit_size) ||
+        !multiply_size((size_t)options->max_batch, config->head_count,
+                       &query_size) ||
+        !multiply_size(query_size, config->qk_nope_dim + config->qk_rope_dim,
+                       &query_size) ||
+        !multiply_size(query_size, sizeof(float), &query_size) ||
+        !multiply_size((size_t)options->max_batch,
+                       config->kv_lora_rank + config->qk_rope_dim,
+                       &compressed_size) ||
+        !multiply_size(compressed_size, sizeof(float), &compressed_size) ||
+        !multiply_size((size_t)options->max_batch, config->head_count,
+                       &context_size) ||
+        !multiply_size(context_size, config->value_dim, &context_size) ||
+        !multiply_size(context_size, sizeof(float), &context_size))
         return set_error(error, error_size, "Moonlight session size overflow");
+    if (config->kv_lora_rank > 512 || config->qk_rope_dim > 256 ||
+        (config->qk_rope_dim & 1))
+        return set_error(error, error_size,
+                         "unsupported Moonlight MLA dimensions");
 
     session = calloc(1, sizeof(*session));
     if (!session) return set_error(error, error_size, "out of memory creating session");
@@ -275,8 +386,15 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     session->rope_kv = allocate_buffer(session, rope_size, error, error_size);
     session->token_ids = allocate_buffer(session, token_size, error, error_size);
     session->logits = allocate_buffer(session, logit_size, error, error_size);
+    session->query = allocate_buffer(session, query_size, error, error_size);
+    session->compressed = allocate_buffer(session, compressed_size, error, error_size);
+    session->context = allocate_buffer(session, context_size, error, error_size);
+    session->kv_lengths = calloc((size_t)config->layer_count,
+                                 sizeof(*session->kv_lengths));
     if (!session->activation_a || !session->activation_b || !session->latent_kv ||
-        !session->rope_kv || !session->token_ids || !session->logits) {
+        !session->rope_kv || !session->token_ids || !session->logits ||
+        !session->query || !session->compressed || !session->context ||
+        !session->kv_lengths) {
         moonlight_session_destroy(session);
         return 0;
     }
@@ -292,12 +410,20 @@ void moonlight_session_destroy(MoonlightSession *session) {
     session->rope_kv = nil;
     session->token_ids = nil;
     session->logits = nil;
+    session->query = nil;
+    session->compressed = nil;
+    session->context = nil;
+    free(session->kv_lengths);
     free(session);
 }
 
 void moonlight_session_reset(MoonlightSession *session) {
     if (!session) return;
     session->position = 0;
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    memset(session->kv_lengths, 0,
+           (size_t)config->layer_count * sizeof(*session->kv_lengths));
     session->stats.command_buffers = 0;
     session->stats.prefill_tokens = 0;
     session->stats.decode_tokens = 0;
@@ -463,5 +589,190 @@ int moonlight_test_matmul(MoonlightSession *session, const char *weight_name,
     [encoder endEncoding];
     if (!finish_command(session, command)) return 0;
     memcpy(output, session->logits.contents, output_size);
+    return 1;
+}
+
+int moonlight_test_attention(MoonlightSession *session, int layer,
+                             const float *input, int rows, int position,
+                             float *output) {
+    const MoonlightConfig *config;
+    MoonlightMatrix query_matrix;
+    MoonlightMatrix kv_a_matrix;
+    MoonlightMatrix kv_b_matrix;
+    MoonlightMatrix output_matrix;
+    MoonlightTensorInfo norm_info;
+    char name[512];
+    int norm_index;
+    int query_width;
+    int compressed_width;
+    int context_width;
+    size_t input_size;
+    size_t output_size;
+    uint32_t cache_shape[6];
+    uint32_t rope_shape[5];
+    uint32_t attention_shape[10];
+    float attention_scale;
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+    id<MTLBuffer> kv_b_scale;
+
+    if (!session || !input || !output || rows <= 0 || position < 0 ||
+        rows > session->options.max_batch) return 0;
+    config = moonlight_model_data_config(session->model->data);
+    if (layer < 0 || layer >= config->layer_count ||
+        position != session->kv_lengths[layer] ||
+        position + rows > session->options.context_size || config->q_lora_rank)
+        return 0;
+    query_width = config->head_count *
+                  (config->qk_nope_dim + config->qk_rope_dim);
+    compressed_width = config->kv_lora_rank + config->qk_rope_dim;
+    context_width = config->head_count * config->value_dim;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.self_attn.q_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        query_width, &query_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        compressed_width, &kv_a_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.self_attn.kv_b_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->kv_lora_rank,
+                        config->head_count *
+                        (config->qk_nope_dim + config->value_dim),
+                        &kv_b_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.self_attn.o_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, context_width,
+                        config->hidden_size, &output_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.self_attn.kv_a_layernorm.weight", layer) >=
+            (int)sizeof(name)) return 0;
+    norm_index = weight_index(session->model, name, &norm_info);
+    if (norm_index < 0 || norm_info.dtype != MOONLIGHT_TENSOR_F32 ||
+        norm_info.element_count != config->kv_lora_rank) return 0;
+    input_size = (size_t)rows * config->hidden_size * sizeof(float);
+    output_size = input_size;
+    if (input_size > session->activation_a.length ||
+        output_size > session->activation_b.length) return 0;
+    memcpy(session->activation_a.contents, input, input_size);
+
+    command = [session->model->queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    encode_matmul(session->model, encoder, &query_matrix,
+                  session->activation_a, session->query, rows,
+                  config->hidden_size, query_width);
+    encode_matmul(session->model, encoder, &kv_a_matrix,
+                  session->activation_a, session->compressed, rows,
+                  config->hidden_size, compressed_width);
+
+    cache_shape[0] = (uint32_t)rows;
+    cache_shape[1] = (uint32_t)config->kv_lora_rank;
+    cache_shape[2] = (uint32_t)config->qk_rope_dim;
+    cache_shape[3] = (uint32_t)session->options.context_size;
+    cache_shape[4] = (uint32_t)layer;
+    cache_shape[5] = (uint32_t)position;
+    [encoder setComputePipelineState:session->model->cache_append];
+    [encoder setBuffer:session->compressed offset:0 atIndex:0];
+    [encoder setBuffer:session->model->weights[norm_index].buffer offset:0 atIndex:1];
+    [encoder setBuffer:session->latent_kv offset:0 atIndex:2];
+    [encoder setBuffer:session->rope_kv offset:0 atIndex:3];
+    [encoder setBytes:cache_shape length:sizeof(cache_shape) atIndex:4];
+    [encoder setBytes:&config->rms_norm_epsilon
+                length:sizeof(config->rms_norm_epsilon) atIndex:5];
+    [encoder setBytes:&config->rope_theta length:sizeof(config->rope_theta) atIndex:6];
+    NSUInteger cache_threads = MIN((NSUInteger)rows,
+        session->model->cache_append.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(MAX(cache_threads, (NSUInteger)1), 1, 1)];
+
+    rope_shape[0] = (uint32_t)rows;
+    rope_shape[1] = (uint32_t)config->head_count;
+    rope_shape[2] = (uint32_t)config->qk_nope_dim;
+    rope_shape[3] = (uint32_t)config->qk_rope_dim;
+    rope_shape[4] = (uint32_t)position;
+    [encoder setComputePipelineState:session->model->rope_query];
+    [encoder setBuffer:session->query offset:0 atIndex:0];
+    [encoder setBytes:rope_shape length:sizeof(rope_shape) atIndex:1];
+    [encoder setBytes:&config->rope_theta length:sizeof(config->rope_theta) atIndex:2];
+    NSUInteger query_count = (NSUInteger)rows * config->head_count;
+    NSUInteger rope_threads = MIN((NSUInteger)64,
+        session->model->rope_query.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(query_count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(rope_threads, 1, 1)];
+
+    attention_shape[0] = (uint32_t)rows;
+    attention_shape[1] = (uint32_t)config->head_count;
+    attention_shape[2] = (uint32_t)config->qk_nope_dim;
+    attention_shape[3] = (uint32_t)config->qk_rope_dim;
+    attention_shape[4] = (uint32_t)config->value_dim;
+    attention_shape[5] = (uint32_t)config->kv_lora_rank;
+    attention_shape[6] = (uint32_t)session->options.context_size;
+    attention_shape[7] = (uint32_t)layer;
+    attention_shape[8] = (uint32_t)position;
+    attention_shape[9] = (uint32_t)kv_b_matrix.format;
+    attention_scale = 1.0f /
+        sqrtf((float)(config->qk_nope_dim + config->qk_rope_dim));
+    kv_b_scale = kv_b_matrix.scale_index >= 0
+        ? session->model->weights[kv_b_matrix.scale_index].buffer
+        : session->model->weights[kv_b_matrix.weight_index].buffer;
+    [encoder setComputePipelineState:session->model->attention_absorbed];
+    [encoder setBuffer:session->query offset:0 atIndex:0];
+    [encoder setBuffer:session->latent_kv offset:0 atIndex:1];
+    [encoder setBuffer:session->rope_kv offset:0 atIndex:2];
+    [encoder setBuffer:session->model->weights[kv_b_matrix.weight_index].buffer
+             offset:0 atIndex:3];
+    [encoder setBuffer:kv_b_scale offset:0 atIndex:4];
+    [encoder setBuffer:session->context offset:0 atIndex:5];
+    [encoder setBytes:attention_shape length:sizeof(attention_shape) atIndex:6];
+    [encoder setBytes:&attention_scale length:sizeof(attention_scale) atIndex:7];
+    NSUInteger attention_threads = MIN((NSUInteger)32,
+        session->model->attention_absorbed.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(query_count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(attention_threads, 1, 1)];
+
+    encode_matmul(session->model, encoder, &output_matrix,
+                  session->context, session->activation_b, rows,
+                  context_width, config->hidden_size);
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+    memcpy(output, session->activation_b.contents, output_size);
+    session->kv_lengths[layer] = position + rows;
+    if (session->position < position + rows) session->position = position + rows;
+    if (position == 0 && rows > 1)
+        session->stats.prefill_tokens += (uint64_t)rows;
+    else
+        session->stats.decode_tokens += (uint64_t)rows;
+    return 1;
+}
+
+int moonlight_test_kv_length(const MoonlightSession *session, int layer) {
+    if (!session) return 0;
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    if (layer < 0 || layer >= config->layer_count) return 0;
+    return session->kv_lengths[layer];
+}
+
+int moonlight_test_copy_kv(const MoonlightSession *session, int layer,
+                           float *latent, float *rope, int capacity) {
+    if (!session || !latent || !rope || capacity < 0) return 0;
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    if (layer < 0 || layer >= config->layer_count ||
+        capacity < session->kv_lengths[layer]) return 0;
+    int length = session->kv_lengths[layer];
+    size_t latent_offset = (size_t)layer * session->options.context_size *
+                           config->kv_lora_rank;
+    size_t rope_offset = (size_t)layer * session->options.context_size *
+                         config->qk_rope_dim;
+    memcpy(latent, (float *)session->latent_kv.contents + latent_offset,
+           (size_t)length * config->kv_lora_rank * sizeof(float));
+    memcpy(rope, (float *)session->rope_kv.contents + rope_offset,
+           (size_t)length * config->qk_rope_dim * sizeof(float));
     return 1;
 }
