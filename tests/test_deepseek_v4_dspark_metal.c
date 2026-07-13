@@ -115,6 +115,89 @@ static int test_dense_q4_k(void **mapped_out) {
     return 0;
 }
 
+static int test_dense_f16_exact_rows(void **mapped_out) {
+    enum { ROWS = 512, COLS = 4096, TOKENS = 3 };
+    const size_t page_size = 16384u;
+    const size_t weight_bytes = (size_t)ROWS * COLS * sizeof(uint16_t);
+    const size_t map_bytes = (weight_bytes + page_size - 1u) & ~(page_size - 1u);
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, page_size, map_bytes) == 0);
+
+    static const uint16_t half_values[] = {
+        0x0000u, 0x3400u, 0xb400u, 0x3800u, 0xb800u, 0x3c00u, 0xbc00u,
+    };
+    uint16_t *weights = mapped;
+    for (int row = 0; row < ROWS; row++) {
+        for (int col = 0; col < COLS; col++) {
+            weights[(size_t)row * COLS + col] =
+                half_values[(row * 7 + col * 11 + (row ^ col)) %
+                            (int)(sizeof(half_values) / sizeof(half_values[0]))];
+        }
+    }
+
+    float *input = malloc((size_t)TOKENS * COLS * sizeof(*input));
+    float *batch = malloc((size_t)TOKENS * ROWS * sizeof(*batch));
+    float *rowwise = malloc((size_t)TOKENS * ROWS * sizeof(*rowwise));
+    CHECK(input && batch && rowwise);
+    for (int token = 0; token < TOKENS; token++) {
+        for (int col = 0; col < COLS; col++) {
+            input[(size_t)token * COLS + col] =
+                (float)(((token + 3) * (col + 5) + (token ^ col)) % 61 - 30) /
+                128.0f;
+        }
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(
+        (uint64_t)TOKENS * COLS * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+        (uint64_t)TOKENS * ROWS * sizeof(float));
+    ds4_gpu_tensor *x_one = ds4_gpu_tensor_alloc((uint64_t)COLS * sizeof(float));
+    ds4_gpu_tensor *out_one = ds4_gpu_tensor_alloc((uint64_t)ROWS * sizeof(float));
+    CHECK(x && out && x_one && out_one);
+    CHECK(ds4_gpu_set_model_map_range(mapped, map_bytes, 0, map_bytes,
+                                       weight_bytes));
+    CHECK(ds4_gpu_tensor_write(x, 0, input,
+                               (uint64_t)TOKENS * COLS * sizeof(float)));
+
+    ds4_gpu_kernel_stats before, after;
+    ds4_gpu_get_kernel_stats(&before);
+    ds4_gpu_set_tiny_decode_order(true);
+    CHECK(ds4_gpu_matmul_f16_tensor(out, mapped, map_bytes, 0,
+                                    COLS, ROWS, x, TOKENS));
+    CHECK(ds4_gpu_tensor_read(out, 0, batch,
+                              (uint64_t)TOKENS * ROWS * sizeof(float)));
+    for (int token = 0; token < TOKENS; token++) {
+        CHECK(ds4_gpu_tensor_write(x_one, 0, input + (size_t)token * COLS,
+                                   (uint64_t)COLS * sizeof(float)));
+        CHECK(ds4_gpu_matmul_f16_tensor(out_one, mapped, map_bytes, 0,
+                                        COLS, ROWS, x_one, 1));
+        CHECK(ds4_gpu_tensor_read(out_one, 0,
+                                  rowwise + (size_t)token * ROWS,
+                                  (uint64_t)ROWS * sizeof(float)));
+    }
+    ds4_gpu_set_tiny_decode_order(false);
+    ds4_gpu_get_kernel_stats(&after);
+
+    const float error = max_abs(batch, rowwise, (size_t)TOKENS * ROWS);
+    printf("DeepSeek V4 dense F16 exact rows Metal: max_abs=%.9g calls=%llu\n",
+           error,
+           (unsigned long long)(after.tiny_batch_exact_f16_calls -
+                                before.tiny_batch_exact_f16_calls));
+    CHECK(error == 0.0f);
+    CHECK(after.tiny_batch_exact_f16_calls ==
+          before.tiny_batch_exact_f16_calls + 1);
+
+    ds4_gpu_tensor_free(out_one);
+    ds4_gpu_tensor_free(x_one);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    free(rowwise);
+    free(batch);
+    free(input);
+    *mapped_out = mapped;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -129,6 +212,8 @@ int main(int argc, char **argv) {
     CHECK(ds4_gpu_init());
     void *q4_mapped = NULL;
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
+    void *f16_mapped = NULL;
+    CHECK(test_dense_f16_exact_rows(&f16_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -212,6 +297,7 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
+    free(f16_mapped);
     free(q4_mapped);
     return 0;
 }
