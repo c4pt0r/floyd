@@ -12,11 +12,10 @@ run_model() {
     name=$1
     model=$2
     set +e
-    printf '%s\n:exit\n' '请写一个简短的中文科幻故事。' |
-        env FLOYD_DEEPSEEK_V4_DS4_GGUF="$model" DSPARK_SPEC=0 \
-            DEEPSEEK_V4_CHAT_TRACE=1 \
-            ./floyd --model "$checkpoint" --ctx 128 --ngen "$tokens" \
-            >"$tmp/$name.stdout" 2>"$tmp/$name.stderr"
+    ./floyd run --model "$checkpoint" --ds4-model "$model" \
+        --prompt '请写一个简短的中文科幻故事。' --ctx 128 \
+        --ngen "$tokens" --draft 1 --trace \
+        >"$tmp/$name.stdout" 2>"$tmp/$name.stderr"
     status=$?
     set -e
     if test "$status" -ne 0; then

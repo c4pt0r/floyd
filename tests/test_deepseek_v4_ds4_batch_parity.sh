@@ -8,22 +8,20 @@ trap 'rm -rf "$tmp"' EXIT
 prompt='请写一个至少五百字的中文科幻故事，直接开始正文。'
 names='Qcur,KVcur,kqv_out,hc_attn_post,hc_ffn_post'
 
-env SNAP="$model" CHAT=1 DSPARK_SPEC=0 \
-    PROMPT="$prompt" CTX=256 NGEN=5 DEEPSEEK_V4_CHAT_TRACE=1 \
-    DS4_LOCK_FILE="$tmp/greedy.lock" \
+env DS4_LOCK_FILE="$tmp/greedy.lock" \
     DS4_METAL_GRAPH_DUMP_PREFIX="$tmp/greedy" \
     DS4_METAL_GRAPH_DUMP_NAME="$names" \
     DS4_METAL_GRAPH_DUMP_LAYER=all \
-    ./floyd >"$tmp/greedy.out" 2>"$tmp/greedy.trace"
+    ./floyd run --model "$model" --prompt "$prompt" --ctx 256 \
+    --ngen 5 --draft 1 --trace >"$tmp/greedy.out" 2>"$tmp/greedy.trace"
 
-env SNAP="$model" CHAT=1 DRAFT=4 \
-    PROMPT="$prompt" CTX=256 NGEN=5 DEEPSEEK_V4_CHAT_TRACE=1 \
-    FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD=0 \
+env FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD=0 \
     DS4_LOCK_FILE="$tmp/spec.lock" \
     DS4_METAL_GRAPH_DUMP_PREFIX="$tmp/spec" \
     DS4_METAL_GRAPH_DUMP_NAME="$names" \
     DS4_METAL_GRAPH_DUMP_LAYER=all \
-    ./floyd >"$tmp/spec.out" 2>"$tmp/spec.trace"
+    ./floyd run --model "$model" --prompt "$prompt" --ctx 256 \
+    --ngen 5 --draft 4 --trace >"$tmp/spec.out" 2>"$tmp/spec.trace"
 
 grep '^DEEPSEEK_V4_TOKEN ' "$tmp/greedy.trace" >"$tmp/greedy.ids"
 grep '^DEEPSEEK_V4_TOKEN ' "$tmp/spec.trace" >"$tmp/spec.ids"

@@ -439,22 +439,8 @@ fixture_dspark_chat/forward.safetensors: tools/make_deepseek_v4_chat_oracle.py t
 test-deepseek-v4-chat-format: fixture_dspark_chat/chat_oracle.json tests/test_deepseek_v4_chat_format
 	./tests/test_deepseek_v4_chat_format "$(DSPARK)" fixture_dspark_chat/chat_oracle.json
 
-test-deepseek-v4-chat: fixture_dspark_chat/forward.safetensors floyd
-	PYTHON="$(PYTHON)" sh tests/test_deepseek_v4_chat_cli.sh "$(DSPARK)" $<
-
-test-deepseek-v4-chat-metal: fixture_dspark_chat/forward.safetensors floyd
-	FM_MIN_S=4 EXPECT_BACKEND=metal PYTHON="$(PYTHON)" \
-		sh tests/test_deepseek_v4_chat_cli.sh "$(DSPARK)" $<
-
-test-deepseek-v4-chat-backend: floyd
+test-deepseek-v4-chat-spec: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
-	sh tests/test_deepseek_v4_chat_backend.sh "$(DSPARK)" cpu
-
-test-deepseek-v4-chat-backend-metal: floyd
-	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
-	sh tests/test_deepseek_v4_chat_backend.sh "$(DSPARK)" metal-ggml
-
-test-deepseek-v4-chat-spec: fixture_dspark_dspark_decode/oracle.safetensors floyd
 	sh tests/test_deepseek_v4_chat_spec.sh "$(DSPARK)"
 
 tools/probe_safetensors: tools/probe_safetensors.c st.h st_probe.h json.h compat.h

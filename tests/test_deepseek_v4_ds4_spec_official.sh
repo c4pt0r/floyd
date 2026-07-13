@@ -17,11 +17,12 @@ fi
 prompt=${PROMPT_TEXT:-写一个至少100字的中文故事。}
 run_chat() {
     prefix=$1
+    draft_flag=$2
+    shift
     shift
     set +e
-    printf '%s\n:exit\n' "$prompt" |
-        env "$@" DEEPSEEK_V4_CHAT_TRACE=1 \
-        ./floyd --model "$model" --ctx 512 --ngen "$tokens" \
+    env "$@" ./floyd run --model "$model" --prompt "$prompt" \
+        --ctx 512 --ngen "$tokens" --draft "$draft_flag" --trace \
         >"$prefix.stdout" 2>"$prefix.stderr"
     rc=$?
     set -e
@@ -31,9 +32,9 @@ run_chat() {
     fi
 }
 
-run_chat "$tmp/base" -u DSPARK_SPEC -u DRAFT \
+run_chat "$tmp/base" 1 -u DSPARK_SPEC -u DRAFT \
     -u FLOYD_DEEPSEEK_V4_DS4_MTP -u FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN
-run_chat "$tmp/spec" DSPARK_SPEC=1 DRAFT="$draft" \
+run_chat "$tmp/spec" "$draft" DSPARK_SPEC=1 \
     FLOYD_DEEPSEEK_V4_DS4_MTP="$mtp" \
     FLOYD_DEEPSEEK_V4_DS4_MTP_MARGIN="$margin"
 

@@ -10,11 +10,14 @@ prompt='请写一个至少五百字的中文科幻故事，直接开始正文。
 
 run_chat() {
     mode=$1
+    draft=$2
+    shift
     shift
     set +e
-    env SNAP="$model" CHAT=1 PROMPT="$prompt" CTX=256 NGEN="$tokens" \
-        DEEPSEEK_V4_CHAT_TRACE=1 DS4_LOCK_FILE="$tmp/$mode.lock" \
-        "$@" ./floyd >"$tmp/$mode.out" 2>"$tmp/$mode.trace"
+    env DS4_LOCK_FILE="$tmp/$mode.lock" "$@" \
+        ./floyd run --model "$model" --prompt "$prompt" --ctx 256 \
+        --ngen "$tokens" --draft "$draft" --trace \
+        >"$tmp/$mode.out" 2>"$tmp/$mode.trace"
     rc=$?
     set -e
     if test "$rc" -ne 0; then
@@ -23,8 +26,8 @@ run_chat() {
     fi
 }
 
-run_chat spec DRAFT=2 FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD=0
-run_chat greedy DSPARK_SPEC=0
+run_chat spec 2 FLOYD_DEEPSEEK_V4_DS4_CONFIDENCE_THRESHOLD=0
+run_chat greedy 1
 
 sed -n 's/^DEEPSEEK_V4_TOKEN /token /p' "$tmp/spec.trace" >"$tmp/spec.ids"
 sed -n 's/^DEEPSEEK_V4_TOKEN /token /p' "$tmp/greedy.trace" >"$tmp/greedy.ids"

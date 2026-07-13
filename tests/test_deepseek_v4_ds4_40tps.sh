@@ -12,15 +12,14 @@ greedy_ids=$(mktemp /tmp/floyd-ds4-40tps-greedy-ids.XXXXXX)
 lock=$(mktemp /tmp/floyd-ds4-40tps-lock.XXXXXX)
 trap 'rm -f "$out" "$trace" "$greedy_out" "$greedy_trace" "$spec_ids" "$greedy_ids" "$lock"' EXIT
 
-env SNAP="$model" CHAT=1 \
-    PROMPT='请写一个至少五百字的中文科幻故事，直接开始正文。' \
-    CTX=256 NGEN="$tokens" DRAFT=3 DEEPSEEK_V4_CHAT_TRACE=1 \
-    DS4_LOCK_FILE="$lock" ./floyd >"$out" 2>"$trace"
+DS4_LOCK_FILE="$lock" ./floyd run --model "$model" \
+    --prompt '请写一个至少五百字的中文科幻故事，直接开始正文。' \
+    --ctx 256 --ngen "$tokens" --draft 3 --trace >"$out" 2>"$trace"
 
-env SNAP="$model" CHAT=1 DSPARK_SPEC=0 \
-    PROMPT='请写一个至少五百字的中文科幻故事，直接开始正文。' \
-    CTX=256 NGEN="$tokens" DEEPSEEK_V4_CHAT_TRACE=1 \
-    DS4_LOCK_FILE="$lock" ./floyd >"$greedy_out" 2>"$greedy_trace"
+DS4_LOCK_FILE="$lock" ./floyd run --model "$model" \
+    --prompt '请写一个至少五百字的中文科幻故事，直接开始正文。' \
+    --ctx 256 --ngen "$tokens" --draft 1 --trace \
+    >"$greedy_out" 2>"$greedy_trace"
 
 perf=$(grep '^DEEPSEEK_V4_PERF ' "$trace")
 printf '%s\n' "$perf" | grep -q ' verify_layer_execute_ms=[0-9]'
