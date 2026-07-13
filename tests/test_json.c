@@ -12,10 +12,11 @@
 } while (0)
 
 int main(void) {
-    jval *root = json_parse(
+    char error[128] = {0};
+    jval *root = json_parse_full(
         "{\"name\":\"Colibri\\nCPU\",\"enabled\":true,\"empty\":null,"
         "\"values\":[1,-2.5,3e2],\"unicode\":\"\\u03bb \\uD83D\\uDE80\"}",
-        NULL
+        error, sizeof(error)
     );
 
     CHECK(root && root->t == J_OBJ);
@@ -30,6 +31,15 @@ int main(void) {
     CHECK(values->kids[1]->num == -2.5);
     CHECK(values->kids[2]->num == 300.0);
     CHECK(strcmp(json_get(root, "unicode")->str, "λ 🚀") == 0);
+    json_free(root);
+
+    root = json_parse_full("{\"ok\":true} trailing", error, sizeof(error));
+    CHECK(root == NULL);
+    CHECK(strstr(error, "trailing") != NULL);
+
+    root = json_parse_full("{\"broken\":", error, sizeof(error));
+    CHECK(root == NULL);
+    CHECK(error[0] != 0);
 
     puts("json tests: ok");
     return 0;

@@ -87,7 +87,7 @@ FLOYD_LINK = $(CXX)
 LDFLAGS += -pthread -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
 endif
 
-TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_hc tests/test_deepseek_v4_quant tests/test_st_probe
+TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_hc tests/test_deepseek_v4_quant tests/test_st_probe tests/test_deepseek_v4_serve_protocol
 
 all: floyd
 
@@ -179,6 +179,9 @@ metal-test: backend_metal.o tests/test_backend_metal.c backend_metal.h
 
 tests/test_json: tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_deepseek_v4_serve_protocol: tests/test_deepseek_v4_serve_protocol.c deepseek_v4_serve.c deepseek_v4_serve.h json.h
+	$(CC) $(CFLAGS) tests/test_deepseek_v4_serve_protocol.c deepseek_v4_serve.c -o $@ $(LDFLAGS)
 
 tests/test_st: tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -510,6 +513,6 @@ test-deepseek-v4-forward: fixture_dspark_layer0/oracle.safetensors fixture_dspar
 	./tests/test_deepseek_v4_forward "$(DSPARK)" fixture_dspark_layer0 fixture_dspark_layers_0_2 fixture_dspark_layer3_hca fixture_dspark_layers_3_4 fixture_dspark_base_forward fixture_dspark_dspark
 
 clean:
-	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_moe_fixture tests/test_deepseek_v4_hc tests/test_deepseek_v4_hc_fixture tests/test_deepseek_v4_attention_fixture tests/test_deepseek_v4_compress_fixture tests/test_deepseek_v4_indexer_fixture tests/test_deepseek_v4_kv_cache_fixture tests/test_deepseek_v4_quant tests/test_deepseek_v4_native_quant tests/test_deepseek_v4_native_quant_metal tests/test_deepseek_v4_model_manifest tests/test_deepseek_v4_forward tests/test_deepseek_v4_decode tests/test_deepseek_v4_dspark_decode tests/test_deepseek_v4_dspark_metal tests/test_deepseek_v4_dspark_session tests/test_deepseek_v4_dspark_support tests/test_deepseek_v4_spec_runtime tests/test_deepseek_v4_ds4 tests/test_deepseek_v4_ggml tests/test_deepseek_v4_ggml_official tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_deepseek_v4_chat_format tools/probe_safetensors
+	rm -f floyd *.o kernels_metal.h tests/test_json tests/test_st tests/test_moe_route tests/test_moe_exec tests/test_deepseek_v4_moe_fixture tests/test_deepseek_v4_hc tests/test_deepseek_v4_hc_fixture tests/test_deepseek_v4_attention_fixture tests/test_deepseek_v4_compress_fixture tests/test_deepseek_v4_indexer_fixture tests/test_deepseek_v4_kv_cache_fixture tests/test_deepseek_v4_quant tests/test_deepseek_v4_native_quant tests/test_deepseek_v4_native_quant_metal tests/test_deepseek_v4_model_manifest tests/test_deepseek_v4_forward tests/test_deepseek_v4_decode tests/test_deepseek_v4_dspark_decode tests/test_deepseek_v4_dspark_metal tests/test_deepseek_v4_dspark_session tests/test_deepseek_v4_dspark_support tests/test_deepseek_v4_spec_runtime tests/test_deepseek_v4_ds4 tests/test_deepseek_v4_ggml tests/test_deepseek_v4_ggml_official tests/test_deepseek_v4_serve_protocol tests/test_st_probe tests/test_backend_metal tests/test_tok_moon tests/test_deepseek_v4_chat_format tools/probe_safetensors
 
 .PHONY: all floyd prepare-deepseek-v4-gguf test-c test-tok test-cli-default-chat test-deepseek-v4-naming test-deepseek-v4-chat-dispatch test-deepseek-v4-attention test-deepseek-v4-chat test-deepseek-v4-chat-metal test-deepseek-v4-chat-backend test-deepseek-v4-chat-backend-metal test-deepseek-v4-chat-format test-deepseek-v4-chat-spec test-deepseek-v4-compress test-deepseek-v4-dspark-decode test-deepseek-v4-dspark-manifest test-deepseek-v4-dspark-metal test-deepseek-v4-dspark-session test-deepseek-v4-dspark-quantizer test-deepseek-v4-dspark-support test-deepseek-v4-ds4 test-deepseek-v4-ds4-40tps test-deepseek-v4-ds4-draft2-tail test-deepseek-v4-ds4-batch-parity test-deepseek-v4-ds4-q8-pair test-deepseek-v4-ds4-official test-deepseek-v4-ds4-spec-official test-deepseek-v4-ggml test-deepseek-v4-ggml-official test-deepseek-v4-hc test-deepseek-v4-indexer test-deepseek-v4-kv-cache test-deepseek-v4-mxfp4 test-deepseek-v4-model-manifest test-deepseek-v4-moe test-deepseek-v4-native-quant test-deepseek-v4-native-quant-metal test-deepseek-v4-oracle test-deepseek-v4-decode test-deepseek-v4-forward test-deepseek-v4-forward-oracle test-deepseek-v4-spec-runtime test-prepare-deepseek-v4-gguf metal-test clean portable
