@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
         .max_tokens = 1,
         .temperature = 0.0f,
         .top_p = 1.0f,
-        .draft = 3,
+        .draft = 2,
     };
     Output first_output = {0}, second_output = {0};
     DeepSeekV4Ds4Stats first_stats, second_stats;
