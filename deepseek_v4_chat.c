@@ -90,6 +90,22 @@ static void deepseek_v4_chat_ds4_perf(const DeepSeekV4Ds4Stats *stats) {
             stats->speculative_verify_head_ms,
             stats->speculative_verify_read_ms,
             stats->speculative_replay_ms);
+    fprintf(stderr,
+            "DEEPSEEK_V4_SCHEDULE d1c1=%llu/%.3f "
+            "d2c1=%llu/%.3f d2c2=%llu/%.3f "
+            "d3c1=%llu/%.3f d3c2=%llu/%.3f d3c3=%llu/%.3f\n",
+            stats->speculative_verify_outcome_calls[1][1],
+            stats->speculative_verify_outcome_ms[1][1],
+            stats->speculative_verify_outcome_calls[2][1],
+            stats->speculative_verify_outcome_ms[2][1],
+            stats->speculative_verify_outcome_calls[2][2],
+            stats->speculative_verify_outcome_ms[2][2],
+            stats->speculative_verify_outcome_calls[3][1],
+            stats->speculative_verify_outcome_ms[3][1],
+            stats->speculative_verify_outcome_calls[3][2],
+            stats->speculative_verify_outcome_ms[3][2],
+            stats->speculative_verify_outcome_calls[3][3],
+            stats->speculative_verify_outcome_ms[3][3]);
 }
 
 static int deepseek_v4_chat_run_ds4(const DeepSeekV4ChatOptions *options,

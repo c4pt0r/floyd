@@ -1,0 +1,41 @@
+--- a/ds4.h
++++ b/ds4.h
+@@ -67,6 +67,8 @@
+     double verify_head_ms;
+     double verify_read_ms;
+     double replay_ms;
++    uint64_t verify_outcome_calls[7][7];
++    double verify_outcome_ms[7][7];
+ } ds4_session_spec_stats;
+ 
+ typedef struct {
+--- a/ds4.c
++++ b/ds4.c
+@@ -28496,6 +28496,7 @@
+         ds4_dspark_snapshot_required((uint32_t)start, (uint32_t)draft_n) != 0;
+     bool have_frontier = false;
+     bool ok = true;
++    double verify_elapsed_ms = 0.0;
+     if (snapshot_required) {
+         have_frontier = spec_frontier_snapshot(&frontier, s);
+         ok = have_frontier;
+@@ -28516,13 +28517,18 @@
+                                              row_tops,
+                                              NULL,
+                                              &s->spec_stats);
+-        s->spec_stats.verify_ms += (now_sec() - verify_started) * 1000.0;
++        verify_elapsed_ms = (now_sec() - verify_started) * 1000.0;
++        s->spec_stats.verify_ms += verify_elapsed_ms;
+     }
+ 
+     int commit = ok ? 1 : 0;
+     for (int i = 1; ok && i < draft_n; i++) {
+         if (row_tops[i - 1] != s->dspark_proposals[i]) break;
+         commit++;
++    }
++    if (draft_n >= 0 && draft_n <= 6 && commit >= 0 && commit <= 6) {
++        s->spec_stats.verify_outcome_calls[draft_n][commit]++;
++        s->spec_stats.verify_outcome_ms[draft_n][commit] += verify_elapsed_ms;
+     }
+     if (ok && commit == draft_n) {
+         ok = metal_graph_read_spec_logits_row(&s->graph,

@@ -45,6 +45,8 @@ typedef struct {
     double speculative_verify_head_ms;
     double speculative_verify_read_ms;
     double speculative_replay_ms;
+    unsigned long long speculative_verify_outcome_calls[7][7];
+    double speculative_verify_outcome_ms[7][7];
 } DeepSeekV4Ds4Stats;
 
 const char *deepseek_v4_ds4_backend_name(void);

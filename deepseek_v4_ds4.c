@@ -548,6 +548,16 @@ int deepseek_v4_ds4_generate_user(
                 spec_after.verify_read_ms - spec_before.verify_read_ms;
             stats->speculative_replay_ms =
                 spec_after.replay_ms - spec_before.replay_ms;
+            for (int draft = 0; draft <= 6; draft++) {
+                for (int commit = 0; commit <= 6; commit++) {
+                    stats->speculative_verify_outcome_calls[draft][commit] =
+                        spec_after.verify_outcome_calls[draft][commit] -
+                        spec_before.verify_outcome_calls[draft][commit];
+                    stats->speculative_verify_outcome_ms[draft][commit] =
+                        spec_after.verify_outcome_ms[draft][commit] -
+                        spec_before.verify_outcome_ms[draft][commit];
+                }
+            }
         }
     }
     return generated;
