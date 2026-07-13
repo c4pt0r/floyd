@@ -70,6 +70,12 @@ int main(int argc, char **argv) {
     ds4_session *session = NULL;
     char error[4096] = {0};
     CHECK(ds4_engine_open(&engine, &options) == 0);
+    CHECK(ds4_engine_mtp_draft_tokens(engine) == 4);
+    CHECK(!ds4_engine_set_mtp_draft_tokens(engine, 1));
+    CHECK(!ds4_engine_set_mtp_draft_tokens(engine, 17));
+    CHECK(ds4_engine_set_mtp_draft_tokens(engine, 2));
+    CHECK(ds4_engine_mtp_draft_tokens(engine) == 2);
+    CHECK(ds4_engine_set_mtp_draft_tokens(engine, 4));
     CHECK(ds4_session_create(&session, engine, 64) == 0);
 
     int prompt_ids[] = {0, 128803, 33310, 128804, 128822};
