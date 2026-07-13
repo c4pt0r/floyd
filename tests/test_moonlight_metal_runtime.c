@@ -249,6 +249,23 @@ int main(int argc, char **argv) {
     if (max_prefill_ms) CHECK(after.prefill_ms <= strtod(max_prefill_ms, NULL));
     if (max_decode_ms) CHECK(after.decode_ms <= strtod(max_decode_ms, NULL));
 
+    moonlight_session_reset(session);
+    int split = (int)id_count / 2;
+    CHECK(split > 0 && split < id_count);
+    CHECK(moonlight_session_prefill(session, ids, split, logits,
+                                    error, sizeof(error)) == 1);
+    CHECK(moonlight_session_append(session, ids + split,
+                                   (int)id_count - split, logits,
+                                   error, sizeof(error)) == 1);
+    logit_error = max_abs(logits,
+                          expected_logits + (id_count - 1) * info.vocab_size,
+                          info.vocab_size);
+    printf("Moonlight Metal append: logits=%.9g position=%d\n",
+           logit_error, moonlight_session_position(session));
+    CHECK(logit_error < 3e-4f);
+    CHECK(argmax(logits, info.vocab_size) == greedy[0]);
+    CHECK(moonlight_session_position(session) == id_count);
+
     free(ids64);
     free(ids);
     free(expected_logits);
