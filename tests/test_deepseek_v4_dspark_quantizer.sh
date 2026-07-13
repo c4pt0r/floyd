@@ -16,6 +16,8 @@ PYTHONPATH="$ROOT:$ROOT/.deps/llama.cpp/gguf-py" "$PYTHON" \
     > "$TMP/manifest.json"
 
 make -C "$DS4_DIR/gguf-tools" deepseek4-quantize >/dev/null
+"$QUANTIZER" --hf "$DSPARK" --template "$TMP/template.gguf" \
+    --copy-unchanged --dry-run >/dev/null
 map_tensor() {
     "$QUANTIZER" --hf "$DSPARK" --template "$TMP/template.gguf" \
         --map-tensor "$1"
