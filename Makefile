@@ -23,6 +23,7 @@ endif
 
 METAL    ?= 0
 METAL_OBJ =
+MOONLIGHT_METAL_OBJ =
 DEEPSEEK_V4_GGML_OBJ =
 DEEPSEEK_V4_DS4_OBJ =
 FLOYD_OBJ = floyd.o
@@ -80,6 +81,7 @@ $(error METAL=1 e' supportato solo su macOS)
 endif
 CFLAGS  += -DFLOYD_METAL
 METAL_OBJ = backend_metal.o
+MOONLIGHT_METAL_OBJ = moonlight_model.o moonlight_metal.o moonlight_chat.o
 CFLAGS  += -DFLOYD_DEEPSEEK_V4_GGML
 CFLAGS  += -DFLOYD_DEEPSEEK_V4_DS4
 DEEPSEEK_V4_GGML_OBJ = deepseek_v4_ggml.o
@@ -96,8 +98,9 @@ all: floyd
 
 DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h
 
-floyd: $(FLOYD_OBJ) $(MOONLIGHT_ORACLE_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
+floyd: $(FLOYD_OBJ) $(MOONLIGHT_ORACLE_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(METAL_OBJ) $(MOONLIGHT_METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
 	$(FLOYD_LINK) $(FLOYD_OBJ) $(MOONLIGHT_ORACLE_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(METAL_OBJ) \
+		$(MOONLIGHT_METAL_OBJ) \
 		$(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) \
 		$(if $(DEEPSEEK_V4_GGML_OBJ),$(LLAMA_STATIC_LIBS)) \
 		$(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS)) \
@@ -106,7 +109,7 @@ floyd: $(FLOYD_OBJ) $(MOONLIGHT_ORACLE_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V
 floyd.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) moonlight_oracle.h st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-floyd_metal.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) moonlight_oracle.h st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
+floyd_metal.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) moonlight_chat.h moonlight_oracle.h st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 moonlight_oracle.o: moonlight_oracle.c moonlight_oracle.h
@@ -117,6 +120,9 @@ moonlight_model.o: moonlight_model.c moonlight_model.h st.h json.h compat.h
 
 moonlight_metal.o: moonlight_metal.m moonlight_metal.h moonlight_model.h moonlight_kernels_metal.h
 	clang -O2 -fobjc-arc -c $< -o $@
+
+moonlight_chat.o: moonlight_chat.c moonlight_chat.h moonlight_metal.h tok.h tok_unicode.h tok_moon.h json.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 moonlight_kernels_metal.h: moonlight_kernels.metal
 	xxd -i $< > $@

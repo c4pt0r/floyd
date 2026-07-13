@@ -35,6 +35,9 @@
 #include "moe_route.h"
 #include "tok_moon.h"                              /* tokenizer moonshot (Chat-Task 4): mtok_*, template builders */
 #include "deepseek_v4_chat.h"
+#ifdef FLOYD_METAL
+#include "moonlight_chat.h"
+#endif
 #include "moonlight_oracle.h"
 #ifdef COLI_CUDA
 #include <omp.h>
@@ -2755,6 +2758,27 @@ int main(int argc, char **argv){
         };
         return deepseek_v4_chat_run(&options);
     }
+#ifdef FLOYD_METAL
+    if ((getenv("CHAT") || getenv("PROMPT")) &&
+        moonlight_metal_model_dir(snap)) {
+        const char *draft = getenv("DRAFT");
+        if (draft && atoi(draft) > 0) {
+            fprintf(stderr, "Moonlight does not support --draft\n");
+            return 2;
+        }
+        MoonlightChatOptions options = {
+            .model_dir = snap,
+            .system_prompt = getenv("SYSTEM") ? getenv("SYSTEM")
+                                                : "You are a helpful assistant",
+            .max_context = getenv("CTX") ? atoi(getenv("CTX")) : 4096,
+            .max_new_tokens = getenv("NGEN") ? atoi(getenv("NGEN"))
+                                               : (getenv("PROMPT") ? 256 : 512),
+            .temperature = getenv("TEMP") ? atof(getenv("TEMP")) : 0.7f,
+            .top_p = getenv("NUCLEUS") ? atof(getenv("NUCLEUS")) : 0.90f,
+        };
+        return moonlight_chat_run(&options);
+    }
+#endif
 #ifdef FLOYD_METAL
     g_metal = (getenv("FLOYD_METAL") && atoi(getenv("FLOYD_METAL"))) ? 1 : 0;
     g_metal_min_s = getenv("FM_MIN_S") ? atoi(getenv("FM_MIN_S")) : 8;
