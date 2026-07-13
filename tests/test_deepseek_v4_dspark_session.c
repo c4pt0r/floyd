@@ -40,6 +40,10 @@ int main(int argc, char **argv) {
               confidence_cases, 3, 0.9f) == 0);
     CHECK(ds4_dspark_confident_prefix_length(
               confidence_cases, 3, 0.2f) == 3);
+    CHECK(ds4_dspark_confident_prefix_length_staged(
+              confidence_cases, 3, 0.5f, 0.2f) == 3);
+    CHECK(ds4_dspark_confident_prefix_length_staged(
+              confidence_cases, 3, 0.5f, 0.48f) == 1);
 
     shards oracle;
     st_init(&oracle, argv[3]);
