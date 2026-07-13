@@ -53,7 +53,7 @@ static void similarity(const float *actual, const float *expected, size_t count,
 }
 
 static int test_dense_q4_k(void **mapped_out) {
-    enum { ROWS = 8, COLS = 256, TOKENS = 2, MAP_BYTES = 4096 };
+    enum { ROWS = 8, COLS = 256, TOKENS = 2, MAP_BYTES = 16384 };
     void *mapped = NULL;
     CHECK(posix_memalign(&mapped, MAP_BYTES, MAP_BYTES) == 0);
     memset(mapped, 0, MAP_BYTES);
