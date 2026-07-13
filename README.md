@@ -1,13 +1,15 @@
 # floyd
 
-**Same native engine, an even bigger model.** `floyd` runs **Moonlight-16B-A3B**
-(moonshotai, `deepseek_v3` architecture — MLA attention, 64-expert
+**Native MoE inference in C.** `floyd` runs **Moonlight-16B-A3B** and the
+official **DeepSeek-V4-Flash-DSpark** checkpoint. Moonlight uses the
+`deepseek_v3` architecture (MLA attention, 64-expert
 sigmoid/`noaux_tc` MoE router, 2 shared experts) in pure C, with the same
 methodology as [colibrì](https://github.com/JustVugg/colibri): offline
 BF16 → int8/int4 conversion, streamed experts with an LRU cache, and
 token-exact parity validation against a `transformers` oracle. An optional
 Metal backend adds Apple Silicon GPU acceleration on the batch (prefill/TF)
-matmul path.
+matmul path; DeepSeek V4 uses the resident DS4 Metal runtime for prefill and
+decode.
 
 *Stesso motore, un modello diverso.*
 
@@ -75,43 +77,87 @@ sqrt-softplus routing; it is a correctness target, not a performance model.
 Physical layers 0 and 1 in the official checkpoint are sliding-only; the first
 CSA/Lightning Indexer block integration point is layer 2.
 
-Prepare the optimized resident DeepSeek V4 Metal chat path against the official
-checkpoint. Model files and pinned runtime checkouts are local ignored
-artifacts; neither is committed:
+## DeepSeek V4 quickstart
+
+Download the official checkpoint and prepare the resident DS4 GGUF files. The
+Python environment is used only for download/conversion; `floyd` inference does
+not start Python or another inference process.
 
 ```bash
-make prepare-deepseek-v4-ds4 DSPARK=/path/to/DeepSeek-V4-Flash-DSpark
+.venv/bin/pip install -q -U "huggingface_hub[cli]"
+.venv/bin/hf download deepseek-ai/DeepSeek-V4-Flash-DSpark \
+  --local-dir models/DeepSeek-V4-Flash-DSpark
 
+make prepare-deepseek-v4-ds4 \
+  DSPARK="$PWD/models/DeepSeek-V4-Flash-DSpark"
 make METAL=1 floyd
-./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
-
-# hardware performance gate (defaults to 16 generated tokens and 30 tok/s)
-make METAL=1 test-deepseek-v4-ds4-official \
-  DSPARK=/path/to/DeepSeek-V4-Flash-DSpark NGEN=128 MIN_TPS=30
-
-# prepare and explicitly select the slower exact native-MXFP4 fallback
-PYTHON=.venv/bin/python make prepare-deepseek-v4-gguf \
-  DSPARK=/path/to/DeepSeek-V4-Flash-DSpark
-FLOYD_DEEPSEEK_V4_GGUF=/path/to/model-mxfp4_moe-00001-of-00004.gguf \
-  ./floyd --model /path/to/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
-
-# explicit slow safetensors correctness path
-PROMPT=hello NGEN=1 DEEPSEEK_V4_CHAT_TRACE=1 \
-  FLOYD_DEEPSEEK_V4_REFERENCE=1 \
-  SNAP=/path/to/DeepSeek-V4-Flash-DSpark CHAT=1 CTX=64 ./floyd
 ```
 
-The default production path statically links the pinned DS4 engine, mmap-resides
-the Q2-imatrix GGUF, warms its mapped pages, and runs the full DeepSeek V4 graph
-on Metal. On a 512 GB M3 Ultra, the command above measured 35.998 tok/s over a
-128-token Chinese story (the exact MXFP4 fallback measured 19.884 tok/s over 16
-tokens). Startup prints `DEEPSEEK_V4_BACKEND backend=metal-ds4`; each turn prints
-measured prompt and decode throughput. It supports the official chat prompt,
-incremental compressed KV state, streaming decode, `:reset`, and `:exit`, with
-no Python or inference subprocess. Set `FLOYD_DEEPSEEK_V4_DS4_MTP` to a prepared
-DS4 MTP GGUF and pass `--draft` to opt into speculative decoding. The exact ggml
-runtime remains selectable through `FLOYD_DEEPSEEK_V4_GGUF`, and the old
-safetensors oracle remains behind `FLOYD_DEEPSEEK_V4_REFERENCE=1`.
+The preparation command writes ignored files under
+`models/DeepSeek-V4-Flash-DSpark-DS4/`. Standard filenames are discovered
+automatically. Use `--ds4-model FILE` and `--ds4-support FILE` only for custom
+locations.
+
+```bash
+# Interactive chat
+./floyd chat --model models/DeepSeek-V4-Flash-DSpark \
+  --ctx 4096 --ngen 512 --draft 3
+
+# One-shot generation
+./floyd run --model models/DeepSeek-V4-Flash-DSpark \
+  --prompt "Write a concise release note." --ctx 4096 --ngen 256 --draft 3
+
+# Persistent JSONL server for agents
+./floyd serve --stdio --model models/DeepSeek-V4-Flash-DSpark \
+  --ctx 8192 --ngen 512 --draft 3 --prefix-cache-mb 256
+```
+
+`serve --stdio` reads one JSON request per line and writes one JSON response per
+line. Keep the process running to reuse model state and shared prompt prefixes.
+Diagnostics go to stderr; stdout remains JSONL.
+
+```json
+{"id":"a","system":"You are a coding agent.","prompt":"Inspect the build.","max_tokens":128,"draft":2}
+{"id":"b","system":"You are a coding agent.","prompt":"Inspect the tests.","max_tokens":128,"draft":2}
+```
+
+Requests may use `messages` instead of `prompt`/`system`, and may set
+`temperature`, `top_p`, and `draft`. Sampling automatically uses ordinary
+decode when `draft` is omitted; explicitly combining sampling with `draft > 1`
+returns a per-request error.
+
+The prefix LRU defaults to 256 MiB and allocates snapshots lazily. Its budget is
+hard: oversized snapshots are skipped without failing inference, and insertion
+also preserves 1 GiB of measurable free host memory. On memory-constrained
+machines, reduce context first and then cache size, for example
+`--ctx 4096 --prefix-cache-mb 64`; pass `--prefix-cache-mb 0` to disable prefix
+snapshots entirely. This does not reduce the memory required to keep model
+weights resident.
+
+Run the hardware performance and agent-cache checks locally when needed:
+
+```bash
+make METAL=1 test-deepseek-v4-ds4-official \
+  DSPARK="$PWD/models/DeepSeek-V4-Flash-DSpark" NGEN=128 MIN_TPS=30
+make METAL=1 test-deepseek-v4-serve-official \
+  DSPARK="$PWD/models/DeepSeek-V4-Flash-DSpark"
+```
+
+The default production path statically links the pinned DS4 engine, warms the
+prepared model, and runs the full graph on Metal. Startup identifies
+`backend=metal-ds4`; chat and run report measured prompt/decode throughput.
+The exact ggml and safetensors oracle paths remain developer fallbacks, not the
+documented production path.
+
+For an exact native-MXFP4 fallback used in correctness work:
+
+```bash
+PYTHON=.venv/bin/python make prepare-deepseek-v4-gguf \
+  DSPARK="$PWD/models/DeepSeek-V4-Flash-DSpark"
+
+FLOYD_DEEPSEEK_V4_GGUF=/path/to/model-mxfp4_moe-00001-of-00004.gguf \
+  ./floyd chat --model models/DeepSeek-V4-Flash-DSpark --ctx 512 --ngen 16
+```
 
 ## What's *not* here (scope)
 
@@ -141,7 +187,8 @@ with no Python in the loop. See the Quickstart and CLI reference below.
 `chat` runtime by default. Both use the same `›` input prompt, `◆` output
 prompt, `:reset`, and `:exit`. It also provides
 `run` (single-shot),
-`tf`/`gen` (teacher-forcing / greedy parity checks vs a Python oracle). Every
+`serve --stdio` (persistent JSONL), and `tf`/`gen` (teacher-forcing / greedy
+parity checks vs a Python oracle). Every
 command needs `--model DIR` pointing at a converted container or a raw HF
 checkpoint directory.
 
@@ -244,6 +291,7 @@ uso: floyd --model DIR [flags] | floyd <comando> [flags]
 comandi:
   chat   conversazione interattiva     floyd --model DIR (predefinito)
   run    generazione singola           floyd run  --model DIR --prompt "..."
+  serve  JSONL persistente su stdio    floyd serve --stdio --model DIR
   tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json
   gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json
   help   questo testo
@@ -252,6 +300,8 @@ flags globali:  --model DIR (obbligatorio) | --cap N (64) | --ebits 4|8|16 (8)
   --dbits 4|8|16 (8) | --ram GB | --metal
 chat/run:  --ngen N (chat Moonlight:512, DeepSeek V4:16; run:256)
   --ctx N (Moonlight:4096, DeepSeek V4:512) | --draft N
+serve:     --stdio (obbligatorio) | --prefix-cache-mb N (256; 0 disattiva)
+DeepSeek V4: --ds4-model FILE | --ds4-support FILE | --trace
 Moonlight: --temp T (0.7) | --top-p P (0.90) | --system "..."
 run:       --prompt "..." (obbligatorio)
 chat:      --no-kvsave (Moonlight; DeepSeek V4 non persiste ancora la KV)
@@ -263,7 +313,8 @@ variabili d'ambiente: interfaccia legacy/debug (IDOT, DSA, MTP, PILOT, STATS, ..
 
 (Italian in the tool's own output; English gloss: `chat` = interactive
 conversation, `run` = single generation, `tf` = teacher-forcing vs oracle,
-`gen` = greedy vs oracle. `--cap` is the per-layer expert LRU cache size,
+`gen` = greedy vs oracle, and `serve` = persistent JSONL on stdin/stdout.
+`--cap` is the per-layer expert LRU cache size,
 `--ebits`/`--dbits` are expert/dense quantization bit-widths, `--ref` is the
 oracle reference JSON, required by `tf`/`gen` and rejected (exit 2) for
 `chat`/`run`, `--draft` is the n-gram speculative-decoding draft window,
