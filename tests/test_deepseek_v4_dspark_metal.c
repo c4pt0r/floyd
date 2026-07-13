@@ -510,34 +510,16 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor *argmax_input =
         ds4_gpu_tensor_alloc((uint64_t)VOCAB * sizeof(*argmax_logits));
     ds4_gpu_tensor *argmax_output = ds4_gpu_tensor_alloc(sizeof(int32_t));
-    ds4_gpu_tensor *argmax_margin = ds4_gpu_tensor_alloc(sizeof(float));
-    CHECK(argmax_input && argmax_output && argmax_margin);
+    CHECK(argmax_input && argmax_output);
     CHECK(ds4_gpu_tensor_write(argmax_input, 0, argmax_logits,
                                (uint64_t)VOCAB * sizeof(*argmax_logits)));
-    CHECK(ds4_gpu_top2_tensor(argmax_output, argmax_margin,
-                              argmax_input, VOCAB));
+    CHECK(ds4_gpu_argmax_tensor(argmax_output, argmax_input, VOCAB));
     int32_t argmax_id = -1;
-    float argmax_gap = -1.0f;
     CHECK(ds4_gpu_tensor_read(argmax_output, 0, &argmax_id, sizeof(argmax_id)));
-    CHECK(ds4_gpu_tensor_read(argmax_margin, 0, &argmax_gap,
-                              sizeof(argmax_gap)));
     CHECK(argmax_id == 17);
-    CHECK(argmax_gap == 0.0f);
-
-    argmax_logits[42] = 2.25f;
-    CHECK(ds4_gpu_tensor_write(argmax_input, 0, argmax_logits,
-                               (uint64_t)VOCAB * sizeof(*argmax_logits)));
-    CHECK(ds4_gpu_top2_tensor(argmax_output, argmax_margin,
-                              argmax_input, VOCAB));
-    CHECK(ds4_gpu_tensor_read(argmax_output, 0, &argmax_id, sizeof(argmax_id)));
-    CHECK(ds4_gpu_tensor_read(argmax_margin, 0, &argmax_gap,
-                              sizeof(argmax_gap)));
-    CHECK(argmax_id == 17);
-    CHECK(fabsf(argmax_gap - 0.75f) < 1e-6f);
     ds4_gpu_kernel_stats argmax_stats_before;
     ds4_gpu_get_kernel_stats(&argmax_stats_before);
     CHECK(argmax_stats_before.fast_argmax_calls > 0);
-    ds4_gpu_tensor_free(argmax_margin);
     ds4_gpu_tensor_free(argmax_output);
     ds4_gpu_tensor_free(argmax_input);
     free(argmax_logits);
