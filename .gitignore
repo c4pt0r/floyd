@@ -36,6 +36,9 @@ tests/test_deepseek_v4_ggml
 tests/test_deepseek_v4_ggml_official
 tests/test_deepseek_v4_ds4
 tests/test_deepseek_v4_ds4_q8_pair
+tests/test_deepseek_v4_serve_protocol
+tests/test_deepseek_v4_prefix_cache
+tests/test_deepseek_v4_serve_stdio
 tools/probe_safetensors
 kernels_metal.h
 fixture_tiny*/
