@@ -215,6 +215,165 @@ static inline float moonlight_weight_value(device const uchar *weight,
     return float(value) * weight_scale[row];
 }
 
+kernel void moonlight_attention_absorb_query(
+        device const float *query [[buffer(0)]],
+        device const uchar *kv_b_weight [[buffer(1)]],
+        device const float *kv_b_scale [[buffer(2)]],
+        device float *absorbed_query [[buffer(3)]],
+        constant uint *shape [[buffer(4)]],
+        uint index [[thread_position_in_grid]]) {
+    uint rows = shape[0];
+    uint heads = shape[1];
+    uint nope_width = shape[2];
+    uint rope_width = shape[3];
+    uint value_width = shape[4];
+    uint latent_width = shape[5];
+    uint weight_format = shape[6];
+    if (index >= rows * heads * latent_width) return;
+    uint latent = index % latent_width;
+    uint query_index = index / latent_width;
+    uint head = query_index % heads;
+    uint query_offset = query_index * (nope_width + rope_width);
+    uint weight_row = head * (nope_width + value_width);
+    float sum = 0.0f;
+    for (uint column = 0; column < nope_width; ++column)
+        sum += query[query_offset + column] *
+               moonlight_weight_value(kv_b_weight, kv_b_scale,
+                                      weight_format, weight_row + column,
+                                      latent, latent_width);
+    absorbed_query[index] = sum;
+}
+
+kernel void moonlight_attention_scores(
+        device const float *absorbed_query [[buffer(0)]],
+        device const float *query [[buffer(1)]],
+        device const float *latent_cache [[buffer(2)]],
+        device const float *rope_cache [[buffer(3)]],
+        device float *scores [[buffer(4)]],
+        constant uint *shape [[buffer(5)]],
+        constant float &attention_scale [[buffer(6)]],
+        uint2 index [[thread_position_in_grid]]) {
+    uint rows = shape[0];
+    uint heads = shape[1];
+    uint nope_width = shape[2];
+    uint rope_width = shape[3];
+    uint latent_width = shape[4];
+    uint context_size = shape[5];
+    uint layer = shape[6];
+    uint position = shape[7];
+    uint key = index.x;
+    uint query_index = index.y;
+    if (query_index >= rows * heads) return;
+    uint row = query_index / heads;
+    uint key_count = position + row + 1;
+    if (key >= key_count) return;
+    uint query_offset = query_index * (nope_width + rope_width);
+    uint absorbed_offset = query_index * latent_width;
+    uint latent_offset = (layer * context_size + key) * latent_width;
+    uint rope_offset = (layer * context_size + key) * rope_width;
+    float score = 0.0f;
+    for (uint latent = 0; latent < latent_width; ++latent)
+        score += absorbed_query[absorbed_offset + latent] *
+                 latent_cache[latent_offset + latent];
+    for (uint column = 0; column < rope_width; ++column)
+        score += query[query_offset + nope_width + column] *
+                 rope_cache[rope_offset + column];
+    scores[query_index * context_size + key] = score * attention_scale;
+}
+
+kernel void moonlight_attention_latent_context(
+        device const float *scores [[buffer(0)]],
+        device const float *latent_cache [[buffer(1)]],
+        device float *latent_context [[buffer(2)]],
+        constant uint *shape [[buffer(3)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint simd_lane [[thread_index_in_simdgroup]],
+        uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint rows = shape[0];
+    uint heads = shape[1];
+    uint latent_width = shape[2];
+    uint context_size = shape[3];
+    uint layer = shape[4];
+    uint position = shape[5];
+    uint query_index = group.x;
+    if (query_index >= rows * heads) return;
+    uint row = query_index / heads;
+    uint key_count = position + row + 1;
+    uint score_offset = query_index * context_size;
+    threadgroup float reduction[8];
+    float local_maximum = -3.402823466e+38f;
+    for (uint key = lane; key < key_count; key += 256)
+        local_maximum = max(local_maximum, scores[score_offset + key]);
+    float value = simd_max(local_maximum);
+    if (simd_lane == 0) reduction[simd_group] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        value = simd_lane < 8 ? reduction[simd_lane]
+                              : -3.402823466e+38f;
+        value = simd_max(value);
+        if (simd_lane == 0) reduction[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maximum = reduction[0];
+    float local_denominator = 0.0f;
+    for (uint key = lane; key < key_count; key += 256)
+        local_denominator += exp(scores[score_offset + key] - maximum);
+    value = simd_sum(local_denominator);
+    if (simd_lane == 0) reduction[simd_group] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        value = simd_lane < 8 ? reduction[simd_lane] : 0.0f;
+        value = simd_sum(value);
+        if (simd_lane == 0) reduction[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float denominator = reduction[0];
+    uint cache_base = layer * context_size;
+    for (uint latent = lane; latent < latent_width; latent += 256) {
+        float sum = 0.0f;
+        for (uint key = 0; key < key_count; ++key) {
+            float probability =
+                exp(scores[score_offset + key] - maximum) / denominator;
+            sum += probability *
+                   latent_cache[(cache_base + key) * latent_width + latent];
+        }
+        latent_context[query_index * latent_width + latent] = sum;
+    }
+}
+
+kernel void moonlight_attention_decode_value(
+        device const float *latent_context [[buffer(0)]],
+        device const uchar *kv_b_weight [[buffer(1)]],
+        device const float *kv_b_scale [[buffer(2)]],
+        device float *context [[buffer(3)]],
+        constant uint *shape [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    uint rows = shape[0];
+    uint heads = shape[1];
+    uint nope_width = shape[2];
+    uint value_width = shape[3];
+    uint latent_width = shape[4];
+    uint weight_format = shape[5];
+    uint output_index = group.x;
+    if (output_index >= rows * heads * value_width) return;
+    uint value_index = output_index % value_width;
+    uint query_index = output_index / value_width;
+    uint head = query_index % heads;
+    uint weight_row = head * (nope_width + value_width) +
+                      nope_width + value_index;
+    uint latent_offset = query_index * latent_width;
+    float sum = 0.0f;
+    for (uint latent = lane; latent < latent_width; latent += 32)
+        sum += latent_context[latent_offset + latent] *
+               moonlight_weight_value(kv_b_weight, kv_b_scale,
+                                      weight_format, weight_row, latent,
+                                      latent_width);
+    sum = simd_sum(sum);
+    if (lane == 0) context[output_index] = sum;
+}
+
 kernel void moonlight_attention_absorbed(
         device const float *query [[buffer(0)]],
         device const float *latent_cache [[buffer(1)]],

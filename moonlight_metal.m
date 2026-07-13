@@ -31,6 +31,10 @@ struct MoonlightModel {
     __strong id<MTLComputePipelineState> cache_append;
     __strong id<MTLComputePipelineState> rope_query;
     __strong id<MTLComputePipelineState> attention_absorbed;
+    __strong id<MTLComputePipelineState> attention_absorb_query;
+    __strong id<MTLComputePipelineState> attention_scores;
+    __strong id<MTLComputePipelineState> attention_latent_context;
+    __strong id<MTLComputePipelineState> attention_decode_value;
     __strong id<MTLComputePipelineState> route_sigmoid_topk;
     __strong id<MTLComputePipelineState> clear_f32;
     __strong id<MTLComputePipelineState> gather_rows;
@@ -54,6 +58,9 @@ struct MoonlightSession {
     __strong id<MTLBuffer> query;
     __strong id<MTLBuffer> compressed;
     __strong id<MTLBuffer> context;
+    __strong id<MTLBuffer> absorbed_query;
+    __strong id<MTLBuffer> attention_scores;
+    __strong id<MTLBuffer> latent_context;
     __strong id<MTLBuffer> router_logits;
     __strong id<MTLBuffer> route_ids;
     __strong id<MTLBuffer> route_weights;
@@ -355,29 +362,76 @@ static int encode_attention_buffer(MoonlightSession *session,
     NSUInteger query_count = (NSUInteger)rows * config->head_count;
     dispatch_1d(encoder, session->model->rope_query, query_count);
 
-    uint32_t attention_shape[10] = {
+    uint32_t absorb_shape[7] = {
         (uint32_t)rows, (uint32_t)config->head_count,
         (uint32_t)config->qk_nope_dim, (uint32_t)config->qk_rope_dim,
         (uint32_t)config->value_dim, (uint32_t)config->kv_lora_rank,
-        (uint32_t)session->options.context_size, (uint32_t)layer,
-        (uint32_t)position, (uint32_t)kv_b_matrix.format,
+        (uint32_t)kv_b_matrix.format,
     };
     float attention_scale = 1.0f /
         sqrtf((float)(config->qk_nope_dim + config->qk_rope_dim));
     id<MTLBuffer> kv_b_scale = kv_b_matrix.scale_index >= 0
         ? session->model->weights[kv_b_matrix.scale_index].buffer
         : session->model->weights[kv_b_matrix.weight_index].buffer;
-    [encoder setComputePipelineState:session->model->attention_absorbed];
+    [encoder setComputePipelineState:session->model->attention_absorb_query];
     [encoder setBuffer:session->query offset:0 atIndex:0];
-    [encoder setBuffer:session->latent_kv offset:0 atIndex:1];
-    [encoder setBuffer:session->rope_kv offset:0 atIndex:2];
     [encoder setBuffer:session->model->weights[kv_b_matrix.weight_index].buffer
-             offset:0 atIndex:3];
-    [encoder setBuffer:kv_b_scale offset:0 atIndex:4];
-    [encoder setBuffer:session->context offset:0 atIndex:5];
-    [encoder setBytes:attention_shape length:sizeof(attention_shape) atIndex:6];
-    [encoder setBytes:&attention_scale length:sizeof(attention_scale) atIndex:7];
-    dispatch_1d(encoder, session->model->attention_absorbed, query_count);
+             offset:0 atIndex:1];
+    [encoder setBuffer:kv_b_scale offset:0 atIndex:2];
+    [encoder setBuffer:session->absorbed_query offset:0 atIndex:3];
+    [encoder setBytes:absorb_shape length:sizeof(absorb_shape) atIndex:4];
+    dispatch_1d(encoder, session->model->attention_absorb_query,
+                query_count * config->kv_lora_rank);
+
+    uint32_t score_shape[8] = {
+        (uint32_t)rows, (uint32_t)config->head_count,
+        (uint32_t)config->qk_nope_dim, (uint32_t)config->qk_rope_dim,
+        (uint32_t)config->kv_lora_rank,
+        (uint32_t)session->options.context_size,
+        (uint32_t)layer, (uint32_t)position,
+    };
+    [encoder setComputePipelineState:session->model->attention_scores];
+    [encoder setBuffer:session->absorbed_query offset:0 atIndex:0];
+    [encoder setBuffer:session->query offset:0 atIndex:1];
+    [encoder setBuffer:session->latent_kv offset:0 atIndex:2];
+    [encoder setBuffer:session->rope_kv offset:0 atIndex:3];
+    [encoder setBuffer:session->attention_scores offset:0 atIndex:4];
+    [encoder setBytes:score_shape length:sizeof(score_shape) atIndex:5];
+    [encoder setBytes:&attention_scale length:sizeof(attention_scale) atIndex:6];
+    NSUInteger key_count = (NSUInteger)position + rows;
+    [encoder dispatchThreads:MTLSizeMake(key_count, query_count, 1)
+        threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)32, key_count),
+                                          MIN((NSUInteger)8, query_count), 1)];
+
+    uint32_t latent_shape[6] = {
+        (uint32_t)rows, (uint32_t)config->head_count,
+        (uint32_t)config->kv_lora_rank,
+        (uint32_t)session->options.context_size,
+        (uint32_t)layer, (uint32_t)position,
+    };
+    [encoder setComputePipelineState:session->model->attention_latent_context];
+    [encoder setBuffer:session->attention_scores offset:0 atIndex:0];
+    [encoder setBuffer:session->latent_kv offset:0 atIndex:1];
+    [encoder setBuffer:session->latent_context offset:0 atIndex:2];
+    [encoder setBytes:latent_shape length:sizeof(latent_shape) atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(query_count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    uint32_t value_shape[6] = {
+        (uint32_t)rows, (uint32_t)config->head_count,
+        (uint32_t)config->qk_nope_dim, (uint32_t)config->value_dim,
+        (uint32_t)config->kv_lora_rank, (uint32_t)kv_b_matrix.format,
+    };
+    [encoder setComputePipelineState:session->model->attention_decode_value];
+    [encoder setBuffer:session->latent_context offset:0 atIndex:0];
+    [encoder setBuffer:session->model->weights[kv_b_matrix.weight_index].buffer
+             offset:0 atIndex:1];
+    [encoder setBuffer:kv_b_scale offset:0 atIndex:2];
+    [encoder setBuffer:session->context offset:0 atIndex:3];
+    [encoder setBytes:value_shape length:sizeof(value_shape) atIndex:4];
+    [encoder dispatchThreadgroups:
+        MTLSizeMake(query_count * config->value_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     encode_matmul(session->model, encoder, &output_matrix,
                   session->context, output, rows, context_width,
                   config->hidden_size);
@@ -745,6 +799,14 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
     model->rope_query = make_pipeline(model, @"moonlight_rope_query", &metal_error);
     model->attention_absorbed =
         make_pipeline(model, @"moonlight_attention_absorbed", &metal_error);
+    model->attention_absorb_query =
+        make_pipeline(model, @"moonlight_attention_absorb_query", &metal_error);
+    model->attention_scores =
+        make_pipeline(model, @"moonlight_attention_scores", &metal_error);
+    model->attention_latent_context = make_pipeline(
+        model, @"moonlight_attention_latent_context", &metal_error);
+    model->attention_decode_value = make_pipeline(
+        model, @"moonlight_attention_decode_value", &metal_error);
     model->route_sigmoid_topk =
         make_pipeline(model, @"moonlight_route_sigmoid_topk", &metal_error);
     model->clear_f32 = make_pipeline(model, @"moonlight_clear_f32", &metal_error);
@@ -758,6 +820,8 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
         !model->matmul_f32 || !model->matmul_q8 ||
         !model->matmul_q8_reduction || !model->matmul_q4 ||
         !model->cache_append || !model->rope_query || !model->attention_absorbed ||
+        !model->attention_absorb_query || !model->attention_scores ||
+        !model->attention_latent_context || !model->attention_decode_value ||
         !model->route_sigmoid_topk || !model->clear_f32 || !model->gather_rows ||
         !model->silu_multiply || !model->scatter_expert || !model->add_f32) {
         NSString *message = metal_error.localizedDescription ?: @"unknown error";
@@ -826,6 +890,10 @@ void moonlight_model_close(MoonlightModel *model) {
     model->cache_append = nil;
     model->rope_query = nil;
     model->attention_absorbed = nil;
+    model->attention_absorb_query = nil;
+    model->attention_scores = nil;
+    model->attention_latent_context = nil;
+    model->attention_decode_value = nil;
     model->route_sigmoid_topk = nil;
     model->clear_f32 = nil;
     model->gather_rows = nil;
@@ -880,6 +948,9 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     size_t query_size;
     size_t compressed_size;
     size_t context_size;
+    size_t absorbed_query_size;
+    size_t attention_score_size;
+    size_t latent_context_size;
     size_t router_size;
     size_t route_size;
     size_t row_index_size;
@@ -923,6 +994,24 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
                        &context_size) ||
         !multiply_size(context_size, config->value_dim, &context_size) ||
         !multiply_size(context_size, sizeof(float), &context_size) ||
+        !multiply_size((size_t)options->max_batch, config->head_count,
+                       &absorbed_query_size) ||
+        !multiply_size(absorbed_query_size, config->kv_lora_rank,
+                       &absorbed_query_size) ||
+        !multiply_size(absorbed_query_size, sizeof(float),
+                       &absorbed_query_size) ||
+        !multiply_size((size_t)options->max_batch, config->head_count,
+                       &attention_score_size) ||
+        !multiply_size(attention_score_size, options->context_size,
+                       &attention_score_size) ||
+        !multiply_size(attention_score_size, sizeof(float),
+                       &attention_score_size) ||
+        !multiply_size((size_t)options->max_batch, config->head_count,
+                       &latent_context_size) ||
+        !multiply_size(latent_context_size, config->kv_lora_rank,
+                       &latent_context_size) ||
+        !multiply_size(latent_context_size, sizeof(float),
+                       &latent_context_size) ||
         !multiply_size((size_t)options->max_batch, config->expert_count,
                        &router_size) ||
         !multiply_size(router_size, sizeof(float), &router_size) ||
@@ -969,6 +1058,12 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     session->query = allocate_buffer(session, query_size, error, error_size);
     session->compressed = allocate_buffer(session, compressed_size, error, error_size);
     session->context = allocate_buffer(session, context_size, error, error_size);
+    session->absorbed_query =
+        allocate_buffer(session, absorbed_query_size, error, error_size);
+    session->attention_scores =
+        allocate_buffer(session, attention_score_size, error, error_size);
+    session->latent_context =
+        allocate_buffer(session, latent_context_size, error, error_size);
     session->router_logits = allocate_buffer(session, router_size, error, error_size);
     session->route_ids = allocate_buffer(session, route_size, error, error_size);
     session->route_weights = allocate_buffer(session, route_size, error, error_size);
@@ -1010,6 +1105,8 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     if (!session->activation_a || !session->activation_b || !session->latent_kv ||
         !session->rope_kv || !session->token_ids || !session->logits ||
         !session->query || !session->compressed || !session->context ||
+        !session->absorbed_query || !session->attention_scores ||
+        !session->latent_context ||
         !session->router_logits || !session->route_ids ||
         !session->route_weights || !session->expert_rows ||
         !session->expert_slots || !session->expert_input ||
@@ -1038,6 +1135,9 @@ void moonlight_session_destroy(MoonlightSession *session) {
     session->query = nil;
     session->compressed = nil;
     session->context = nil;
+    session->absorbed_query = nil;
+    session->attention_scores = nil;
+    session->latent_context = nil;
     session->router_logits = nil;
     session->route_ids = nil;
     session->route_weights = nil;
