@@ -278,11 +278,14 @@ int moonlight_chat_run(const MoonlightChatOptions *options) {
     }
     const char *one_shot = getenv("PROMPT");
     if (one_shot) {
-        if (!append_turn(&chat, one_shot) ||
-            generate(&chat, eos, error, sizeof(error)) < 0)
-            fprintf(stderr, "%s\n", error[0] ? error : "Moonlight prompt is too long");
+        int generated = -1;
+        if (!append_turn(&chat, one_shot))
+            snprintf(error, sizeof(error), "Moonlight prompt is too long");
+        else
+            generated = generate(&chat, eos, error, sizeof(error));
+        if (generated < 0) fprintf(stderr, "%s\n", error);
         putchar('\n');
-        int status = error[0] != 0;
+        int status = generated < 0;
         close_chat(&chat);
         return status;
     }
