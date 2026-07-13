@@ -831,13 +831,6 @@ int deepseek_v4_ds4_generate_messages(
             snprintf(error, error_size, "speculative draft requested without DSpark support");
         return -1;
     }
-    if (config->draft > 1 && config->draft != session->draft_tokens) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                     "request draft %d differs from resident DS4 draft %d",
-                     config->draft, session->draft_tokens);
-        return -1;
-    }
     if (stats) memset(stats, 0, sizeof(*stats));
 
     ds4_tokens prompt = {0};
@@ -903,6 +896,16 @@ int deepseek_v4_ds4_generate_messages(
     if (cached_tokens < prompt.len) ds4_cache_save(session, &prompt, config_key);
     double prompt_ms = ds4_now_ms() - prompt_started;
 
+    int restore_draft = 0;
+    if (config->draft > 1 && config->draft != session->draft_tokens) {
+        if (!ds4_engine_set_mtp_draft_tokens(session->engine, config->draft)) {
+            if (error && error_size)
+                snprintf(error, error_size, "failed to set request DS4 draft");
+            ds4_tokens_free(&prompt);
+            return -1;
+        }
+        restore_draft = 1;
+    }
     ds4_session_spec_stats spec_before = {0}, spec_after = {0};
     (void)ds4_session_get_spec_stats(session->session, &spec_before);
     int generated = 0, spec_rounds = 0, spec_tokens = 0;
@@ -967,6 +970,9 @@ int deepseek_v4_ds4_generate_messages(
         if (ds4_session_get_spec_stats(session->session, &spec_after))
             ds4_stats_add_spec_delta(stats, &spec_before, &spec_after);
     }
+    if (restore_draft)
+        (void)ds4_engine_set_mtp_draft_tokens(
+            session->engine, session->draft_tokens);
     ds4_tokens_free(&prompt);
     return generated;
 }
