@@ -38,7 +38,7 @@ if nm floyd | grep -Eq \
 fi
 
 if nm floyd | grep -Eq \
-    '_cpu_decode_scratch_init$|_forward_first_token_cpu$|_prefill_layer_major_cpu$|_session_cpu_reset_cache$'; then
+    '_cpu_decode_scratch_init$|_forward_first_token_cpu$|_prefill_layer_major_cpu$|_session_cpu_reset_cache$|_metal_graph_decode_cpu_router_applicable$|_metal_graph_upload_prompt_embeddings_hc_cpu$'; then
     echo "floyd still contains the DS4 CPU inference backend" >&2
     exit 1
 fi
