@@ -484,6 +484,75 @@ static int test_shared_q8_exact_rows(void **mapped_out) {
     return 0;
 }
 
+static int test_attention_exact_batch_kv_broadcast(void **mapped_out) {
+    enum { TOKENS = 3, HEADS = 8, HEAD_DIM = 512, RAW_CAP = 128,
+           POS0 = 20, N_COMP = 5, RATIO = 4 };
+    const size_t page_size = 16384u;
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, page_size, page_size) == 0);
+    memset(mapped, 0, page_size);
+    float *sinks = mapped;
+    for (int head = 0; head < HEADS; head++)
+        sinks[head] = (float)(head - 4) / 16.0f;
+
+    const size_t q_count = (size_t)TOKENS * HEADS * HEAD_DIM;
+    const size_t raw_count = (size_t)RAW_CAP * HEAD_DIM;
+    const size_t comp_count = (size_t)N_COMP * HEAD_DIM;
+    float *q = malloc(q_count * sizeof(*q));
+    float *raw = malloc(raw_count * sizeof(*raw));
+    float *comp = malloc(comp_count * sizeof(*comp));
+    float *reference = malloc(q_count * sizeof(*reference));
+    float *actual = malloc(q_count * sizeof(*actual));
+    CHECK(q && raw && comp && reference && actual);
+    for (size_t i = 0; i < q_count; i++)
+        q[i] = (float)((int)((i * 7u + 5u) % 43u) - 21) / 64.0f;
+    for (size_t i = 0; i < raw_count; i++)
+        raw[i] = (float)((int)((i * 11u + 3u) % 61u) - 30) / 64.0f;
+    for (size_t i = 0; i < comp_count; i++)
+        comp[i] = (float)((int)((i * 13u + 9u) % 47u) - 23) / 64.0f;
+
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw_t = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp_t = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *heads_t = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    CHECK(q_t && raw_t && comp_t && heads_t);
+    CHECK(ds4_gpu_set_model_map_range(mapped, page_size, 0, page_size,
+                                       HEADS * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(q_t, 0, q, q_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(raw_t, 0, raw, raw_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(comp_t, 0, comp, comp_count * sizeof(float)));
+
+    setenv("DS4_METAL_DISABLE_EXACT_BATCH_KV_BROADCAST", "1", 1);
+    CHECK(ds4_gpu_attention_decode_exact_batch_heads_tensor(
+        heads_t, mapped, page_size, 0, q_t, raw_t, comp_t, 0,
+        TOKENS, POS0, RAW_CAP, N_COMP, RAW_CAP, RATIO, HEADS, HEAD_DIM));
+    CHECK(ds4_gpu_tensor_read(heads_t, 0, reference, q_count * sizeof(float)));
+    unsetenv("DS4_METAL_DISABLE_EXACT_BATCH_KV_BROADCAST");
+
+    ds4_gpu_kernel_stats before, after;
+    ds4_gpu_get_kernel_stats(&before);
+    CHECK(ds4_gpu_attention_decode_exact_batch_heads_tensor(
+        heads_t, mapped, page_size, 0, q_t, raw_t, comp_t, 0,
+        TOKENS, POS0, RAW_CAP, N_COMP, RAW_CAP, RATIO, HEADS, HEAD_DIM));
+    CHECK(ds4_gpu_tensor_read(heads_t, 0, actual, q_count * sizeof(float)));
+    ds4_gpu_get_kernel_stats(&after);
+    const float error = max_abs(actual, reference, q_count);
+    printf("DeepSeek V4 exact batch attention KV broadcast Metal: "
+           "max_abs=%.9g calls=%llu\n",
+           error,
+           (unsigned long long)(after.tiny_batch_attn_kv_broadcast_calls -
+                                before.tiny_batch_attn_kv_broadcast_calls));
+    CHECK(error == 0.0f);
+    CHECK(after.tiny_batch_attn_kv_broadcast_calls ==
+          before.tiny_batch_attn_kv_broadcast_calls + 1);
+
+    ds4_gpu_tensor_free(heads_t); ds4_gpu_tensor_free(comp_t);
+    ds4_gpu_tensor_free(raw_t); ds4_gpu_tensor_free(q_t);
+    free(actual); free(reference); free(comp); free(raw); free(q);
+    *mapped_out = mapped;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -504,6 +573,8 @@ int main(int argc, char **argv) {
     CHECK(test_attention_low_q8_exact_rows(&attn_low_mapped) == 0);
     void *shared_mapped = NULL;
     CHECK(test_shared_q8_exact_rows(&shared_mapped) == 0);
+    void *attn_broadcast_mapped = NULL;
+    CHECK(test_attention_exact_batch_kv_broadcast(&attn_broadcast_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -587,6 +658,7 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
+    free(attn_broadcast_mapped);
     free(shared_mapped);
     free(attn_low_mapped);
     free(attn_hc_mapped);
