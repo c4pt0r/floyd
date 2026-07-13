@@ -1,0 +1,254 @@
+diff --git a/ds4.c b/ds4.c
+index 968d8cb..9678a67 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -28437,6 +28437,8 @@ int ds4_session_get_kernel_stats(const ds4_session *s,
+             gpu_stats.tiny_batch_router_calls;
+         out->tiny_batch_attn_hc_calls =
+             gpu_stats.tiny_batch_attn_hc_calls;
++        out->tiny_batch_attn_hc_exact_rows_calls =
++            gpu_stats.tiny_batch_attn_hc_exact_rows_calls;
+         out->tiny_batch_raw_store_calls =
+             gpu_stats.tiny_batch_raw_store_calls;
+         out->tiny_batch_exact_attn_calls =
+diff --git a/ds4.h b/ds4.h
+index 0381754..f611180 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -77,6 +77,7 @@ typedef struct {
+     uint64_t tiny_batch_shared_swiglu_calls;
+     uint64_t tiny_batch_router_calls;
+     uint64_t tiny_batch_attn_hc_calls;
++    uint64_t tiny_batch_attn_hc_exact_rows_calls;
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
+     uint64_t tiny_batch_exact_q8_calls;
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 529d2ab..0f04f64 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -25,6 +25,7 @@ typedef struct {
+     uint64_t tiny_batch_shared_swiglu_calls;
+     uint64_t tiny_batch_router_calls;
+     uint64_t tiny_batch_attn_hc_calls;
++    uint64_t tiny_batch_attn_hc_exact_rows_calls;
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
+     uint64_t tiny_batch_exact_q8_calls;
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 0f0a148..8b8c017 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -346,6 +346,7 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
+ static uint64_t g_tiny_batch_shared_swiglu_calls;
+ static uint64_t g_tiny_batch_router_calls;
+ static uint64_t g_tiny_batch_attn_hc_calls;
++static uint64_t g_tiny_batch_attn_hc_exact_rows_calls;
+ static uint64_t g_tiny_batch_raw_store_calls;
+ static uint64_t g_tiny_batch_exact_attn_calls;
+ static uint64_t g_tiny_batch_exact_q8_calls;
+@@ -361,6 +362,8 @@ void ds4_gpu_get_kernel_stats(ds4_gpu_kernel_stats *out) {
+         g_tiny_batch_shared_swiglu_calls;
+     out->tiny_batch_router_calls = g_tiny_batch_router_calls;
+     out->tiny_batch_attn_hc_calls = g_tiny_batch_attn_hc_calls;
++    out->tiny_batch_attn_hc_exact_rows_calls =
++        g_tiny_batch_attn_hc_exact_rows_calls;
+     out->tiny_batch_raw_store_calls = g_tiny_batch_raw_store_calls;
+     out->tiny_batch_exact_attn_calls = g_tiny_batch_exact_attn_calls;
+     out->tiny_batch_exact_q8_calls = g_tiny_batch_exact_q8_calls;
+@@ -6358,6 +6361,21 @@ int ds4_gpu_init(void) {
+             }
+             g_exact_q8_pipeline_warmups++;
+         }
++        static const char *attn_hc_exact_pipeline_names[] = {
++            "kernel_dsv4_q8_hc_expand4_q8_0_rows2",
++            "kernel_dsv4_q8_hc_expand4_q8_0_rows3",
++            "kernel_dsv4_q8_hc_expand4_q8_0_rows4",
++        };
++        for (size_t i = 0;
++             i < sizeof(attn_hc_exact_pipeline_names) /
++                 sizeof(attn_hc_exact_pipeline_names[0]);
++             i++) {
++            if (!ds4_gpu_get_mul_mv_pipeline(attn_hc_exact_pipeline_names[i], 4)) {
++                g_queue = nil;
++                g_device = nil;
++                return 0;
++            }
++        }
+ 
+         g_initialized = 1;
+     }
+@@ -28013,9 +28031,15 @@ static int ds4_gpu_matmul_q8_0_hc_expand_rows_tensor(
+             .has_add = 0,
+         };
+ 
++        const bool exact_rows = n_tokens >= 2 && n_tokens <= 4 &&
++            getenv("DS4_METAL_DISABLE_ATTN_HC_EXACT_ROWS") == NULL;
++        const char *pipeline_name = exact_rows
++            ? (n_tokens == 2 ? "kernel_dsv4_q8_hc_expand4_q8_0_rows2" :
++               (n_tokens == 3 ? "kernel_dsv4_q8_hc_expand4_q8_0_rows3" :
++                                "kernel_dsv4_q8_hc_expand4_q8_0_rows4"))
++            : "kernel_dsv4_q8_hc_expand4_q8_0";
+         id<MTLComputePipelineState> pipeline =
+-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_q8_hc_expand4_q8_0",
+-                                          mv_dispatch.nsg);
++            ds4_gpu_get_mul_mv_pipeline(pipeline_name, mv_dispatch.nsg);
+         if (!pipeline) return 0;
+ 
+         int owned = 0;
+@@ -28036,12 +28060,13 @@ static int ds4_gpu_matmul_q8_0_hc_expand_rows_tensor(
+         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                               (NSUInteger)mv_dispatch.nr0,
+-                                              (NSUInteger)n_tokens,
++                                              exact_rows ? 1u : (NSUInteger)n_tokens,
+                                               1)
+              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+         ds4_gpu_end_compute_encoder(cb, enc);
+ 
+         if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8 HC expand fused")) return 0;
++        if (exact_rows) g_tiny_batch_attn_hc_exact_rows_calls++;
+     }
+ 
+     return 1;
+diff --git a/metal/dsv4_hc.metal b/metal/dsv4_hc.metal
+index e24056c..10ab50d 100644
+--- a/metal/dsv4_hc.metal
++++ b/metal/dsv4_hc.metal
+@@ -871,6 +871,136 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
+     }
+ }
+ 
++template<short NR1>
++void kernel_dsv4_q8_hc_expand4_q8_0_exact_rows_impl(
++        constant ds4_metal_args_mul_mv          & mv,
++        constant ds4_metal_args_dsv4_hc_expand & hc,
++        device  const char * weight,
++        device  const char * input,
++        device        char * block_out,
++        device  const char * residual,
++        device  const char * post,
++        device  const char * comb,
++        device        char * dst,
++        threadgroup   char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    if (hc.n_hc != 4 || hc.n_tokens != NR1) return;
++
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NQ = 8;
++    constexpr short NR0 = N_R0_Q8_0;
++    const int nb = mv.ne00 / QK8_0;
++    const int row0 = tgpig.x * NR0;
++    const short ix = tiisg / (NW / NQ);
++    const short il = tiisg % (NW / NQ);
++    const int ib0 = sgitg * NQ + ix;
++
++    device const block_q8_0 *ax[NR0];
++    FOR_UNROLL(short row = 0; row < NR0; ++row) {
++        const uint64_t off0 = (uint64_t)(row0 + row) * mv.nb01;
++        ax[row] = (device const block_q8_0 *)(weight + off0);
++    }
++
++    device const float *yb[NR1];
++    FOR_UNROLL(short token = 0; token < NR1; ++token) {
++        device const float *y =
++            (device const float *)(input + (uint64_t)token * mv.nb11);
++        yb[token] = y + ib0 * QK8_0 + il * NQ;
++    }
++    float sumf[NR1][NR0] = {{0.0f}};
++    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
++        FOR_UNROLL(short token = 0; token < NR1; ++token) {
++            float yl[NQ];
++            FOR_UNROLL(short i = 0; i < NQ; ++i) yl[i] = yb[token][i];
++            FOR_UNROLL(short row = 0; row < NR0; ++row) {
++                device const int8_t *qs = ax[row][ib].qs + il * NQ;
++                float sumq = 0.0f;
++                FOR_UNROLL(short i = 0; i < NQ; ++i) sumq += qs[i] * yl[i];
++                sumf[token][row] += sumq * ax[row][ib].d;
++            }
++            yb[token] += NSG * NQ * QK8_0;
++        }
++    }
++
++    threadgroup float *shmem_f32[NR0];
++    FOR_UNROLL(short row = 0; row < NR0; ++row)
++        shmem_f32[row] = (threadgroup float *)shmem + NW * row;
++
++    FOR_UNROLL(short token = 0; token < NR1; ++token) {
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
++            sumf[token][row] = simd_sum(sumf[token][row]);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            if (tiisg == 0) shmem_f32[row][sgitg] = sumf[token][row];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        FOR_UNROLL(short row = 0; row < NR0; ++row) {
++            const int d = row0 + row;
++            if (d >= mv.ne01) continue;
++            const float block_v = simd_sum(shmem_f32[row][tiisg]);
++            if (tiisg == 0 && sgitg == 0) {
++                *((device float *)(block_out +
++                    ((uint64_t)token * mv.ne0 + d) * sizeof(float))) = block_v;
++
++                const float r0 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1 + token * hc.nb_res2));
++                const float r1 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1 + token * hc.nb_res2));
++                const float r2 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1 + token * hc.nb_res2));
++                const float r3 = *((device const float *)(residual +
++                    (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1 + token * hc.nb_res2));
++
++                for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
++                    float acc = block_v * *((device const float *)(post +
++                        dst_hc * hc.nb_post0 + token * hc.nb_post1));
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        0 * hc.nb_comb1 + token * hc.nb_comb2)) * r0;
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        1 * hc.nb_comb1 + token * hc.nb_comb2)) * r1;
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        2 * hc.nb_comb1 + token * hc.nb_comb2)) * r2;
++                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 +
++                        3 * hc.nb_comb1 + token * hc.nb_comb2)) * r3;
++                    *((device float *)(dst + (uint64_t)d * hc.nb0 +
++                        dst_hc * hc.nb1 + token * hc.nb2)) = acc;
++                }
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++}
++
++#define DS4_ATTN_HC_EXACT_ROWS_KERNEL(NR1) \
++[[host_name("kernel_dsv4_q8_hc_expand4_q8_0_rows" #NR1)]] \
++kernel void kernel_dsv4_q8_hc_expand4_q8_0_rows##NR1( \
++        constant ds4_metal_args_mul_mv & mv, \
++        constant ds4_metal_args_dsv4_hc_expand & hc, \
++        device const char * weight, device const char * input, \
++        device char * block_out, device const char * residual, \
++        device const char * post, device const char * comb, device char * dst, \
++        threadgroup char * shmem [[threadgroup(0)]], \
++        uint3 tgpig [[threadgroup_position_in_grid]], \
++        ushort tiisg [[thread_index_in_simdgroup]], \
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    kernel_dsv4_q8_hc_expand4_q8_0_exact_rows_impl<NR1>( \
++        mv, hc, weight, input, block_out, residual, post, comb, dst, shmem, \
++        tgpig, tiisg, sgitg); \
++}
++
++DS4_ATTN_HC_EXACT_ROWS_KERNEL(2)
++DS4_ATTN_HC_EXACT_ROWS_KERNEL(3)
++DS4_ATTN_HC_EXACT_ROWS_KERNEL(4)
++
++#undef DS4_ATTN_HC_EXACT_ROWS_KERNEL
++
+ // Reduces HC channels to a normal embedding row with the learned pre weights.
+ // This is the input adapter before the attention block and before the FFN block.
+ kernel void kernel_dsv4_hc_weighted_sum(
