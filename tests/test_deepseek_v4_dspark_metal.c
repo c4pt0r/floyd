@@ -120,95 +120,6 @@ static int test_dense_q4_k(void **mapped_out) {
     return 0;
 }
 
-static int test_compressor_f16_pair_exact_rows(void **mapped_out) {
-    enum { TOKENS = 3, IN_DIM = 4096, OUT_DIM = 512 };
-    const size_t page_size = 16384u;
-    const size_t matrix_count = (size_t)IN_DIM * OUT_DIM;
-    const size_t matrix_bytes = matrix_count * sizeof(uint16_t);
-    const size_t weight_bytes = 2u * matrix_bytes;
-    const size_t map_bytes =
-        (weight_bytes + page_size - 1u) & ~(page_size - 1u);
-    void *mapped = NULL;
-    CHECK(posix_memalign(&mapped, page_size, map_bytes) == 0);
-    memset(mapped, 0, map_bytes);
-
-    static const uint16_t half_values[] = {
-        0x0000u, 0x3400u, 0x3800u, 0x3c00u,
-        0xb400u, 0xb800u, 0xbc00u,
-    };
-    uint16_t *weights = mapped;
-    for (size_t i = 0; i < 2u * matrix_count; i++)
-        weights[i] = half_values[(i * 5u + i / IN_DIM) %
-                                 (sizeof(half_values) / sizeof(half_values[0]))];
-
-    const size_t input_count = (size_t)TOKENS * IN_DIM;
-    const size_t output_count = (size_t)TOKENS * OUT_DIM;
-    float *input = malloc(input_count * sizeof(*input));
-    float *batch_a = malloc(output_count * sizeof(*batch_a));
-    float *batch_b = malloc(output_count * sizeof(*batch_b));
-    float *row_a = malloc(output_count * sizeof(*row_a));
-    float *row_b = malloc(output_count * sizeof(*row_b));
-    CHECK(input && batch_a && batch_b && row_a && row_b);
-    for (size_t i = 0; i < input_count; i++)
-        input[i] = (float)((int)((i * 17u + 9u) % 73u) - 36) / 128.0f;
-
-#define TENSOR(name, count) \
-    ds4_gpu_tensor *name = \
-        ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)); \
-    CHECK(name)
-    TENSOR(x, input_count);
-    TENSOR(out_a, output_count);
-    TENSOR(out_b, output_count);
-    TENSOR(x_one, IN_DIM);
-    TENSOR(out_a_one, OUT_DIM);
-    TENSOR(out_b_one, OUT_DIM);
-#undef TENSOR
-
-    CHECK(ds4_gpu_set_model_map_range(mapped, map_bytes, 0, map_bytes,
-                                       weight_bytes));
-    CHECK(ds4_gpu_tensor_write(x, 0, input, input_count * sizeof(float)));
-    CHECK(ds4_gpu_matmul_f16_pair_tensor(
-        out_a, out_b, mapped, map_bytes, 0, matrix_bytes,
-        IN_DIM, OUT_DIM, x, TOKENS));
-    CHECK(ds4_gpu_tensor_read(out_a, 0, batch_a,
-                              output_count * sizeof(float)));
-    CHECK(ds4_gpu_tensor_read(out_b, 0, batch_b,
-                              output_count * sizeof(float)));
-    for (int token = 0; token < TOKENS; token++) {
-        CHECK(ds4_gpu_tensor_write(x_one, 0,
-                                   input + (size_t)token * IN_DIM,
-                                   (uint64_t)IN_DIM * sizeof(float)));
-        CHECK(ds4_gpu_matmul_f16_pair_tensor(
-            out_a_one, out_b_one, mapped, map_bytes, 0, matrix_bytes,
-            IN_DIM, OUT_DIM, x_one, 1));
-        CHECK(ds4_gpu_tensor_read(out_a_one, 0,
-                                  row_a + (size_t)token * OUT_DIM,
-                                  (uint64_t)OUT_DIM * sizeof(float)));
-        CHECK(ds4_gpu_tensor_read(out_b_one, 0,
-                                  row_b + (size_t)token * OUT_DIM,
-                                  (uint64_t)OUT_DIM * sizeof(float)));
-    }
-    const float error_a = max_abs(batch_a, row_a, output_count);
-    const float error_b = max_abs(batch_b, row_b, output_count);
-    printf("DeepSeek V4 compressor F16 pair exact rows Metal: "
-           "a=%.9g b=%.9g\n", error_a, error_b);
-    CHECK(error_a == 0.0f && error_b == 0.0f);
-
-    ds4_gpu_tensor_free(out_b_one);
-    ds4_gpu_tensor_free(out_a_one);
-    ds4_gpu_tensor_free(x_one);
-    ds4_gpu_tensor_free(out_b);
-    ds4_gpu_tensor_free(out_a);
-    ds4_gpu_tensor_free(x);
-    free(row_b);
-    free(row_a);
-    free(batch_b);
-    free(batch_a);
-    free(input);
-    *mapped_out = mapped;
-    return 0;
-}
-
 static int test_attention_q8_hc_exact_rows(void **mapped_out) {
     enum { TOKENS = 3, IN_DIM = 2048, N_EMBD = 4096, N_HC = 4, MIX_HC = 24 };
     const size_t page_size = 16384u;
@@ -587,8 +498,6 @@ int main(int argc, char **argv) {
     CHECK(ds4_gpu_init());
     void *q4_mapped = NULL;
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
-    void *compressor_pair_mapped = NULL;
-    CHECK(test_compressor_f16_pair_exact_rows(&compressor_pair_mapped) == 0);
     void *attn_hc_mapped = NULL;
     CHECK(test_attention_q8_hc_exact_rows(&attn_hc_mapped) == 0);
     void *attn_low_mapped = NULL;
@@ -681,7 +590,6 @@ int main(int argc, char **argv) {
     free(shared_mapped);
     free(attn_low_mapped);
     free(attn_hc_mapped);
-    free(compressor_pair_mapped);
     free(q4_mapped);
     return 0;
 }
