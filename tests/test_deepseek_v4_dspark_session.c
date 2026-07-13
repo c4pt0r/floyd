@@ -116,6 +116,7 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_create(&speculative, engine, 64) == 0);
     CHECK(ds4_session_sync(greedy, &prompt, error, sizeof(error)) == 0);
     CHECK(ds4_session_sync(speculative, &prompt, error, sizeof(error)) == 0);
+    CHECK(setenv("DS4_METAL_VERIFY_SPLIT_LAYERS", "4", 1) == 0);
 
     int greedy_ids[6], spec_ids[6], spec_count = 0, max_round = 0;
     int eval_rounds = 0;
@@ -156,6 +157,7 @@ int main(int argc, char **argv) {
     CHECK(spec_stats.verify_head_ms > 0.0);
     CHECK(spec_stats.verify_read_ms > 0.0);
     CHECK(spec_stats.replay_ms == 0.0);
+    CHECK(spec_stats.verify_split_flushes > 0);
     CHECK(spec_stats.verify_outcome_calls[4][4] == 1);
     CHECK(spec_stats.verify_outcome_ms[4][4] > 0.0);
 
@@ -209,5 +211,6 @@ int main(int argc, char **argv) {
     ds4_engine_close(engine);
     CHECK(unlink(lock_path) == 0);
     unsetenv("DS4_LOCK_FILE");
+    unsetenv("DS4_METAL_VERIFY_SPLIT_LAYERS");
     return 0;
 }
