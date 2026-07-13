@@ -276,7 +276,7 @@ int moonlight_chat_run(const MoonlightChatOptions *options) {
         close_chat(&chat);
         return 1;
     }
-    const char *one_shot = getenv("PROMPT");
+    const char *one_shot = options->prompt;
     if (one_shot) {
         int generated = -1;
         if (!append_turn(&chat, one_shot))

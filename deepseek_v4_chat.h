@@ -5,6 +5,7 @@
 
 typedef struct {
     const char *model_dir;
+    const char *prompt;
     int max_context;
     int max_new_tokens;
     int use_spec;

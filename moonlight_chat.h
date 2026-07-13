@@ -3,6 +3,7 @@
 
 typedef struct {
     const char *model_dir;
+    const char *prompt;
     const char *system_prompt;
     int max_context;
     int max_new_tokens;

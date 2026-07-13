@@ -14,7 +14,7 @@ if printf '%s\n' "$help" | grep -q '^uso:'; then
 fi
 set +e
 output=$(printf 'hello\n:exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
-    ./floyd --model "$model" --no-kvsave --ngen 1 2>&1)
+    ./floyd --model "$model" --ngen 1 2>&1)
 status=$?
 set -e
 printf '%s\n' "$output"
