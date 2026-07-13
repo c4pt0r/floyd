@@ -356,6 +356,9 @@ test-cli-default-chat: floyd
 	@test -n "$(MOONLIGHT)" || (echo "set MOONLIGHT=/path/to/moonlight_i8"; exit 2)
 	sh tests/test_cli_default_chat.sh "$(MOONLIGHT)"
 
+test-metal-only-build: floyd
+	sh tests/test_metal_only_build.sh
+
 test-deepseek-v4-naming:
 	sh tests/test_deepseek_v4_naming.sh
 
