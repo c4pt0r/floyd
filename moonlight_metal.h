@@ -59,6 +59,9 @@ MoonlightStats moonlight_session_stats(const MoonlightSession *session);
 int moonlight_session_prefill(MoonlightSession *session, const int *ids,
                               int count, float *last_logits,
                               char *error, size_t error_size);
+int moonlight_session_append(MoonlightSession *session, const int *ids,
+                             int count, float *last_logits,
+                             char *error, size_t error_size);
 int moonlight_session_decode(MoonlightSession *session, int token,
                              float *logits, char *error, size_t error_size);
 int moonlight_test_prefill_layers(MoonlightSession *session, const int *ids,

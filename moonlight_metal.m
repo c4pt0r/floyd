@@ -2004,6 +2004,23 @@ int moonlight_session_prefill(MoonlightSession *session, const int *ids,
     return 1;
 }
 
+int moonlight_session_append(MoonlightSession *session, const int *ids,
+                             int count, float *last_logits,
+                             char *error, size_t error_size) {
+    if (!session || !ids || !last_logits || count <= 0 ||
+        count > session->options.max_batch || session->position <= 0 ||
+        session->position + count > session->options.context_size)
+        return set_error(error, error_size,
+                         "invalid Moonlight append request");
+    int position = session->position;
+    double start = monotonic_seconds();
+    if (!run_tokens_fast(session, ids, count, position, last_logits,
+                         error, error_size)) return 0;
+    session->stats.prefill_tokens += (uint64_t)count;
+    session->stats.prefill_ms += (monotonic_seconds() - start) * 1000.0;
+    return 1;
+}
+
 int moonlight_session_decode(MoonlightSession *session, int token,
                              float *logits, char *error, size_t error_size) {
     if (!session || !logits || session->position < 0 ||
