@@ -156,6 +156,8 @@ int main(int argc, char **argv) {
     CHECK(spec_stats.verify_head_ms > 0.0);
     CHECK(spec_stats.verify_read_ms > 0.0);
     CHECK(spec_stats.replay_ms == 0.0);
+    CHECK(spec_stats.verify_outcome_calls[4][4] == 1);
+    CHECK(spec_stats.verify_outcome_ms[4][4] > 0.0);
 
     ds4_session_kernel_stats kernel_stats;
     CHECK(ds4_session_get_kernel_stats(speculative, &kernel_stats));

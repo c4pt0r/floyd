@@ -24,6 +24,8 @@ env SNAP="$model" CHAT=1 DSPARK_SPEC=0 \
 
 perf=$(grep '^DEEPSEEK_V4_PERF ' "$trace")
 printf '%s\n' "$perf" | grep -q ' verify_layer_execute_ms=[0-9]'
+schedule=$(grep '^DEEPSEEK_V4_SCHEDULE ' "$trace")
+printf '%s\n' "$schedule" | grep -q ' d3c3=[0-9]'
 count=$(grep -c '^DEEPSEEK_V4_TOKEN ' "$trace")
 tps=$(printf '%s\n' "$perf" | sed -n 's/.* decode_tps=\([0-9.]*\).*/\1/p')
 replay=$(printf '%s\n' "$perf" | sed -n 's/.* replay_ms=\([0-9.]*\).*/\1/p')
@@ -31,6 +33,7 @@ direct=$(printf '%s\n' "$perf" | sed -n 's/.* direct_accepted=\([0-9][0-9]*\).*/
 prefix1=$(printf '%s\n' "$perf" | sed -n 's/.* prefix1_accepted=\([0-9][0-9]*\).*/\1/p')
 snapshots=$(printf '%s\n' "$perf" | sed -n 's/.* frontier_snapshots=\([0-9][0-9]*\).*/\1/p')
 printf '%s\n' "$perf"
+printf '%s\n' "$schedule"
 printf 'tokens=%s decode_tps=%s replay_ms=%s direct_accepted=%s prefix1_accepted=%s snapshots=%s\n' \
     "$count" "$tps" "$replay" "$direct" "$prefix1" "$snapshots"
 
