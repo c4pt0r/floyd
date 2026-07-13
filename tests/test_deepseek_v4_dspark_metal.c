@@ -57,6 +57,41 @@ static void similarity(const float *actual, const float *expected, size_t count,
     *cosine = (float)(ae / sqrt(aa * ee));
 }
 
+static int test_private_scratch_contract(void) {
+    enum { COUNT = 64 };
+    uint32_t input[COUNT];
+    uint32_t actual[COUNT];
+    for (uint32_t i = 0; i < COUNT; i++) input[i] = i * 2654435761u;
+    memset(actual, 0, sizeof(actual));
+
+    ds4_gpu_tensor *src = ds4_gpu_tensor_alloc(sizeof(input));
+    ds4_gpu_tensor *private_scratch = ds4_gpu_tensor_alloc_private(sizeof(input));
+    ds4_gpu_tensor *private_view =
+        ds4_gpu_tensor_view(private_scratch, 0, sizeof(input));
+    ds4_gpu_tensor *dst = ds4_gpu_tensor_alloc(sizeof(actual));
+    CHECK(src && private_scratch && private_view && dst);
+    CHECK(ds4_gpu_tensor_is_private(private_scratch));
+    CHECK(ds4_gpu_tensor_is_private(private_view));
+    CHECK(ds4_gpu_tensor_contents(private_scratch) == NULL);
+    CHECK(!ds4_gpu_tensor_write(private_scratch, 0, input, sizeof(input)));
+    CHECK(!ds4_gpu_tensor_read(private_scratch, 0, actual, sizeof(actual)));
+    CHECK(ds4_gpu_tensor_write(src, 0, input, sizeof(input)));
+    CHECK(ds4_gpu_begin_commands());
+    CHECK(ds4_gpu_tensor_copy(private_scratch, 0, src, 0, sizeof(input)));
+    CHECK(ds4_gpu_tensor_copy(dst, 0, private_view, 0, sizeof(input)));
+    CHECK(ds4_gpu_end_commands());
+    CHECK(ds4_gpu_tensor_read(dst, 0, actual, sizeof(actual)));
+    CHECK(memcmp(actual, input, sizeof(input)) == 0);
+    printf("DeepSeek V4 Metal private scratch: bytes=%zu roundtrip=exact\n",
+           sizeof(input));
+
+    ds4_gpu_tensor_free(dst);
+    ds4_gpu_tensor_free(private_view);
+    ds4_gpu_tensor_free(private_scratch);
+    ds4_gpu_tensor_free(src);
+    return 0;
+}
+
 static int test_dense_q4_k(void **mapped_out) {
     enum { ROWS = 8, COLS = 256, TOKENS = 2, MAP_BYTES = 16384 };
     void *mapped = NULL;
@@ -496,6 +531,7 @@ int main(int argc, char **argv) {
     argmax_logits[17] = 3.0f;
     argmax_logits[42] = 3.0f;
     CHECK(ds4_gpu_init());
+    CHECK(test_private_scratch_contract() == 0);
     void *q4_mapped = NULL;
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
     void *attn_hc_mapped = NULL;
