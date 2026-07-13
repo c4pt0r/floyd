@@ -33,6 +33,11 @@ static float json_float(jval *root, const char *name, float fallback) {
     return value && value->t == J_NUM ? (float)value->num : fallback;
 }
 
+static int json_bool(jval *root, const char *name, int fallback) {
+    jval *value = json_get(root, name);
+    return value && value->t == J_BOOL ? value->boolean : fallback;
+}
+
 static int read_config(MoonlightConfig *config, const char *path,
                        char *error, size_t error_size) {
     char filename[4096];
@@ -83,6 +88,7 @@ static int read_config(MoonlightConfig *config, const char *path,
     config->qk_rope_dim = json_int(root, "qk_rope_head_dim");
     config->value_dim = json_int(root, "v_head_dim");
     config->shared_expert_count = json_int(root, "n_shared_experts");
+    config->normalize_topk = json_bool(root, "norm_topk_prob", 1);
     config->vocab_size = json_int(root, "vocab_size");
     config->rms_norm_epsilon = json_float(root, "rms_norm_eps", 1e-5f);
     config->rope_theta = json_float(root, "rope_theta", 10000.0f);

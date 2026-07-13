@@ -44,6 +44,7 @@ tests/test_moonlight_oracle
 tests/test_moonlight_metal_runtime
 tests/test_moonlight_metal_primitives
 tests/test_moonlight_metal_mla
+tests/test_moonlight_metal_moe
 tools/probe_safetensors
 kernels_metal.h
 moonlight_kernels_metal.h

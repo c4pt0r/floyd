@@ -281,3 +281,105 @@ kernel void moonlight_attention_absorbed(
         context[context_offset + value] = sum;
     }
 }
+
+kernel void moonlight_route_sigmoid_topk(
+        device const float *logits [[buffer(0)]],
+        device const float *selection_bias [[buffer(1)]],
+        device int *route_ids [[buffer(2)]],
+        device float *route_weights [[buffer(3)]],
+        constant uint *shape [[buffer(4)]],
+        constant float &routed_scale [[buffer(5)]],
+        uint row [[thread_position_in_grid]]) {
+    uint rows = shape[0];
+    uint expert_count = shape[1];
+    uint top_k = shape[2];
+    uint normalize = shape[3];
+    if (row >= rows) return;
+    float scores[256];
+    uint logit_offset = row * expert_count;
+    uint route_offset = row * top_k;
+    for (uint expert = 0; expert < expert_count; ++expert)
+        scores[expert] = 1.0f / (1.0f + exp(-logits[logit_offset + expert]));
+    for (uint slot = 0; slot < top_k; ++slot) {
+        int best = -1;
+        float best_value = -3.402823466e+38f;
+        for (uint expert = 0; expert < expert_count; ++expert) {
+            bool selected = false;
+            for (uint previous = 0; previous < slot; ++previous)
+                selected = selected || route_ids[route_offset + previous] == int(expert);
+            float value = scores[expert] + selection_bias[expert];
+            if (!selected && value > best_value) {
+                best = int(expert);
+                best_value = value;
+            }
+        }
+        route_ids[route_offset + slot] = best;
+        route_weights[route_offset + slot] = scores[best];
+    }
+    float denominator = 1.0e-20f;
+    if (normalize)
+        for (uint slot = 0; slot < top_k; ++slot)
+            denominator += route_weights[route_offset + slot];
+    else
+        denominator = 1.0f;
+    for (uint slot = 0; slot < top_k; ++slot)
+        route_weights[route_offset + slot] =
+            route_weights[route_offset + slot] / denominator * routed_scale;
+}
+
+kernel void moonlight_clear_f32(device float *output [[buffer(0)]],
+                                constant uint &count [[buffer(1)]],
+                                uint index [[thread_position_in_grid]]) {
+    if (index < count) output[index] = 0.0f;
+}
+
+kernel void moonlight_gather_rows(device const float *input [[buffer(0)]],
+                                  device const int *row_indices [[buffer(1)]],
+                                  device float *output [[buffer(2)]],
+                                  constant uint *shape [[buffer(3)]],
+                                  uint index [[thread_position_in_grid]]) {
+    uint row_count = shape[0];
+    uint width = shape[1];
+    if (index >= row_count * width) return;
+    uint row = index / width;
+    uint column = index - row * width;
+    output[index] = input[uint(row_indices[row]) * width + column];
+}
+
+kernel void moonlight_silu_multiply(device const float *gate [[buffer(0)]],
+                                    device const float *up [[buffer(1)]],
+                                    device float *output [[buffer(2)]],
+                                    constant uint &count [[buffer(3)]],
+                                    uint index [[thread_position_in_grid]]) {
+    if (index >= count) return;
+    float value = gate[index];
+    output[index] = value / (1.0f + exp(-value)) * up[index];
+}
+
+kernel void moonlight_scatter_expert(
+        device const float *expert_output [[buffer(0)]],
+        device const int *row_indices [[buffer(1)]],
+        device const int *route_slots [[buffer(2)]],
+        device const float *route_weights [[buffer(3)]],
+        device float *routed_output [[buffer(4)]],
+        constant uint *shape [[buffer(5)]],
+        uint index [[thread_position_in_grid]]) {
+    uint row_count = shape[0];
+    uint width = shape[1];
+    uint top_k = shape[2];
+    if (index >= row_count * width) return;
+    uint gathered_row = index / width;
+    uint column = index - gathered_row * width;
+    uint output_row = uint(row_indices[gathered_row]);
+    uint slot = uint(route_slots[gathered_row]);
+    float weight = route_weights[output_row * top_k + slot];
+    routed_output[output_row * width + column] += weight * expert_output[index];
+}
+
+kernel void moonlight_add_f32(device const float *left [[buffer(0)]],
+                              device const float *right [[buffer(1)]],
+                              device float *output [[buffer(2)]],
+                              constant uint &count [[buffer(3)]],
+                              uint index [[thread_position_in_grid]]) {
+    if (index < count) output[index] = left[index] + right[index];
+}

@@ -29,6 +29,12 @@ struct MoonlightModel {
     __strong id<MTLComputePipelineState> cache_append;
     __strong id<MTLComputePipelineState> rope_query;
     __strong id<MTLComputePipelineState> attention_absorbed;
+    __strong id<MTLComputePipelineState> route_sigmoid_topk;
+    __strong id<MTLComputePipelineState> clear_f32;
+    __strong id<MTLComputePipelineState> gather_rows;
+    __strong id<MTLComputePipelineState> silu_multiply;
+    __strong id<MTLComputePipelineState> scatter_expert;
+    __strong id<MTLComputePipelineState> add_f32;
     MoonlightWeight *weights;
     int weight_count;
     uint64_t resident_bytes;
@@ -46,8 +52,22 @@ struct MoonlightSession {
     __strong id<MTLBuffer> query;
     __strong id<MTLBuffer> compressed;
     __strong id<MTLBuffer> context;
+    __strong id<MTLBuffer> router_logits;
+    __strong id<MTLBuffer> route_ids;
+    __strong id<MTLBuffer> route_weights;
+    __strong id<MTLBuffer> expert_rows;
+    __strong id<MTLBuffer> expert_slots;
+    __strong id<MTLBuffer> expert_input;
+    __strong id<MTLBuffer> expert_gate;
+    __strong id<MTLBuffer> expert_up;
+    __strong id<MTLBuffer> expert_hidden;
+    __strong id<MTLBuffer> expert_output;
+    __strong id<MTLBuffer> routed_output;
+    __strong id<MTLBuffer> shared_output;
     MoonlightStats stats;
     int *kv_lengths;
+    int *host_unique_experts;
+    int *host_expert_row_counts;
     int position;
 };
 
@@ -150,6 +170,15 @@ static void encode_matmul(MoonlightModel *model,
         threadsPerThreadgroup:MTLSizeMake(columns, row_threads, 1)];
 }
 
+static void dispatch_1d(id<MTLComputeCommandEncoder> encoder,
+                        id<MTLComputePipelineState> pipeline,
+                        NSUInteger count) {
+    NSUInteger threads = MIN((NSUInteger)256,
+                             pipeline.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(MAX(threads, (NSUInteger)1), 1, 1)];
+}
+
 static int finish_command(MoonlightSession *session, id<MTLCommandBuffer> command) {
     [command commit];
     [command waitUntilCompleted];
@@ -223,9 +252,20 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
     model->rope_query = make_pipeline(model, @"moonlight_rope_query", &metal_error);
     model->attention_absorbed =
         make_pipeline(model, @"moonlight_attention_absorbed", &metal_error);
+    model->route_sigmoid_topk =
+        make_pipeline(model, @"moonlight_route_sigmoid_topk", &metal_error);
+    model->clear_f32 = make_pipeline(model, @"moonlight_clear_f32", &metal_error);
+    model->gather_rows = make_pipeline(model, @"moonlight_gather_rows", &metal_error);
+    model->silu_multiply =
+        make_pipeline(model, @"moonlight_silu_multiply", &metal_error);
+    model->scatter_expert =
+        make_pipeline(model, @"moonlight_scatter_expert", &metal_error);
+    model->add_f32 = make_pipeline(model, @"moonlight_add_f32", &metal_error);
     if (!model->noop || !model->embed_f32 || !model->rmsnorm ||
         !model->matmul_f32 || !model->matmul_q8 || !model->matmul_q4 ||
-        !model->cache_append || !model->rope_query || !model->attention_absorbed) {
+        !model->cache_append || !model->rope_query || !model->attention_absorbed ||
+        !model->route_sigmoid_topk || !model->clear_f32 || !model->gather_rows ||
+        !model->silu_multiply || !model->scatter_expert || !model->add_f32) {
         NSString *message = metal_error.localizedDescription ?: @"unknown error";
         set_error(error, error_size, "Moonlight pipeline creation failed: %s",
                   message.UTF8String);
@@ -291,6 +331,12 @@ void moonlight_model_close(MoonlightModel *model) {
     model->cache_append = nil;
     model->rope_query = nil;
     model->attention_absorbed = nil;
+    model->route_sigmoid_topk = nil;
+    model->clear_f32 = nil;
+    model->gather_rows = nil;
+    model->silu_multiply = nil;
+    model->scatter_expert = nil;
+    model->add_f32 = nil;
     model->library = nil;
     model->queue = nil;
     model->device = nil;
@@ -314,8 +360,13 @@ MoonlightModelInfo moonlight_model_info(const MoonlightModel *model) {
     result.qk_nope_dim = config->qk_nope_dim;
     result.qk_rope_dim = config->qk_rope_dim;
     result.value_dim = config->value_dim;
+    result.expert_count = config->expert_count;
+    result.experts_per_token = config->experts_per_token;
+    result.moe_intermediate_size = config->moe_intermediate_size;
+    result.shared_expert_count = config->shared_expert_count;
     result.rms_norm_epsilon = config->rms_norm_epsilon;
     result.rope_theta = config->rope_theta;
+    result.routed_scale = config->routed_scale;
     result.resident_bytes = model->resident_bytes;
     return result;
 }
@@ -333,6 +384,13 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     size_t query_size;
     size_t compressed_size;
     size_t context_size;
+    size_t router_size;
+    size_t route_size;
+    size_t row_index_size;
+    size_t expert_input_size;
+    size_t expert_intermediate_size;
+    size_t expert_output_size;
+    int shared_width;
 
     if (!out || !model || !options)
         return set_error(error, error_size, "model and session options are required");
@@ -368,10 +426,33 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
         !multiply_size((size_t)options->max_batch, config->head_count,
                        &context_size) ||
         !multiply_size(context_size, config->value_dim, &context_size) ||
-        !multiply_size(context_size, sizeof(float), &context_size))
+        !multiply_size(context_size, sizeof(float), &context_size) ||
+        !multiply_size((size_t)options->max_batch, config->expert_count,
+                       &router_size) ||
+        !multiply_size(router_size, sizeof(float), &router_size) ||
+        !multiply_size((size_t)options->max_batch, config->experts_per_token,
+                       &route_size) ||
+        !multiply_size(route_size, sizeof(float), &route_size) ||
+        !multiply_size((size_t)options->max_batch, config->expert_count,
+                       &row_index_size) ||
+        !multiply_size(row_index_size, sizeof(int32_t), &row_index_size) ||
+        !multiply_size((size_t)options->max_batch, config->hidden_size,
+                       &expert_input_size) ||
+        !multiply_size(expert_input_size, sizeof(float), &expert_input_size))
         return set_error(error, error_size, "Moonlight session size overflow");
+    shared_width = config->moe_intermediate_size * config->shared_expert_count;
+    if (!multiply_size((size_t)options->max_batch,
+                       (size_t)MAX(config->moe_intermediate_size, shared_width),
+                       &expert_intermediate_size) ||
+        !multiply_size(expert_intermediate_size, sizeof(float),
+                       &expert_intermediate_size) ||
+        !multiply_size((size_t)options->max_batch, config->hidden_size,
+                       &expert_output_size) ||
+        !multiply_size(expert_output_size, sizeof(float), &expert_output_size))
+        return set_error(error, error_size, "Moonlight MoE session size overflow");
     if (config->kv_lora_rank > 512 || config->qk_rope_dim > 256 ||
-        (config->qk_rope_dim & 1))
+        (config->qk_rope_dim & 1) || config->expert_count > 256 ||
+        config->experts_per_token > config->expert_count)
         return set_error(error, error_size,
                          "unsupported Moonlight MLA dimensions");
 
@@ -389,12 +470,43 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     session->query = allocate_buffer(session, query_size, error, error_size);
     session->compressed = allocate_buffer(session, compressed_size, error, error_size);
     session->context = allocate_buffer(session, context_size, error, error_size);
+    session->router_logits = allocate_buffer(session, router_size, error, error_size);
+    session->route_ids = allocate_buffer(session, route_size, error, error_size);
+    session->route_weights = allocate_buffer(session, route_size, error, error_size);
+    session->expert_rows = allocate_buffer(session, row_index_size, error, error_size);
+    session->expert_slots = allocate_buffer(session, row_index_size, error, error_size);
+    session->expert_input =
+        allocate_buffer(session, expert_input_size, error, error_size);
+    session->expert_gate =
+        allocate_buffer(session, expert_intermediate_size, error, error_size);
+    session->expert_up =
+        allocate_buffer(session, expert_intermediate_size, error, error_size);
+    session->expert_hidden =
+        allocate_buffer(session, expert_intermediate_size, error, error_size);
+    session->expert_output =
+        allocate_buffer(session, expert_output_size, error, error_size);
+    session->routed_output =
+        allocate_buffer(session, expert_output_size, error, error_size);
+    session->shared_output =
+        allocate_buffer(session, expert_output_size, error, error_size);
     session->kv_lengths = calloc((size_t)config->layer_count,
                                  sizeof(*session->kv_lengths));
+    session->host_unique_experts = calloc((size_t)config->expert_count,
+                                          sizeof(*session->host_unique_experts));
+    session->host_expert_row_counts =
+        calloc((size_t)config->expert_count,
+               sizeof(*session->host_expert_row_counts));
     if (!session->activation_a || !session->activation_b || !session->latent_kv ||
         !session->rope_kv || !session->token_ids || !session->logits ||
         !session->query || !session->compressed || !session->context ||
-        !session->kv_lengths) {
+        !session->router_logits || !session->route_ids ||
+        !session->route_weights || !session->expert_rows ||
+        !session->expert_slots || !session->expert_input ||
+        !session->expert_gate || !session->expert_up ||
+        !session->expert_hidden || !session->expert_output ||
+        !session->routed_output || !session->shared_output ||
+        !session->kv_lengths || !session->host_unique_experts ||
+        !session->host_expert_row_counts) {
         moonlight_session_destroy(session);
         return 0;
     }
@@ -413,7 +525,21 @@ void moonlight_session_destroy(MoonlightSession *session) {
     session->query = nil;
     session->compressed = nil;
     session->context = nil;
+    session->router_logits = nil;
+    session->route_ids = nil;
+    session->route_weights = nil;
+    session->expert_rows = nil;
+    session->expert_slots = nil;
+    session->expert_input = nil;
+    session->expert_gate = nil;
+    session->expert_up = nil;
+    session->expert_hidden = nil;
+    session->expert_output = nil;
+    session->routed_output = nil;
+    session->shared_output = nil;
     free(session->kv_lengths);
+    free(session->host_unique_experts);
+    free(session->host_expert_row_counts);
     free(session);
 }
 
@@ -774,5 +900,217 @@ int moonlight_test_copy_kv(const MoonlightSession *session, int layer,
            (size_t)length * config->kv_lora_rank * sizeof(float));
     memcpy(rope, (float *)session->rope_kv.contents + rope_offset,
            (size_t)length * config->qk_rope_dim * sizeof(float));
+    return 1;
+}
+
+int moonlight_test_moe(MoonlightSession *session, int layer,
+                       const float *input, int rows, int *route_ids,
+                       float *route_weights, float *router_scores,
+                       float *routed_output, float *shared_output,
+                       float *output) {
+    const MoonlightConfig *config;
+    MoonlightMatrix router_matrix;
+    MoonlightMatrix gate_matrix;
+    MoonlightMatrix up_matrix;
+    MoonlightMatrix down_matrix;
+    MoonlightTensorInfo bias_info;
+    char name[512];
+    int bias_index;
+    int shared_width;
+    int unique_count = 0;
+    size_t hidden_bytes;
+    size_t route_bytes;
+    size_t score_bytes;
+    uint32_t route_shape[4];
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+
+    if (!session || !input || !route_ids || !route_weights ||
+        !router_scores || !routed_output || !shared_output || !output ||
+        rows <= 0 || rows > session->options.max_batch) return 0;
+    config = moonlight_model_data_config(session->model->data);
+    if (layer < config->first_dense_layer_count || layer >= config->layer_count ||
+        config->expert_count <= 0 || config->experts_per_token <= 0 ||
+        config->shared_expert_count <= 0) return 0;
+    shared_width = config->moe_intermediate_size * config->shared_expert_count;
+    hidden_bytes = (size_t)rows * config->hidden_size * sizeof(float);
+    route_bytes = (size_t)rows * config->experts_per_token * sizeof(float);
+    score_bytes = (size_t)rows * config->expert_count * sizeof(float);
+    memcpy(session->activation_a.contents, input, hidden_bytes);
+
+    if (snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        config->expert_count, &router_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.gate.e_score_correction_bias", layer) >=
+            (int)sizeof(name)) return 0;
+    bias_index = weight_index(session->model, name, &bias_info);
+    if (bias_index < 0 || bias_info.dtype != MOONLIGHT_TENSOR_F32 ||
+        bias_info.element_count != config->expert_count) return 0;
+
+    command = [session->model->queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    encode_matmul(session->model, encoder, &router_matrix,
+                  session->activation_a, session->router_logits, rows,
+                  config->hidden_size, config->expert_count);
+    route_shape[0] = (uint32_t)rows;
+    route_shape[1] = (uint32_t)config->expert_count;
+    route_shape[2] = (uint32_t)config->experts_per_token;
+    route_shape[3] = (uint32_t)config->normalize_topk;
+    [encoder setComputePipelineState:session->model->route_sigmoid_topk];
+    [encoder setBuffer:session->router_logits offset:0 atIndex:0];
+    [encoder setBuffer:session->model->weights[bias_index].buffer offset:0 atIndex:1];
+    [encoder setBuffer:session->route_ids offset:0 atIndex:2];
+    [encoder setBuffer:session->route_weights offset:0 atIndex:3];
+    [encoder setBytes:route_shape length:sizeof(route_shape) atIndex:4];
+    [encoder setBytes:&config->routed_scale length:sizeof(config->routed_scale)
+                atIndex:5];
+    dispatch_1d(encoder, session->model->route_sigmoid_topk, (NSUInteger)rows);
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+
+    int *selected = session->route_ids.contents;
+    int *all_expert_rows = session->expert_rows.contents;
+    int *all_expert_slots = session->expert_slots.contents;
+    unsigned char seen[256] = {0};
+    memset(session->host_expert_row_counts, 0,
+           (size_t)config->expert_count *
+           sizeof(*session->host_expert_row_counts));
+    for (int row = 0; row < rows; ++row) {
+        for (int slot = 0; slot < config->experts_per_token; ++slot) {
+            int expert = selected[(int64_t)row * config->experts_per_token + slot];
+            if (expert < 0 || expert >= config->expert_count) return 0;
+            if (!seen[expert]) {
+                seen[expert] = 1;
+                session->host_unique_experts[unique_count++] = expert;
+            }
+            int expert_row = session->host_expert_row_counts[expert]++;
+            int64_t offset = (int64_t)expert * session->options.max_batch +
+                             expert_row;
+            all_expert_rows[offset] = row;
+            all_expert_slots[offset] = slot;
+        }
+    }
+
+    command = [session->model->queue commandBuffer];
+    encoder = [command computeCommandEncoder];
+    uint32_t hidden_count = (uint32_t)((int64_t)rows * config->hidden_size);
+    [encoder setComputePipelineState:session->model->clear_f32];
+    [encoder setBuffer:session->routed_output offset:0 atIndex:0];
+    [encoder setBytes:&hidden_count length:sizeof(hidden_count) atIndex:1];
+    dispatch_1d(encoder, session->model->clear_f32, hidden_count);
+
+    for (int unique = 0; unique < unique_count; ++unique) {
+        int expert = session->host_unique_experts[unique];
+        int expert_row_count = session->host_expert_row_counts[expert];
+        NSUInteger index_offset =
+            (NSUInteger)expert * session->options.max_batch * sizeof(int32_t);
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.gate_proj.weight",
+                     layer, expert) >= (int)sizeof(name) ||
+            !resolve_matrix(session->model, name, config->hidden_size,
+                            config->moe_intermediate_size, &gate_matrix)) return 0;
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.up_proj.weight",
+                     layer, expert) >= (int)sizeof(name) ||
+            !resolve_matrix(session->model, name, config->hidden_size,
+                            config->moe_intermediate_size, &up_matrix)) return 0;
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.down_proj.weight",
+                     layer, expert) >= (int)sizeof(name) ||
+            !resolve_matrix(session->model, name, config->moe_intermediate_size,
+                            config->hidden_size, &down_matrix)) return 0;
+
+        uint32_t gather_shape[2] = {(uint32_t)expert_row_count,
+                                    (uint32_t)config->hidden_size};
+        [encoder setComputePipelineState:session->model->gather_rows];
+        [encoder setBuffer:session->activation_a offset:0 atIndex:0];
+        [encoder setBuffer:session->expert_rows offset:index_offset atIndex:1];
+        [encoder setBuffer:session->expert_input offset:0 atIndex:2];
+        [encoder setBytes:gather_shape length:sizeof(gather_shape) atIndex:3];
+        dispatch_1d(encoder, session->model->gather_rows,
+                    (NSUInteger)expert_row_count * config->hidden_size);
+        encode_matmul(session->model, encoder, &gate_matrix,
+                      session->expert_input, session->expert_gate,
+                      expert_row_count, config->hidden_size,
+                      config->moe_intermediate_size);
+        encode_matmul(session->model, encoder, &up_matrix,
+                      session->expert_input, session->expert_up,
+                      expert_row_count, config->hidden_size,
+                      config->moe_intermediate_size);
+        uint32_t intermediate_count =
+            (uint32_t)((int64_t)expert_row_count * config->moe_intermediate_size);
+        [encoder setComputePipelineState:session->model->silu_multiply];
+        [encoder setBuffer:session->expert_gate offset:0 atIndex:0];
+        [encoder setBuffer:session->expert_up offset:0 atIndex:1];
+        [encoder setBuffer:session->expert_hidden offset:0 atIndex:2];
+        [encoder setBytes:&intermediate_count length:sizeof(intermediate_count)
+                  atIndex:3];
+        dispatch_1d(encoder, session->model->silu_multiply, intermediate_count);
+        encode_matmul(session->model, encoder, &down_matrix,
+                      session->expert_hidden, session->expert_output,
+                      expert_row_count, config->moe_intermediate_size,
+                      config->hidden_size);
+        uint32_t scatter_shape[3] = {(uint32_t)expert_row_count,
+                                     (uint32_t)config->hidden_size,
+                                     (uint32_t)config->experts_per_token};
+        [encoder setComputePipelineState:session->model->scatter_expert];
+        [encoder setBuffer:session->expert_output offset:0 atIndex:0];
+        [encoder setBuffer:session->expert_rows offset:index_offset atIndex:1];
+        [encoder setBuffer:session->expert_slots offset:index_offset atIndex:2];
+        [encoder setBuffer:session->route_weights offset:0 atIndex:3];
+        [encoder setBuffer:session->routed_output offset:0 atIndex:4];
+        [encoder setBytes:scatter_shape length:sizeof(scatter_shape) atIndex:5];
+        dispatch_1d(encoder, session->model->scatter_expert,
+                    (NSUInteger)expert_row_count * config->hidden_size);
+    }
+
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.shared_experts.gate_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        shared_width, &gate_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.shared_experts.up_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        shared_width, &up_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.shared_experts.down_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, shared_width,
+                        config->hidden_size, &down_matrix)) return 0;
+    encode_matmul(session->model, encoder, &gate_matrix,
+                  session->activation_a, session->expert_gate, rows,
+                  config->hidden_size, shared_width);
+    encode_matmul(session->model, encoder, &up_matrix,
+                  session->activation_a, session->expert_up, rows,
+                  config->hidden_size, shared_width);
+    uint32_t shared_count = (uint32_t)((int64_t)rows * shared_width);
+    [encoder setComputePipelineState:session->model->silu_multiply];
+    [encoder setBuffer:session->expert_gate offset:0 atIndex:0];
+    [encoder setBuffer:session->expert_up offset:0 atIndex:1];
+    [encoder setBuffer:session->expert_hidden offset:0 atIndex:2];
+    [encoder setBytes:&shared_count length:sizeof(shared_count) atIndex:3];
+    dispatch_1d(encoder, session->model->silu_multiply, shared_count);
+    encode_matmul(session->model, encoder, &down_matrix,
+                  session->expert_hidden, session->shared_output, rows,
+                  shared_width, config->hidden_size);
+    [encoder setComputePipelineState:session->model->add_f32];
+    [encoder setBuffer:session->routed_output offset:0 atIndex:0];
+    [encoder setBuffer:session->shared_output offset:0 atIndex:1];
+    [encoder setBuffer:session->activation_b offset:0 atIndex:2];
+    [encoder setBytes:&hidden_count length:sizeof(hidden_count) atIndex:3];
+    dispatch_1d(encoder, session->model->add_f32, hidden_count);
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+
+    memcpy(route_ids, session->route_ids.contents, route_bytes);
+    memcpy(route_weights, session->route_weights.contents, route_bytes);
+    memcpy(router_scores, session->router_logits.contents, score_bytes);
+    memcpy(routed_output, session->routed_output.contents, hidden_bytes);
+    memcpy(shared_output, session->shared_output.contents, hidden_bytes);
+    memcpy(output, session->activation_b.contents, hidden_bytes);
     return 1;
 }

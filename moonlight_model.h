@@ -28,6 +28,7 @@ typedef struct {
     int qk_rope_dim;
     int value_dim;
     int shared_expert_count;
+    int normalize_topk;
     int vocab_size;
     float rms_norm_epsilon;
     float rope_theta;

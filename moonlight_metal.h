@@ -21,8 +21,13 @@ typedef struct {
     int qk_nope_dim;
     int qk_rope_dim;
     int value_dim;
+    int expert_count;
+    int experts_per_token;
+    int moe_intermediate_size;
+    int shared_expert_count;
     float rms_norm_epsilon;
     float rope_theta;
+    float routed_scale;
     uint64_t resident_bytes;
 } MoonlightModelInfo;
 
@@ -65,5 +70,10 @@ int moonlight_test_attention(MoonlightSession *session, int layer,
 int moonlight_test_kv_length(const MoonlightSession *session, int layer);
 int moonlight_test_copy_kv(const MoonlightSession *session, int layer,
                            float *latent, float *rope, int capacity);
+int moonlight_test_moe(MoonlightSession *session, int layer,
+                       const float *input, int rows, int *route_ids,
+                       float *route_weights, float *router_scores,
+                       float *routed_output, float *shared_output,
+                       float *output);
 
 #endif
