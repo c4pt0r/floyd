@@ -20,6 +20,11 @@ typedef struct {
     uint8_t qs[128];
 } test_block_q4_k;
 
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} test_block_q8_0;
+
 #define CHECK(condition) do { \
     if (!(condition)) { \
         fprintf(stderr, "%s:%d: check failed: %s\n", \
@@ -115,6 +120,135 @@ static int test_dense_q4_k(void **mapped_out) {
     return 0;
 }
 
+static int test_attention_q8_hc_exact_rows(void **mapped_out) {
+    enum { TOKENS = 3, IN_DIM = 2048, N_EMBD = 4096, N_HC = 4, MIX_HC = 24 };
+    const size_t page_size = 16384u;
+    const size_t blocks_per_row = IN_DIM / 32u;
+    const size_t weight_bytes =
+        (size_t)N_EMBD * blocks_per_row * sizeof(test_block_q8_0);
+    const size_t map_bytes = (weight_bytes + page_size - 1u) & ~(page_size - 1u);
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, page_size, map_bytes) == 0);
+    memset(mapped, 0, map_bytes);
+    test_block_q8_0 *weights = mapped;
+    for (int row = 0; row < N_EMBD; row++) {
+        for (size_t block = 0; block < blocks_per_row; block++) {
+            test_block_q8_0 *w = weights + (size_t)row * blocks_per_row + block;
+            w->d = 0x3000u;
+            for (int i = 0; i < 32; i++)
+                w->qs[i] = (int8_t)(((row * 3 + (int)block * 5 + i * 7) % 15) - 7);
+        }
+    }
+
+    const size_t input_count = (size_t)TOKENS * IN_DIM;
+    const size_t block_count = (size_t)TOKENS * N_EMBD;
+    const size_t hc_count = (size_t)TOKENS * N_HC * N_EMBD;
+    const size_t split_count = (size_t)TOKENS * MIX_HC;
+    float *input = malloc(input_count * sizeof(*input));
+    float *residual = malloc(hc_count * sizeof(*residual));
+    float *split = malloc(split_count * sizeof(*split));
+    float *batch_block = malloc(block_count * sizeof(*batch_block));
+    float *row_block = malloc(block_count * sizeof(*row_block));
+    float *batch_hc = malloc(hc_count * sizeof(*batch_hc));
+    float *row_hc = malloc(hc_count * sizeof(*row_hc));
+    CHECK(input && residual && split && batch_block && row_block && batch_hc && row_hc);
+    for (size_t i = 0; i < input_count; i++)
+        input[i] = (float)((int)((i * 13u + 17u) % 63u) - 31) / 128.0f;
+    for (size_t i = 0; i < hc_count; i++)
+        residual[i] = (float)((int)((i * 11u + 3u) % 47u) - 23) / 64.0f;
+    for (int token = 0; token < TOKENS; token++) {
+        float *row = split + (size_t)token * MIX_HC;
+        for (int i = 0; i < N_HC; i++) row[i] = 0.0f;
+        for (int i = 0; i < N_HC; i++) row[N_HC + i] = 0.25f * (float)(i + 1);
+        for (int dst = 0; dst < N_HC; dst++)
+            for (int src = 0; src < N_HC; src++)
+                row[2 * N_HC + dst * N_HC + src] =
+                    dst == src ? 0.75f : 0.0625f;
+    }
+
+#define TENSOR(name, count) \
+    ds4_gpu_tensor *name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)); \
+    CHECK(name)
+    TENSOR(x, input_count);
+    TENSOR(res, hc_count);
+    TENSOR(post, split_count);
+    TENSOR(block, block_count);
+    TENSOR(hc, hc_count);
+    TENSOR(x_one, IN_DIM);
+    TENSOR(res_one, N_HC * N_EMBD);
+    TENSOR(post_one, MIX_HC);
+    TENSOR(block_one, N_EMBD);
+    TENSOR(hc_one, N_HC * N_EMBD);
+#undef TENSOR
+
+    CHECK(ds4_gpu_set_model_map_range(mapped, map_bytes, 0, map_bytes,
+                                       weight_bytes));
+    CHECK(ds4_gpu_tensor_write(x, 0, input, input_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(res, 0, residual, hc_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(post, 0, split, split_count * sizeof(float)));
+
+    ds4_gpu_kernel_stats before, after;
+    ds4_gpu_get_kernel_stats(&before);
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_decode_order_batch_tensor(
+        hc, block, mapped, map_bytes, 0, IN_DIM, N_EMBD, x, res, post,
+        N_EMBD, N_HC, TOKENS));
+    CHECK(ds4_gpu_tensor_read(block, 0, batch_block,
+                              block_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(hc, 0, batch_hc, hc_count * sizeof(float)));
+    for (int token = 0; token < TOKENS; token++) {
+        CHECK(ds4_gpu_tensor_write(x_one, 0,
+                                   input + (size_t)token * IN_DIM,
+                                   (uint64_t)IN_DIM * sizeof(float)));
+        CHECK(ds4_gpu_tensor_write(res_one, 0,
+                                   residual + (size_t)token * N_HC * N_EMBD,
+                                   (uint64_t)N_HC * N_EMBD * sizeof(float)));
+        CHECK(ds4_gpu_tensor_write(post_one, 0,
+                                   split + (size_t)token * MIX_HC,
+                                   (uint64_t)MIX_HC * sizeof(float)));
+        CHECK(ds4_gpu_matmul_q8_0_hc_expand_decode_order_batch_tensor(
+            hc_one, block_one, mapped, map_bytes, 0, IN_DIM, N_EMBD,
+            x_one, res_one, post_one, N_EMBD, N_HC, 1));
+        CHECK(ds4_gpu_tensor_read(block_one, 0,
+                                  row_block + (size_t)token * N_EMBD,
+                                  (uint64_t)N_EMBD * sizeof(float)));
+        CHECK(ds4_gpu_tensor_read(hc_one, 0,
+                                  row_hc + (size_t)token * N_HC * N_EMBD,
+                                  (uint64_t)N_HC * N_EMBD * sizeof(float)));
+    }
+    ds4_gpu_get_kernel_stats(&after);
+    const float block_error = max_abs(batch_block, row_block, block_count);
+    const float hc_error = max_abs(batch_hc, row_hc, hc_count);
+    printf("DeepSeek V4 attention Q8 HC exact rows Metal: "
+           "block_max_abs=%.9g hc_max_abs=%.9g calls=%llu\n",
+           block_error, hc_error,
+           (unsigned long long)(after.tiny_batch_attn_hc_exact_rows_calls -
+                                before.tiny_batch_attn_hc_exact_rows_calls));
+    CHECK(block_error == 0.0f);
+    CHECK(hc_error == 0.0f);
+    CHECK(after.tiny_batch_attn_hc_exact_rows_calls ==
+          before.tiny_batch_attn_hc_exact_rows_calls + 1);
+
+    ds4_gpu_tensor_free(hc_one);
+    ds4_gpu_tensor_free(block_one);
+    ds4_gpu_tensor_free(post_one);
+    ds4_gpu_tensor_free(res_one);
+    ds4_gpu_tensor_free(x_one);
+    ds4_gpu_tensor_free(hc);
+    ds4_gpu_tensor_free(block);
+    ds4_gpu_tensor_free(post);
+    ds4_gpu_tensor_free(res);
+    ds4_gpu_tensor_free(x);
+    free(row_hc);
+    free(batch_hc);
+    free(row_block);
+    free(batch_block);
+    free(split);
+    free(residual);
+    free(input);
+    *mapped_out = mapped;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -129,6 +263,8 @@ int main(int argc, char **argv) {
     CHECK(ds4_gpu_init());
     void *q4_mapped = NULL;
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
+    void *attn_hc_mapped = NULL;
+    CHECK(test_attention_q8_hc_exact_rows(&attn_hc_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -212,6 +348,7 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
+    free(attn_hc_mapped);
     free(q4_mapped);
     return 0;
 }

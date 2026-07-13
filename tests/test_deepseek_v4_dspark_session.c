@@ -166,18 +166,21 @@ int main(int argc, char **argv) {
     CHECK(kernel_stats.tiny_batch_shared_swiglu_calls >= 43);
     CHECK(kernel_stats.tiny_batch_router_calls >= 43);
     CHECK(kernel_stats.tiny_batch_attn_hc_calls >= 43);
+    CHECK(kernel_stats.tiny_batch_attn_hc_exact_rows_calls >= 43);
     CHECK(kernel_stats.tiny_batch_raw_store_calls >= 43);
     CHECK(kernel_stats.tiny_batch_exact_attn_calls >= 43);
     CHECK(kernel_stats.tiny_batch_exact_q8_calls > 0);
     printf("DeepSeek V4 DSpark tiny batch fusion: moe_calls=%llu "
            "moe_fallback=%llu shared_calls=%llu router_calls=%llu "
-           "attn_hc_calls=%llu raw_store_calls=%llu exact_attn_calls=%llu "
+           "attn_hc_calls=%llu attn_hc_exact_rows_calls=%llu "
+           "raw_store_calls=%llu exact_attn_calls=%llu "
            "exact_q8_calls=%llu\n",
            (unsigned long long)kernel_stats.tiny_batch_pair_swiglu_calls,
            (unsigned long long)kernel_stats.tiny_batch_activation_fallback_calls,
            (unsigned long long)kernel_stats.tiny_batch_shared_swiglu_calls,
            (unsigned long long)kernel_stats.tiny_batch_router_calls,
            (unsigned long long)kernel_stats.tiny_batch_attn_hc_calls,
+           (unsigned long long)kernel_stats.tiny_batch_attn_hc_exact_rows_calls,
            (unsigned long long)kernel_stats.tiny_batch_raw_store_calls,
            (unsigned long long)kernel_stats.tiny_batch_exact_attn_calls,
            (unsigned long long)kernel_stats.tiny_batch_exact_q8_calls);
