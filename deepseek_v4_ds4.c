@@ -536,6 +536,16 @@ int deepseek_v4_ds4_generate_user(
                 spec_after.proposal_ms - spec_before.proposal_ms;
             stats->speculative_verify_ms =
                 spec_after.verify_ms - spec_before.verify_ms;
+            stats->speculative_verify_layer_encode_ms =
+                spec_after.verify_layer_encode_ms -
+                spec_before.verify_layer_encode_ms;
+            stats->speculative_verify_layer_execute_ms =
+                spec_after.verify_layer_execute_ms -
+                spec_before.verify_layer_execute_ms;
+            stats->speculative_verify_head_ms =
+                spec_after.verify_head_ms - spec_before.verify_head_ms;
+            stats->speculative_verify_read_ms =
+                spec_after.verify_read_ms - spec_before.verify_read_ms;
             stats->speculative_replay_ms =
                 spec_after.replay_ms - spec_before.replay_ms;
         }

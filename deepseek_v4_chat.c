@@ -74,7 +74,9 @@ static void deepseek_v4_chat_ds4_perf(const DeepSeekV4Ds4Stats *stats) {
             "prefix1_accepted=%d "
             "frontier_snapshots=%d "
             "target_ms=%.3f proposal_ms=%.3f "
-            "verify_ms=%.3f replay_ms=%.3f\n",
+            "verify_ms=%.3f verify_layer_encode_ms=%.3f "
+            "verify_layer_execute_ms=%.3f verify_head_ms=%.3f "
+            "verify_read_ms=%.3f replay_ms=%.3f\n",
             stats->load_ms, stats->prompt_tokens, prompt_tps,
             stats->generated_tokens, decode_tps,
             stats->speculative_rounds, stats->speculative_tokens,
@@ -83,6 +85,10 @@ static void deepseek_v4_chat_ds4_perf(const DeepSeekV4Ds4Stats *stats) {
             stats->speculative_frontier_snapshots,
             stats->speculative_target_ms,
             stats->speculative_proposal_ms, stats->speculative_verify_ms,
+            stats->speculative_verify_layer_encode_ms,
+            stats->speculative_verify_layer_execute_ms,
+            stats->speculative_verify_head_ms,
+            stats->speculative_verify_read_ms,
             stats->speculative_replay_ms);
 }
 

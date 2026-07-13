@@ -40,6 +40,10 @@ typedef struct {
     double speculative_target_ms;
     double speculative_proposal_ms;
     double speculative_verify_ms;
+    double speculative_verify_layer_encode_ms;
+    double speculative_verify_layer_execute_ms;
+    double speculative_verify_head_ms;
+    double speculative_verify_read_ms;
     double speculative_replay_ms;
 } DeepSeekV4Ds4Stats;
 

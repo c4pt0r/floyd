@@ -1,0 +1,99 @@
+--- a/ds4.h
++++ b/ds4.h
+@@ -62,6 +62,10 @@
+     double target_ms;
+     double proposal_ms;
+     double verify_ms;
++    double verify_layer_encode_ms;
++    double verify_layer_execute_ms;
++    double verify_head_ms;
++    double verify_read_ms;
+     double replay_ms;
+ } ds4_session_spec_stats;
+ 
+--- a/ds4.c
++++ b/ds4.c
+@@ -22143,12 +22143,14 @@
+         uint32_t               prefix1_capture_mask,
+         uint32_t               prefix2_capture_mask,
+         int                   *row_tops,
+-        float                 *row_logits) {
++        float                 *row_logits,
++        ds4_session_spec_stats *stats) {
+     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
+     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
+     if (top_rows && !row_tops) return false;
+ 
++    const double layer_started = now_sec();
+     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
+     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                          g->prefill_tokens,
+@@ -22182,8 +22184,16 @@
+                                             start,
+                                             n_tokens);
+     }
++    const double layer_encoded = now_sec();
+     if (ok) ok = ds4_gpu_end_commands() != 0;
+     else (void)ds4_gpu_synchronize();
++    const double layer_done = now_sec();
++    if (stats) {
++        stats->verify_layer_encode_ms +=
++            (layer_encoded - layer_started) * 1000.0;
++        stats->verify_layer_execute_ms +=
++            (layer_done - layer_encoded) * 1000.0;
++    }
+     ds4_gpu_set_tiny_decode_order(saved_decode_order);
+     g_metal_graph_dump_verifier = saved_dump_verifier;
+     g->spec_verify_decode_order = saved_decode_order;
+@@ -22193,6 +22203,7 @@
+     g->spec_prefix2_capture_mask = saved_capture2_mask;
+     if (!ok) return false;
+ 
++    const double head_started = now_sec();
+     ok = ds4_gpu_begin_commands() != 0;
+     if (ok) ok = metal_graph_encode_output_head_batch(g,
+                                                       model,
+@@ -22220,6 +22231,8 @@
+     }
+     if (ok) ok = ds4_gpu_end_commands() != 0;
+     else (void)ds4_gpu_synchronize();
++    const double head_done = now_sec();
++    if (stats) stats->verify_head_ms += (head_done - head_started) * 1000.0;
+     if (ok && top_rows) {
+         ok = ds4_gpu_tensor_read(g->comp_selected,
+                                    0,
+@@ -22232,6 +22245,7 @@
+                                    row_logits,
+                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+     }
++    if (stats) stats->verify_read_ms += (now_sec() - head_done) * 1000.0;
+     return ok;
+ }
+ 
+@@ -28500,7 +28514,8 @@
+                                              prefix1_capture_mask,
+                                              prefix2_capture_mask,
+                                              row_tops,
+-                                             NULL);
++                                             NULL,
++                                             &s->spec_stats);
+         s->spec_stats.verify_ms += (now_sec() - verify_started) * 1000.0;
+     }
+ 
+@@ -28954,6 +28969,7 @@
+                                                 capture_prefix1 ? (4u | 128u) : 0u,
+                                                 0u,
+                                                 row_tops,
++                                                NULL,
+                                                 NULL);
+         }
+         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
+@@ -29112,6 +29128,7 @@
+                                                     false,
+                                                     0u,
+                                                     row_tops,
++                                                    NULL,
+                                                     NULL);
+                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
+                                                               (uint32_t)(commit_drafts - 1),
