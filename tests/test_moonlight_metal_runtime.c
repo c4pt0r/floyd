@@ -227,6 +227,24 @@ int main(int argc, char **argv) {
            after.prefill_ms, id_count * 1000.0 / after.prefill_ms,
            after.decode_ms, 1000.0 / after.decode_ms);
 
+    moonlight_session_reset(session);
+    CHECK(moonlight_session_prefill(session, ids, (int)id_count, logits,
+                                    error, sizeof(error)) == 1);
+    logit_error = max_abs(logits,
+                          expected_logits + (id_count - 1) * info.vocab_size,
+                          info.vocab_size);
+    CHECK(logit_error < 3e-4f);
+    CHECK(argmax(logits, info.vocab_size) == greedy[0]);
+    CHECK(moonlight_session_decode(session, greedy[0], logits,
+                                   error, sizeof(error)) == 1);
+    CHECK(argmax(logits, info.vocab_size) == greedy[1]);
+    after = moonlight_session_stats(session);
+    printf("Moonlight Metal fast path: logits=%.9g commands=%llu prefill=%.3f ms decode=%.3f ms\n",
+           logit_error, (unsigned long long)after.command_buffers,
+           after.prefill_ms, after.decode_ms);
+    CHECK(after.command_buffers <= (uint64_t)(2 * info.layer_count + 2));
+    CHECK(after.cpu_fallbacks == 0);
+
     free(ids64);
     free(ids);
     free(expected_logits);
