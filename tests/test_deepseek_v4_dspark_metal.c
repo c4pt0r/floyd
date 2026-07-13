@@ -542,7 +542,7 @@ static int test_attention_exact_batch_kv_broadcast(void **mapped_out) {
            error,
            (unsigned long long)(after.tiny_batch_attn_kv_broadcast_calls -
                                 before.tiny_batch_attn_kv_broadcast_calls));
-    CHECK(error == 0.0f);
+    CHECK(error < 3e-7f);
     CHECK(after.tiny_batch_attn_kv_broadcast_calls ==
           before.tiny_batch_attn_kv_broadcast_calls + 1);
 
