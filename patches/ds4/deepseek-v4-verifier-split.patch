@@ -1,0 +1,58 @@
+diff --git a/ds4.c b/ds4.c
+index 27d7999..e8aeeb9 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -17189,6 +17189,20 @@ static uint32_t metal_graph_token_split_after_layers(void) {
+     return split_after_layers;
+ }
+ 
++static uint32_t metal_graph_verify_split_after_layers(void) {
++    uint32_t split_after_layers = 8;
++#ifndef DS4_ROCM_BUILD
++    const char *split_env = getenv("DS4_METAL_VERIFY_SPLIT_LAYERS");
++    if (split_env && split_env[0]) {
++        char *end = NULL;
++        const unsigned long v = strtoul(split_env, &end, 10);
++        if (end != split_env && *end == '\0' && v <= DS4_N_LAYER)
++            split_after_layers = (uint32_t)v;
++    }
++#endif
++    return split_after_layers;
++}
++
+ static bool metal_graph_capture_dspark_main_hidden(
+         ds4_gpu_graph *g,
+         uint32_t il,
+@@ -22234,6 +22248,8 @@ static bool metal_graph_verify_suffix_tops(
+     g_metal_graph_dump_verifier = true;
+     ds4_gpu_set_tiny_decode_order(true);
+     ok = ds4_gpu_begin_commands() != 0;
++    const uint32_t split_after_layers =
++        metal_graph_verify_split_after_layers();
+     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+         ok = metal_graph_encode_layer_batch(g,
+                                             model,
+@@ -22241,6 +22257,11 @@ static bool metal_graph_verify_suffix_tops(
+                                             il,
+                                             start,
+                                             n_tokens);
++        if (ok && split_after_layers != 0 &&
++            il + 1u == split_after_layers) {
++            ok = ds4_gpu_flush_commands() != 0;
++            if (ok && stats) stats->verify_split_flushes++;
++        }
+     }
+     const double layer_encoded = now_sec();
+     if (ok) ok = ds4_gpu_end_commands() != 0;
+diff --git a/ds4.h b/ds4.h
+index bd0c374..63af74f 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -67,6 +67,7 @@ typedef struct {
+     double verify_head_ms;
+     double verify_read_ms;
+     double replay_ms;
++    uint64_t verify_split_flushes;
+     uint64_t proposal_early_skips;
+     uint64_t verify_outcome_calls[7][7];
+     double verify_outcome_ms[7][7];
