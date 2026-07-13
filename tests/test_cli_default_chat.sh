@@ -27,3 +27,13 @@ if printf '%s\n' "$output" | grep -q "Motore C GLM"; then
 fi
 printf '%s\n' "$output" | grep -q "›"
 printf '%s\n' "$output" | grep -q "◆"
+
+set +e
+too_long=$(./floyd run --model "$model" --ctx 8 --ngen 1 \
+    --prompt "This prompt is intentionally too long for an eight token context." \
+    --temp 0 2>&1)
+too_long_status=$?
+set -e
+printf '%s\n' "$too_long"
+[ "$too_long_status" -ne 0 ]
+printf '%s\n' "$too_long" | grep -Eq 'too long|context'
