@@ -26,6 +26,7 @@ struct MoonlightModel {
     __strong id<MTLComputePipelineState> rmsnorm;
     __strong id<MTLComputePipelineState> matmul_f32;
     __strong id<MTLComputePipelineState> matmul_q8;
+    __strong id<MTLComputePipelineState> matmul_q8_reduction;
     __strong id<MTLComputePipelineState> matmul_q4;
     __strong id<MTLComputePipelineState> cache_append;
     __strong id<MTLComputePipelineState> rope_query;
@@ -83,6 +84,8 @@ typedef struct {
     int format;
     __unsafe_unretained id<MTLComputePipelineState> pipeline;
 } MoonlightMatrix;
+
+static double monotonic_seconds(void);
 
 static int set_error(char *error, size_t error_size, const char *format, ...) {
     va_list arguments;
@@ -159,7 +162,9 @@ static void encode_matmul_at(MoonlightModel *model,
                              int rows, int input_width, int output_width) {
     uint32_t shape[3] = {(uint32_t)output_width, (uint32_t)input_width,
                          (uint32_t)rows};
-    [encoder setComputePipelineState:matrix->pipeline];
+    id<MTLComputePipelineState> pipeline = matrix->format == 1
+        ? model->matmul_q8_reduction : matrix->pipeline;
+    [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:model->weights[matrix->weight_index].buffer offset:0 atIndex:0];
     if (matrix->scale_index >= 0) {
         [encoder setBuffer:model->weights[matrix->scale_index].buffer offset:0 atIndex:1];
@@ -171,10 +176,17 @@ static void encode_matmul_at(MoonlightModel *model,
         [encoder setBuffer:output offset:output_offset atIndex:2];
         [encoder setBytes:shape length:sizeof(shape) atIndex:3];
     }
-    NSUInteger columns = MIN((NSUInteger)32, (NSUInteger)output_width);
-    NSUInteger row_threads = MIN((NSUInteger)8, (NSUInteger)rows);
-    [encoder dispatchThreads:MTLSizeMake(output_width, rows, 1)
-        threadsPerThreadgroup:MTLSizeMake(columns, row_threads, 1)];
+    if (matrix->format == 1) {
+        NSUInteger threads = MIN((NSUInteger)32,
+                                 pipeline.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreadgroups:MTLSizeMake(output_width, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    } else {
+        NSUInteger columns = MIN((NSUInteger)32, (NSUInteger)output_width);
+        NSUInteger row_threads = MIN((NSUInteger)8, (NSUInteger)rows);
+        [encoder dispatchThreads:MTLSizeMake(output_width, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(columns, row_threads, 1)];
+    }
 }
 
 static void encode_matmul(MoonlightModel *model,
@@ -726,6 +738,8 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
     model->rmsnorm = make_pipeline(model, @"moonlight_rmsnorm", &metal_error);
     model->matmul_f32 = make_pipeline(model, @"moonlight_matmul_f32", &metal_error);
     model->matmul_q8 = make_pipeline(model, @"moonlight_matmul_q8", &metal_error);
+    model->matmul_q8_reduction =
+        make_pipeline(model, @"moonlight_matmul_q8_reduction", &metal_error);
     model->matmul_q4 = make_pipeline(model, @"moonlight_matmul_q4", &metal_error);
     model->cache_append = make_pipeline(model, @"moonlight_cache_append", &metal_error);
     model->rope_query = make_pipeline(model, @"moonlight_rope_query", &metal_error);
@@ -741,7 +755,8 @@ int moonlight_model_open(MoonlightModel **out, const char *path,
         make_pipeline(model, @"moonlight_scatter_expert", &metal_error);
     model->add_f32 = make_pipeline(model, @"moonlight_add_f32", &metal_error);
     if (!model->noop || !model->embed_f32 || !model->rmsnorm ||
-        !model->matmul_f32 || !model->matmul_q8 || !model->matmul_q4 ||
+        !model->matmul_f32 || !model->matmul_q8 ||
+        !model->matmul_q8_reduction || !model->matmul_q4 ||
         !model->cache_append || !model->rope_query || !model->attention_absorbed ||
         !model->route_sigmoid_topk || !model->clear_f32 || !model->gather_rows ||
         !model->silu_multiply || !model->scatter_expert || !model->add_f32) {
@@ -806,6 +821,7 @@ void moonlight_model_close(MoonlightModel *model) {
     model->rmsnorm = nil;
     model->matmul_f32 = nil;
     model->matmul_q8 = nil;
+    model->matmul_q8_reduction = nil;
     model->matmul_q4 = nil;
     model->cache_append = nil;
     model->rope_query = nil;
@@ -1780,6 +1796,8 @@ static int run_tokens_fast(MoonlightSession *session, const int *ids, int count,
         moonlight_model_data_config(session->model->data);
     int first_sparse = MIN(config->first_dense_layer_count,
                            config->layer_count);
+    int profile = getenv("MOONLIGHT_PROFILE") != NULL;
+    double command_start = monotonic_seconds();
     id<MTLCommandBuffer> command = [session->model->queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     if (!command || !encoder ||
@@ -1807,16 +1825,26 @@ static int run_tokens_fast(MoonlightSession *session, const int *ids, int count,
                          "Moonlight fast final projection failed");
     }
     [encoder endEncoding];
+    double wait_start = monotonic_seconds();
     if (!finish_command(session, command))
         return set_error(error, error_size,
                          "Moonlight fast initial command failed");
+    if (profile)
+        fprintf(stderr,
+                "moonlight profile rows=%d initial encode=%.3f wait=%.3f gpu=%.3f ms\n",
+                count, (wait_start - command_start) * 1000.0,
+                (monotonic_seconds() - wait_start) * 1000.0,
+                (command.GPUEndTime - command.GPUStartTime) * 1000.0);
 
     for (int layer = first_sparse; layer < config->layer_count; ++layer) {
         int unique_count;
+        double route_start = monotonic_seconds();
         if (!prepare_route_tables(session, layer, count, &unique_count))
             return set_error(error, error_size,
                              "Moonlight fast route table failed at layer %d",
                              layer);
+        double route_end = monotonic_seconds();
+        command_start = route_end;
         command = [session->model->queue commandBuffer];
         encoder = [command computeCommandEncoder];
         if (!command || !encoder ||
@@ -1836,10 +1864,19 @@ static int run_tokens_fast(MoonlightSession *session, const int *ids, int count,
                              "Moonlight fast final projection failed");
         }
         [encoder endEncoding];
+        wait_start = monotonic_seconds();
         if (!finish_command(session, command))
             return set_error(error, error_size,
                              "Moonlight fast command failed at layer %d",
                              layer);
+        if (profile)
+            fprintf(stderr,
+                    "moonlight profile rows=%d layer=%d experts=%d route=%.3f encode=%.3f wait=%.3f gpu=%.3f ms\n",
+                    count, layer, unique_count,
+                    (route_end - route_start) * 1000.0,
+                    (wait_start - command_start) * 1000.0,
+                    (monotonic_seconds() - wait_start) * 1000.0,
+                    (command.GPUEndTime - command.GPUStartTime) * 1000.0);
     }
     memcpy(last_logits, session->logits.contents,
            (size_t)config->vocab_size * sizeof(*last_logits));

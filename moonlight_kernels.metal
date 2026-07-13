@@ -79,6 +79,31 @@ kernel void moonlight_matmul_q8(device const char *weight [[buffer(0)]],
     output[row * output_width + column] = sum * scale[column];
 }
 
+kernel void moonlight_matmul_q8_reduction(
+        device const char *weight [[buffer(0)]],
+        device const float *scale [[buffer(1)]],
+        device const float *input [[buffer(2)]],
+        device float *output [[buffer(3)]],
+        constant uint *shape [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    uint column = group.x;
+    uint row = group.y;
+    uint output_width = shape[0];
+    uint input_width = shape[1];
+    uint rows = shape[2];
+    if (column >= output_width || row >= rows) return;
+    float sum = 0.0f;
+    uint input_offset = row * input_width;
+    uint weight_offset = column * input_width;
+    for (uint inner = lane; inner < input_width; inner += 32)
+        sum += input[input_offset + inner] *
+               float(weight[weight_offset + inner]);
+    sum = simd_sum(sum);
+    if (lane == 0)
+        output[row * output_width + column] = sum * scale[column];
+}
+
 kernel void moonlight_matmul_q4(device const uchar *weight [[buffer(0)]],
                                 device const float *scale [[buffer(1)]],
                                 device const float *input [[buffer(2)]],
