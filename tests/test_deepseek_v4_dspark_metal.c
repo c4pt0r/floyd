@@ -325,6 +325,165 @@ static int test_attention_low_q8_exact_rows(void **mapped_out) {
     return 0;
 }
 
+static int test_shared_q8_exact_rows(void **mapped_out) {
+    enum { TOKENS = 3, IN_DIM = 4096, HIDDEN = 2048, N_EMBD = 4096,
+           N_HC = 4, MIX_HC = 24 };
+    const size_t page_size = 16384u;
+    const size_t gate_bytes =
+        (size_t)HIDDEN * (IN_DIM / 32u) * sizeof(test_block_q8_0);
+    const size_t down_bytes =
+        (size_t)N_EMBD * (HIDDEN / 32u) * sizeof(test_block_q8_0);
+    const size_t weight_bytes = gate_bytes * 2u + down_bytes;
+    const size_t map_bytes = (weight_bytes + page_size - 1u) & ~(page_size - 1u);
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, page_size, map_bytes) == 0);
+    memset(mapped, 0, map_bytes);
+    test_block_q8_0 *weights = mapped;
+    const size_t weight_blocks = weight_bytes / sizeof(*weights);
+    for (size_t block = 0; block < weight_blocks; block++) {
+        weights[block].d = 0x3000u;
+        for (int i = 0; i < 32; i++)
+            weights[block].qs[i] =
+                (int8_t)(((block * 11u + (size_t)i * 3u) % 15u) - 7);
+    }
+
+    const size_t input_count = (size_t)TOKENS * IN_DIM;
+    const size_t hidden_count = (size_t)TOKENS * HIDDEN;
+    const size_t embd_count = (size_t)TOKENS * N_EMBD;
+    const size_t hc_count = (size_t)TOKENS * N_HC * N_EMBD;
+    const size_t split_count = (size_t)TOKENS * MIX_HC;
+    float *input = malloc(input_count * sizeof(*input));
+    float *routed = malloc(embd_count * sizeof(*routed));
+    float *residual = malloc(hc_count * sizeof(*residual));
+    float *split = malloc(split_count * sizeof(*split));
+    float *batch_gate = malloc(hidden_count * sizeof(*batch_gate));
+    float *batch_up = malloc(hidden_count * sizeof(*batch_up));
+    float *batch_mid = malloc(hidden_count * sizeof(*batch_mid));
+    float *batch_shared = malloc(embd_count * sizeof(*batch_shared));
+    float *batch_hc = malloc(hc_count * sizeof(*batch_hc));
+    float *row_gate = malloc(hidden_count * sizeof(*row_gate));
+    float *row_up = malloc(hidden_count * sizeof(*row_up));
+    float *row_mid = malloc(hidden_count * sizeof(*row_mid));
+    float *row_shared = malloc(embd_count * sizeof(*row_shared));
+    float *row_hc = malloc(hc_count * sizeof(*row_hc));
+    CHECK(input && routed && residual && split && batch_gate && batch_up &&
+          batch_mid && batch_shared && batch_hc && row_gate && row_up &&
+          row_mid && row_shared && row_hc);
+    for (size_t i = 0; i < input_count; i++)
+        input[i] = (float)((int)((i * 19u + 5u) % 71u) - 35) / 128.0f;
+    for (size_t i = 0; i < embd_count; i++)
+        routed[i] = (float)((int)((i * 7u + 13u) % 43u) - 21) / 64.0f;
+    for (size_t i = 0; i < hc_count; i++)
+        residual[i] = (float)((int)((i * 13u + 9u) % 53u) - 26) / 64.0f;
+    for (int token = 0; token < TOKENS; token++) {
+        float *row = split + (size_t)token * MIX_HC;
+        for (int i = 0; i < N_HC; i++) row[i] = 0.0f;
+        for (int i = 0; i < N_HC; i++) row[N_HC + i] = 0.125f * (float)(i + 1);
+        for (int dst = 0; dst < N_HC; dst++)
+            for (int src = 0; src < N_HC; src++)
+                row[2 * N_HC + dst * N_HC + src] =
+                    dst == src ? 0.75f : 0.0625f;
+    }
+
+#define TENSOR(name, count) \
+    ds4_gpu_tensor *name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)); \
+    CHECK(name)
+    TENSOR(x, input_count); TENSOR(routed_t, embd_count);
+    TENSOR(res, hc_count); TENSOR(post, split_count);
+    TENSOR(gate, hidden_count); TENSOR(up, hidden_count); TENSOR(mid, hidden_count);
+    TENSOR(shared, embd_count); TENSOR(hc, hc_count);
+    TENSOR(x_one, IN_DIM); TENSOR(routed_one, N_EMBD);
+    TENSOR(res_one, N_HC * N_EMBD); TENSOR(post_one, MIX_HC);
+    TENSOR(gate_one, HIDDEN); TENSOR(up_one, HIDDEN); TENSOR(mid_one, HIDDEN);
+    TENSOR(shared_one, N_EMBD); TENSOR(hc_one, N_HC * N_EMBD);
+#undef TENSOR
+    CHECK(ds4_gpu_set_model_map_range(mapped, map_bytes, 0, map_bytes,
+                                       weight_bytes));
+    CHECK(ds4_gpu_tensor_write(x, 0, input, input_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(routed_t, 0, routed, embd_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(res, 0, residual, hc_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_write(post, 0, split, split_count * sizeof(float)));
+
+    ds4_gpu_kernel_stats before, after;
+    ds4_gpu_get_kernel_stats(&before);
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_decode_order_batch_tensor(
+        gate, up, mid, mapped, map_bytes, 0, gate_bytes,
+        IN_DIM, HIDDEN, x, TOKENS, 7.0f));
+    CHECK(ds4_gpu_shared_down_hc_expand_q8_0_decode_order_batch_tensor(
+        hc, shared, mapped, map_bytes, gate_bytes * 2u,
+        HIDDEN, N_EMBD, mid, routed_t, res, post, N_EMBD, N_HC, TOKENS));
+    CHECK(ds4_gpu_tensor_read(gate, 0, batch_gate, hidden_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(up, 0, batch_up, hidden_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(mid, 0, batch_mid, hidden_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(shared, 0, batch_shared, embd_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(hc, 0, batch_hc, hc_count * sizeof(float)));
+    for (int token = 0; token < TOKENS; token++) {
+        CHECK(ds4_gpu_tensor_write(x_one, 0, input + (size_t)token * IN_DIM,
+                                   (uint64_t)IN_DIM * sizeof(float)));
+        CHECK(ds4_gpu_tensor_write(routed_one, 0,
+                                   routed + (size_t)token * N_EMBD,
+                                   (uint64_t)N_EMBD * sizeof(float)));
+        CHECK(ds4_gpu_tensor_write(res_one, 0,
+                                   residual + (size_t)token * N_HC * N_EMBD,
+                                   (uint64_t)N_HC * N_EMBD * sizeof(float)));
+        CHECK(ds4_gpu_tensor_write(post_one, 0,
+                                   split + (size_t)token * MIX_HC,
+                                   (uint64_t)MIX_HC * sizeof(float)));
+        CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_decode_order_batch_tensor(
+            gate_one, up_one, mid_one, mapped, map_bytes, 0, gate_bytes,
+            IN_DIM, HIDDEN, x_one, 1, 7.0f));
+        CHECK(ds4_gpu_shared_down_hc_expand_q8_0_decode_order_batch_tensor(
+            hc_one, shared_one, mapped, map_bytes, gate_bytes * 2u,
+            HIDDEN, N_EMBD, mid_one, routed_one, res_one, post_one,
+            N_EMBD, N_HC, 1));
+        CHECK(ds4_gpu_tensor_read(gate_one, 0, row_gate + (size_t)token * HIDDEN,
+                                  (uint64_t)HIDDEN * sizeof(float)));
+        CHECK(ds4_gpu_tensor_read(up_one, 0, row_up + (size_t)token * HIDDEN,
+                                  (uint64_t)HIDDEN * sizeof(float)));
+        CHECK(ds4_gpu_tensor_read(mid_one, 0, row_mid + (size_t)token * HIDDEN,
+                                  (uint64_t)HIDDEN * sizeof(float)));
+        CHECK(ds4_gpu_tensor_read(shared_one, 0,
+                                  row_shared + (size_t)token * N_EMBD,
+                                  (uint64_t)N_EMBD * sizeof(float)));
+        CHECK(ds4_gpu_tensor_read(hc_one, 0,
+                                  row_hc + (size_t)token * N_HC * N_EMBD,
+                                  (uint64_t)N_HC * N_EMBD * sizeof(float)));
+    }
+    ds4_gpu_get_kernel_stats(&after);
+    const float gate_error = max_abs(batch_gate, row_gate, hidden_count);
+    const float up_error = max_abs(batch_up, row_up, hidden_count);
+    const float mid_error = max_abs(batch_mid, row_mid, hidden_count);
+    const float shared_error = max_abs(batch_shared, row_shared, embd_count);
+    const float hc_error = max_abs(batch_hc, row_hc, hc_count);
+    printf("DeepSeek V4 shared Q8 exact rows Metal: "
+           "gate=%.9g up=%.9g mid=%.9g down=%.9g hc=%.9g calls=%llu/%llu\n",
+           gate_error, up_error, mid_error, shared_error, hc_error,
+           (unsigned long long)(after.tiny_batch_shared_gate_up_exact_rows_calls -
+                                before.tiny_batch_shared_gate_up_exact_rows_calls),
+           (unsigned long long)(after.tiny_batch_shared_down_exact_rows_calls -
+                                before.tiny_batch_shared_down_exact_rows_calls));
+    CHECK(gate_error == 0.0f && up_error == 0.0f && mid_error == 0.0f);
+    CHECK(shared_error == 0.0f && hc_error == 0.0f);
+    CHECK(after.tiny_batch_shared_gate_up_exact_rows_calls ==
+          before.tiny_batch_shared_gate_up_exact_rows_calls + 1);
+    CHECK(after.tiny_batch_shared_down_exact_rows_calls ==
+          before.tiny_batch_shared_down_exact_rows_calls + 1);
+
+    ds4_gpu_tensor_free(hc_one); ds4_gpu_tensor_free(shared_one);
+    ds4_gpu_tensor_free(mid_one); ds4_gpu_tensor_free(up_one); ds4_gpu_tensor_free(gate_one);
+    ds4_gpu_tensor_free(post_one); ds4_gpu_tensor_free(res_one);
+    ds4_gpu_tensor_free(routed_one); ds4_gpu_tensor_free(x_one);
+    ds4_gpu_tensor_free(hc); ds4_gpu_tensor_free(shared);
+    ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(post); ds4_gpu_tensor_free(res);
+    ds4_gpu_tensor_free(routed_t); ds4_gpu_tensor_free(x);
+    free(row_hc); free(row_shared); free(row_mid); free(row_up); free(row_gate);
+    free(batch_hc); free(batch_shared); free(batch_mid); free(batch_up); free(batch_gate);
+    free(split); free(residual); free(routed); free(input);
+    *mapped_out = mapped;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -343,6 +502,8 @@ int main(int argc, char **argv) {
     CHECK(test_attention_q8_hc_exact_rows(&attn_hc_mapped) == 0);
     void *attn_low_mapped = NULL;
     CHECK(test_attention_low_q8_exact_rows(&attn_low_mapped) == 0);
+    void *shared_mapped = NULL;
+    CHECK(test_shared_q8_exact_rows(&shared_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -426,6 +587,7 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
+    free(shared_mapped);
     free(attn_low_mapped);
     free(attn_hc_mapped);
     free(q4_mapped);
