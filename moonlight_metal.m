@@ -151,29 +151,39 @@ static int resolve_matrix(MoonlightModel *model, const char *name,
     return 0;
 }
 
-static void encode_matmul(MoonlightModel *model,
-                          id<MTLComputeCommandEncoder> encoder,
-                          const MoonlightMatrix *matrix,
-                          id<MTLBuffer> input, id<MTLBuffer> output,
-                          int rows, int input_width, int output_width) {
+static void encode_matmul_at(MoonlightModel *model,
+                             id<MTLComputeCommandEncoder> encoder,
+                             const MoonlightMatrix *matrix,
+                             id<MTLBuffer> input, NSUInteger input_offset,
+                             id<MTLBuffer> output, NSUInteger output_offset,
+                             int rows, int input_width, int output_width) {
     uint32_t shape[3] = {(uint32_t)output_width, (uint32_t)input_width,
                          (uint32_t)rows};
     [encoder setComputePipelineState:matrix->pipeline];
     [encoder setBuffer:model->weights[matrix->weight_index].buffer offset:0 atIndex:0];
     if (matrix->scale_index >= 0) {
         [encoder setBuffer:model->weights[matrix->scale_index].buffer offset:0 atIndex:1];
-        [encoder setBuffer:input offset:0 atIndex:2];
-        [encoder setBuffer:output offset:0 atIndex:3];
+        [encoder setBuffer:input offset:input_offset atIndex:2];
+        [encoder setBuffer:output offset:output_offset atIndex:3];
         [encoder setBytes:shape length:sizeof(shape) atIndex:4];
     } else {
-        [encoder setBuffer:input offset:0 atIndex:1];
-        [encoder setBuffer:output offset:0 atIndex:2];
+        [encoder setBuffer:input offset:input_offset atIndex:1];
+        [encoder setBuffer:output offset:output_offset atIndex:2];
         [encoder setBytes:shape length:sizeof(shape) atIndex:3];
     }
     NSUInteger columns = MIN((NSUInteger)32, (NSUInteger)output_width);
     NSUInteger row_threads = MIN((NSUInteger)8, (NSUInteger)rows);
     [encoder dispatchThreads:MTLSizeMake(output_width, rows, 1)
         threadsPerThreadgroup:MTLSizeMake(columns, row_threads, 1)];
+}
+
+static void encode_matmul(MoonlightModel *model,
+                          id<MTLComputeCommandEncoder> encoder,
+                          const MoonlightMatrix *matrix,
+                          id<MTLBuffer> input, id<MTLBuffer> output,
+                          int rows, int input_width, int output_width) {
+    encode_matmul_at(model, encoder, matrix, input, 0, output, 0,
+                     rows, input_width, output_width);
 }
 
 static void dispatch_1d(id<MTLComputeCommandEncoder> encoder,
@@ -183,6 +193,469 @@ static void dispatch_1d(id<MTLComputeCommandEncoder> encoder,
                              pipeline.maxTotalThreadsPerThreadgroup);
     [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(MAX(threads, (NSUInteger)1), 1, 1)];
+}
+
+static int encode_embedding_buffer(MoonlightSession *session,
+                                   id<MTLComputeCommandEncoder> encoder,
+                                   const int *ids, int count,
+                                   id<MTLBuffer> output) {
+    MoonlightTensorInfo info;
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    int index = weight_index(session->model, "model.embed_tokens.weight", &info);
+    if (index < 0 || info.dtype != MOONLIGHT_TENSOR_F32 ||
+        info.element_count != (int64_t)config->vocab_size * config->hidden_size)
+        return 0;
+    memcpy(session->token_ids.contents, ids, (size_t)count * sizeof(int32_t));
+    uint32_t shape[2] = {(uint32_t)count, (uint32_t)config->hidden_size};
+    [encoder setComputePipelineState:session->model->embed_f32];
+    [encoder setBuffer:session->model->weights[index].buffer offset:0 atIndex:0];
+    [encoder setBuffer:session->token_ids offset:0 atIndex:1];
+    [encoder setBuffer:output offset:0 atIndex:2];
+    [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+    dispatch_1d(encoder, session->model->embed_f32,
+                (NSUInteger)count * config->hidden_size);
+    return 1;
+}
+
+static int encode_rmsnorm_buffer(MoonlightSession *session,
+                                 id<MTLComputeCommandEncoder> encoder,
+                                 id<MTLBuffer> input, NSUInteger input_offset,
+                                 const char *weight_name, int rows, int width,
+                                 id<MTLBuffer> output,
+                                 NSUInteger output_offset) {
+    MoonlightTensorInfo info;
+    int index = weight_index(session->model, weight_name, &info);
+    if (index < 0 || info.dtype != MOONLIGHT_TENSOR_F32 ||
+        info.element_count != width) return 0;
+    uint32_t shape[2] = {(uint32_t)rows, (uint32_t)width};
+    float epsilon =
+        moonlight_model_data_config(session->model->data)->rms_norm_epsilon;
+    [encoder setComputePipelineState:session->model->rmsnorm];
+    [encoder setBuffer:input offset:input_offset atIndex:0];
+    [encoder setBuffer:session->model->weights[index].buffer offset:0 atIndex:1];
+    [encoder setBuffer:output offset:output_offset atIndex:2];
+    [encoder setBytes:shape length:sizeof(shape) atIndex:3];
+    [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:4];
+    dispatch_1d(encoder, session->model->rmsnorm, (NSUInteger)rows);
+    return 1;
+}
+
+static void encode_add_buffer(MoonlightSession *session,
+                              id<MTLComputeCommandEncoder> encoder,
+                              id<MTLBuffer> left, id<MTLBuffer> right,
+                              id<MTLBuffer> output, uint32_t count) {
+    [encoder setComputePipelineState:session->model->add_f32];
+    [encoder setBuffer:left offset:0 atIndex:0];
+    [encoder setBuffer:right offset:0 atIndex:1];
+    [encoder setBuffer:output offset:0 atIndex:2];
+    [encoder setBytes:&count length:sizeof(count) atIndex:3];
+    dispatch_1d(encoder, session->model->add_f32, count);
+}
+
+static void encode_silu_buffer(MoonlightSession *session,
+                               id<MTLComputeCommandEncoder> encoder,
+                               id<MTLBuffer> gate, id<MTLBuffer> up,
+                               id<MTLBuffer> output, uint32_t count) {
+    [encoder setComputePipelineState:session->model->silu_multiply];
+    [encoder setBuffer:gate offset:0 atIndex:0];
+    [encoder setBuffer:up offset:0 atIndex:1];
+    [encoder setBuffer:output offset:0 atIndex:2];
+    [encoder setBytes:&count length:sizeof(count) atIndex:3];
+    dispatch_1d(encoder, session->model->silu_multiply, count);
+}
+
+static int encode_attention_buffer(MoonlightSession *session,
+                                   id<MTLComputeCommandEncoder> encoder,
+                                   int layer, id<MTLBuffer> input,
+                                   int rows, int position,
+                                   id<MTLBuffer> output) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    MoonlightMatrix query_matrix;
+    MoonlightMatrix kv_a_matrix;
+    MoonlightMatrix kv_b_matrix;
+    MoonlightMatrix output_matrix;
+    MoonlightTensorInfo norm_info;
+    char name[512];
+    int norm_index;
+    int query_width = config->head_count *
+                      (config->qk_nope_dim + config->qk_rope_dim);
+    int compressed_width = config->kv_lora_rank + config->qk_rope_dim;
+    int context_width = config->head_count * config->value_dim;
+    if (position != session->kv_lengths[layer] || config->q_lora_rank)
+        return 0;
+    snprintf(name, sizeof(name),
+             "model.layers.%d.self_attn.q_proj.weight", layer);
+    if (!resolve_matrix(session->model, name, config->hidden_size,
+                        query_width, &query_matrix)) return 0;
+    snprintf(name, sizeof(name),
+             "model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", layer);
+    if (!resolve_matrix(session->model, name, config->hidden_size,
+                        compressed_width, &kv_a_matrix)) return 0;
+    snprintf(name, sizeof(name),
+             "model.layers.%d.self_attn.kv_b_proj.weight", layer);
+    if (!resolve_matrix(session->model, name, config->kv_lora_rank,
+                        config->head_count *
+                        (config->qk_nope_dim + config->value_dim),
+                        &kv_b_matrix)) return 0;
+    snprintf(name, sizeof(name),
+             "model.layers.%d.self_attn.o_proj.weight", layer);
+    if (!resolve_matrix(session->model, name, context_width,
+                        config->hidden_size, &output_matrix)) return 0;
+    snprintf(name, sizeof(name),
+             "model.layers.%d.self_attn.kv_a_layernorm.weight", layer);
+    norm_index = weight_index(session->model, name, &norm_info);
+    if (norm_index < 0 || norm_info.dtype != MOONLIGHT_TENSOR_F32 ||
+        norm_info.element_count != config->kv_lora_rank) return 0;
+
+    encode_matmul(session->model, encoder, &query_matrix, input,
+                  session->query, rows, config->hidden_size, query_width);
+    encode_matmul(session->model, encoder, &kv_a_matrix, input,
+                  session->compressed, rows, config->hidden_size,
+                  compressed_width);
+    uint32_t cache_shape[6] = {
+        (uint32_t)rows, (uint32_t)config->kv_lora_rank,
+        (uint32_t)config->qk_rope_dim,
+        (uint32_t)session->options.context_size,
+        (uint32_t)layer, (uint32_t)position,
+    };
+    [encoder setComputePipelineState:session->model->cache_append];
+    [encoder setBuffer:session->compressed offset:0 atIndex:0];
+    [encoder setBuffer:session->model->weights[norm_index].buffer offset:0 atIndex:1];
+    [encoder setBuffer:session->latent_kv offset:0 atIndex:2];
+    [encoder setBuffer:session->rope_kv offset:0 atIndex:3];
+    [encoder setBytes:cache_shape length:sizeof(cache_shape) atIndex:4];
+    [encoder setBytes:&config->rms_norm_epsilon
+                length:sizeof(config->rms_norm_epsilon) atIndex:5];
+    [encoder setBytes:&config->rope_theta length:sizeof(config->rope_theta) atIndex:6];
+    dispatch_1d(encoder, session->model->cache_append, (NSUInteger)rows);
+
+    uint32_t rope_shape[5] = {
+        (uint32_t)rows, (uint32_t)config->head_count,
+        (uint32_t)config->qk_nope_dim, (uint32_t)config->qk_rope_dim,
+        (uint32_t)position,
+    };
+    [encoder setComputePipelineState:session->model->rope_query];
+    [encoder setBuffer:session->query offset:0 atIndex:0];
+    [encoder setBytes:rope_shape length:sizeof(rope_shape) atIndex:1];
+    [encoder setBytes:&config->rope_theta length:sizeof(config->rope_theta) atIndex:2];
+    NSUInteger query_count = (NSUInteger)rows * config->head_count;
+    dispatch_1d(encoder, session->model->rope_query, query_count);
+
+    uint32_t attention_shape[10] = {
+        (uint32_t)rows, (uint32_t)config->head_count,
+        (uint32_t)config->qk_nope_dim, (uint32_t)config->qk_rope_dim,
+        (uint32_t)config->value_dim, (uint32_t)config->kv_lora_rank,
+        (uint32_t)session->options.context_size, (uint32_t)layer,
+        (uint32_t)position, (uint32_t)kv_b_matrix.format,
+    };
+    float attention_scale = 1.0f /
+        sqrtf((float)(config->qk_nope_dim + config->qk_rope_dim));
+    id<MTLBuffer> kv_b_scale = kv_b_matrix.scale_index >= 0
+        ? session->model->weights[kv_b_matrix.scale_index].buffer
+        : session->model->weights[kv_b_matrix.weight_index].buffer;
+    [encoder setComputePipelineState:session->model->attention_absorbed];
+    [encoder setBuffer:session->query offset:0 atIndex:0];
+    [encoder setBuffer:session->latent_kv offset:0 atIndex:1];
+    [encoder setBuffer:session->rope_kv offset:0 atIndex:2];
+    [encoder setBuffer:session->model->weights[kv_b_matrix.weight_index].buffer
+             offset:0 atIndex:3];
+    [encoder setBuffer:kv_b_scale offset:0 atIndex:4];
+    [encoder setBuffer:session->context offset:0 atIndex:5];
+    [encoder setBytes:attention_shape length:sizeof(attention_shape) atIndex:6];
+    [encoder setBytes:&attention_scale length:sizeof(attention_scale) atIndex:7];
+    dispatch_1d(encoder, session->model->attention_absorbed, query_count);
+    encode_matmul(session->model, encoder, &output_matrix,
+                  session->context, output, rows, context_width,
+                  config->hidden_size);
+    session->kv_lengths[layer] = position + rows;
+    return 1;
+}
+
+static int encode_dense_residual_buffer(
+        MoonlightSession *session, id<MTLComputeCommandEncoder> encoder,
+        int layer, int rows) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    MoonlightMatrix gate_matrix;
+    MoonlightMatrix up_matrix;
+    MoonlightMatrix down_matrix;
+    char name[512];
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.gate_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        config->dense_intermediate_size, &gate_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.up_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        config->dense_intermediate_size, &up_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.down_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->dense_intermediate_size,
+                        config->hidden_size, &down_matrix)) return 0;
+    encode_matmul(session->model, encoder, &gate_matrix,
+                  session->activation_b, session->expert_gate, rows,
+                  config->hidden_size, config->dense_intermediate_size);
+    encode_matmul(session->model, encoder, &up_matrix,
+                  session->activation_b, session->expert_up, rows,
+                  config->hidden_size, config->dense_intermediate_size);
+    encode_silu_buffer(session, encoder, session->expert_gate,
+                       session->expert_up, session->expert_hidden,
+                       (uint32_t)((int64_t)rows *
+                                  config->dense_intermediate_size));
+    encode_matmul(session->model, encoder, &down_matrix,
+                  session->expert_hidden, session->expert_output, rows,
+                  config->dense_intermediate_size, config->hidden_size);
+    encode_add_buffer(session, encoder, session->routed_output,
+                      session->expert_output, session->activation_a,
+                      (uint32_t)((int64_t)rows * config->hidden_size));
+    return 1;
+}
+
+static int encode_router_buffer(MoonlightSession *session,
+                                id<MTLComputeCommandEncoder> encoder,
+                                int layer, int rows) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    MoonlightMatrix router_matrix;
+    MoonlightTensorInfo bias_info;
+    char name[512];
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.gate.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        config->expert_count, &router_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.gate.e_score_correction_bias", layer) >=
+            (int)sizeof(name)) return 0;
+    int bias_index = weight_index(session->model, name, &bias_info);
+    if (bias_index < 0 || bias_info.dtype != MOONLIGHT_TENSOR_F32 ||
+        bias_info.element_count != config->expert_count) return 0;
+    encode_matmul(session->model, encoder, &router_matrix,
+                  session->activation_b, session->router_logits, rows,
+                  config->hidden_size, config->expert_count);
+    uint32_t shape[4] = {
+        (uint32_t)rows, (uint32_t)config->expert_count,
+        (uint32_t)config->experts_per_token,
+        (uint32_t)config->normalize_topk,
+    };
+    [encoder setComputePipelineState:session->model->route_sigmoid_topk];
+    [encoder setBuffer:session->router_logits offset:0 atIndex:0];
+    [encoder setBuffer:session->model->weights[bias_index].buffer
+             offset:0 atIndex:1];
+    [encoder setBuffer:session->route_ids offset:0 atIndex:2];
+    [encoder setBuffer:session->route_weights offset:0 atIndex:3];
+    [encoder setBytes:shape length:sizeof(shape) atIndex:4];
+    [encoder setBytes:&config->routed_scale length:sizeof(config->routed_scale)
+              atIndex:5];
+    dispatch_1d(encoder, session->model->route_sigmoid_topk, (NSUInteger)rows);
+    return 1;
+}
+
+static int prepare_route_tables(MoonlightSession *session, int layer,
+                                int rows, int *unique_count) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    int *selected = session->route_ids.contents;
+    int *all_expert_rows = session->expert_rows.contents;
+    int *all_expert_slots = session->expert_slots.contents;
+    unsigned char seen[256] = {0};
+    *unique_count = 0;
+    memcpy(session->host_route_trace +
+               (int64_t)layer * session->options.max_batch *
+                   config->experts_per_token,
+           selected,
+           (size_t)rows * config->experts_per_token * sizeof(*selected));
+    memset(session->host_expert_row_counts, 0,
+           (size_t)config->expert_count *
+               sizeof(*session->host_expert_row_counts));
+    for (int row = 0; row < rows; ++row) {
+        for (int slot = 0; slot < config->experts_per_token; ++slot) {
+            int expert = selected[(int64_t)row * config->experts_per_token +
+                                  slot];
+            if (expert < 0 || expert >= config->expert_count) return 0;
+            if (!seen[expert]) {
+                seen[expert] = 1;
+                session->host_unique_experts[(*unique_count)++] = expert;
+            }
+            int expert_row = session->host_expert_row_counts[expert]++;
+            int64_t offset = (int64_t)expert * session->options.max_batch +
+                             expert_row;
+            all_expert_rows[offset] = row;
+            all_expert_slots[offset] = slot;
+        }
+    }
+    return 1;
+}
+
+static int encode_moe_residual_buffer(
+        MoonlightSession *session, id<MTLComputeCommandEncoder> encoder,
+        int layer, int rows, int unique_count) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    MoonlightMatrix gate_matrix;
+    MoonlightMatrix up_matrix;
+    MoonlightMatrix down_matrix;
+    char name[512];
+    uint32_t hidden_count =
+        (uint32_t)((int64_t)rows * config->hidden_size);
+    [encoder setComputePipelineState:session->model->clear_f32];
+    [encoder setBuffer:session->activation_a offset:0 atIndex:0];
+    [encoder setBytes:&hidden_count length:sizeof(hidden_count) atIndex:1];
+    dispatch_1d(encoder, session->model->clear_f32, hidden_count);
+
+    for (int unique = 0; unique < unique_count; ++unique) {
+        int expert = session->host_unique_experts[unique];
+        int expert_row_count = session->host_expert_row_counts[expert];
+        NSUInteger index_offset =
+            (NSUInteger)expert * session->options.max_batch * sizeof(int32_t);
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.gate_proj.weight",
+                     layer, expert) >= (int)sizeof(name) ||
+            !resolve_matrix(session->model, name, config->hidden_size,
+                            config->moe_intermediate_size,
+                            &gate_matrix)) return 0;
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.up_proj.weight",
+                     layer, expert) >= (int)sizeof(name) ||
+            !resolve_matrix(session->model, name, config->hidden_size,
+                            config->moe_intermediate_size,
+                            &up_matrix)) return 0;
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.mlp.experts.%d.down_proj.weight",
+                     layer, expert) >= (int)sizeof(name) ||
+            !resolve_matrix(session->model, name,
+                            config->moe_intermediate_size,
+                            config->hidden_size, &down_matrix)) return 0;
+        uint32_t gather_shape[2] = {(uint32_t)expert_row_count,
+                                    (uint32_t)config->hidden_size};
+        [encoder setComputePipelineState:session->model->gather_rows];
+        [encoder setBuffer:session->activation_b offset:0 atIndex:0];
+        [encoder setBuffer:session->expert_rows offset:index_offset atIndex:1];
+        [encoder setBuffer:session->expert_input offset:0 atIndex:2];
+        [encoder setBytes:gather_shape length:sizeof(gather_shape) atIndex:3];
+        dispatch_1d(encoder, session->model->gather_rows,
+                    (NSUInteger)expert_row_count * config->hidden_size);
+        encode_matmul(session->model, encoder, &gate_matrix,
+                      session->expert_input, session->expert_gate,
+                      expert_row_count, config->hidden_size,
+                      config->moe_intermediate_size);
+        encode_matmul(session->model, encoder, &up_matrix,
+                      session->expert_input, session->expert_up,
+                      expert_row_count, config->hidden_size,
+                      config->moe_intermediate_size);
+        encode_silu_buffer(session, encoder, session->expert_gate,
+                           session->expert_up, session->expert_hidden,
+                           (uint32_t)((int64_t)expert_row_count *
+                                      config->moe_intermediate_size));
+        encode_matmul(session->model, encoder, &down_matrix,
+                      session->expert_hidden, session->expert_output,
+                      expert_row_count, config->moe_intermediate_size,
+                      config->hidden_size);
+        uint32_t scatter_shape[3] = {
+            (uint32_t)expert_row_count, (uint32_t)config->hidden_size,
+            (uint32_t)config->experts_per_token,
+        };
+        [encoder setComputePipelineState:session->model->scatter_expert];
+        [encoder setBuffer:session->expert_output offset:0 atIndex:0];
+        [encoder setBuffer:session->expert_rows offset:index_offset atIndex:1];
+        [encoder setBuffer:session->expert_slots offset:index_offset atIndex:2];
+        [encoder setBuffer:session->route_weights offset:0 atIndex:3];
+        [encoder setBuffer:session->activation_a offset:0 atIndex:4];
+        [encoder setBytes:scatter_shape length:sizeof(scatter_shape) atIndex:5];
+        dispatch_1d(encoder, session->model->scatter_expert,
+                    (NSUInteger)expert_row_count * config->hidden_size);
+    }
+
+    int shared_width =
+        config->moe_intermediate_size * config->shared_expert_count;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.shared_experts.gate_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        shared_width, &gate_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.shared_experts.up_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        shared_width, &up_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.shared_experts.down_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, shared_width,
+                        config->hidden_size, &down_matrix)) return 0;
+    encode_matmul(session->model, encoder, &gate_matrix,
+                  session->activation_b, session->expert_gate, rows,
+                  config->hidden_size, shared_width);
+    encode_matmul(session->model, encoder, &up_matrix,
+                  session->activation_b, session->expert_up, rows,
+                  config->hidden_size, shared_width);
+    encode_silu_buffer(session, encoder, session->expert_gate,
+                       session->expert_up, session->expert_hidden,
+                       (uint32_t)((int64_t)rows * shared_width));
+    encode_matmul(session->model, encoder, &down_matrix,
+                  session->expert_hidden, session->shared_output, rows,
+                  shared_width, config->hidden_size);
+    encode_add_buffer(session, encoder, session->activation_a,
+                      session->shared_output, session->expert_output,
+                      hidden_count);
+    encode_add_buffer(session, encoder, session->routed_output,
+                      session->expert_output, session->activation_a,
+                      hidden_count);
+    return 1;
+}
+
+static int encode_attention_block(MoonlightSession *session,
+                                  id<MTLComputeCommandEncoder> encoder,
+                                  int layer, int rows, int position,
+                                  int encode_router) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    char name[512];
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.input_layernorm.weight", layer) >=
+            (int)sizeof(name) ||
+        !encode_rmsnorm_buffer(session, encoder, session->activation_a, 0,
+                               name, rows, config->hidden_size,
+                               session->activation_b, 0)) return 0;
+    if (!encode_attention_buffer(session, encoder, layer,
+                                 session->activation_b, rows, position,
+                                 session->expert_output)) return 0;
+    uint32_t hidden_count =
+        (uint32_t)((int64_t)rows * config->hidden_size);
+    encode_add_buffer(session, encoder, session->activation_a,
+                      session->expert_output, session->routed_output,
+                      hidden_count);
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.post_attention_layernorm.weight", layer) >=
+            (int)sizeof(name) ||
+        !encode_rmsnorm_buffer(session, encoder, session->routed_output, 0,
+                               name, rows, config->hidden_size,
+                               session->activation_b, 0)) return 0;
+    return !encode_router || encode_router_buffer(session, encoder, layer, rows);
+}
+
+static int encode_final_logits(MoonlightSession *session,
+                               id<MTLComputeCommandEncoder> encoder,
+                               int rows) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    MoonlightMatrix matrix;
+    NSUInteger input_offset =
+        (NSUInteger)(rows - 1) * config->hidden_size * sizeof(float);
+    if (!encode_rmsnorm_buffer(session, encoder, session->activation_a,
+                               input_offset, "model.norm.weight", 1,
+                               config->hidden_size, session->activation_b, 0) ||
+        !resolve_matrix(session->model, "lm_head.weight", config->hidden_size,
+                        config->vocab_size, &matrix)) return 0;
+    encode_matmul_at(session->model, encoder, &matrix, session->activation_b, 0,
+                     session->logits, 0, 1, config->hidden_size,
+                     config->vocab_size);
+    return 1;
 }
 
 static int finish_command(MoonlightSession *session, id<MTLCommandBuffer> command) {
@@ -1300,6 +1773,81 @@ static int run_tokens(MoonlightSession *session, const int *ids, int count,
     return 1;
 }
 
+static int run_tokens_fast(MoonlightSession *session, const int *ids, int count,
+                           int start_position, float *last_logits,
+                           char *error, size_t error_size) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    int first_sparse = MIN(config->first_dense_layer_count,
+                           config->layer_count);
+    id<MTLCommandBuffer> command = [session->model->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (!command || !encoder ||
+        !encode_embedding_buffer(session, encoder, ids, count,
+                                 session->activation_a))
+        return set_error(error, error_size,
+                         "Moonlight fast embedding failed");
+
+    for (int layer = 0; layer < first_sparse; ++layer) {
+        if (!encode_attention_block(session, encoder, layer, count,
+                                    start_position, 0) ||
+            !encode_dense_residual_buffer(session, encoder, layer, count))
+            return set_error(error, error_size,
+                             "Moonlight fast dense block failed at layer %d",
+                             layer);
+    }
+    if (first_sparse < config->layer_count) {
+        if (!encode_attention_block(session, encoder, first_sparse, count,
+                                    start_position, 1))
+            return set_error(error, error_size,
+                             "Moonlight fast sparse attention failed at layer %d",
+                             first_sparse);
+    } else if (!encode_final_logits(session, encoder, count)) {
+        return set_error(error, error_size,
+                         "Moonlight fast final projection failed");
+    }
+    [encoder endEncoding];
+    if (!finish_command(session, command))
+        return set_error(error, error_size,
+                         "Moonlight fast initial command failed");
+
+    for (int layer = first_sparse; layer < config->layer_count; ++layer) {
+        int unique_count;
+        if (!prepare_route_tables(session, layer, count, &unique_count))
+            return set_error(error, error_size,
+                             "Moonlight fast route table failed at layer %d",
+                             layer);
+        command = [session->model->queue commandBuffer];
+        encoder = [command computeCommandEncoder];
+        if (!command || !encoder ||
+            !encode_moe_residual_buffer(session, encoder, layer, count,
+                                        unique_count))
+            return set_error(error, error_size,
+                             "Moonlight fast MoE failed at layer %d", layer);
+        if (layer + 1 < config->layer_count) {
+            if (!encode_attention_block(session, encoder, layer + 1, count,
+                                        start_position, 1))
+                return set_error(
+                    error, error_size,
+                    "Moonlight fast sparse attention failed at layer %d",
+                    layer + 1);
+        } else if (!encode_final_logits(session, encoder, count)) {
+            return set_error(error, error_size,
+                             "Moonlight fast final projection failed");
+        }
+        [encoder endEncoding];
+        if (!finish_command(session, command))
+            return set_error(error, error_size,
+                             "Moonlight fast command failed at layer %d",
+                             layer);
+    }
+    memcpy(last_logits, session->logits.contents,
+           (size_t)config->vocab_size * sizeof(*last_logits));
+    session->position = start_position + count;
+    session->last_forward_rows = count;
+    return 1;
+}
+
 int moonlight_session_prefill(MoonlightSession *session, const int *ids,
                               int count, float *last_logits,
                               char *error, size_t error_size) {
@@ -1311,8 +1859,8 @@ int moonlight_session_prefill(MoonlightSession *session, const int *ids,
         return set_error(error, error_size,
                          "Moonlight prefill requires an empty session");
     double start = monotonic_seconds();
-    if (!run_tokens(session, ids, count, 0, NULL, last_logits,
-                    error, error_size))
+    if (!run_tokens_fast(session, ids, count, 0, last_logits,
+                         error, error_size))
         return 0;
     session->stats.prefill_tokens += (uint64_t)count;
     session->stats.prefill_ms += (monotonic_seconds() - start) * 1000.0;
@@ -1326,8 +1874,8 @@ int moonlight_session_decode(MoonlightSession *session, int token,
         return set_error(error, error_size, "invalid Moonlight decode request");
     int position = session->position;
     double start = monotonic_seconds();
-    if (!run_tokens(session, &token, 1, position, NULL, logits,
-                    error, error_size))
+    if (!run_tokens_fast(session, &token, 1, position, logits,
+                         error, error_size))
         return 0;
     session->stats.decode_tokens++;
     session->stats.decode_ms += (monotonic_seconds() - start) * 1000.0;
