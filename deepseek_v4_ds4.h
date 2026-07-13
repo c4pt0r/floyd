@@ -2,6 +2,7 @@
 #define DEEPSEEK_V4_DS4_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +16,13 @@ typedef struct {
     float confidence_threshold;
     float tail_confidence_threshold;
 } DeepSeekV4Ds4SpecConfig;
+
+typedef struct {
+    int max_tokens;
+    float temperature;
+    float top_p;
+    int draft;
+} DeepSeekV4Ds4RequestConfig;
 
 typedef enum {
     DEEPSEEK_V4_DS4_SPEC_NONE = 0,
@@ -51,6 +59,11 @@ typedef struct {
 } DeepSeekV4Ds4Stats;
 
 const char *deepseek_v4_ds4_backend_name(void);
+int deepseek_v4_ds4_prefix_cache_bytes(uint64_t megabytes, uint64_t *bytes);
+int deepseek_v4_ds4_request_config_validate(
+    const DeepSeekV4Ds4RequestConfig *config, char *error, size_t error_size);
+uint64_t deepseek_v4_ds4_request_config_key(
+    int max_context, const DeepSeekV4Ds4RequestConfig *config);
 int deepseek_v4_ds4_spec_config_from_env(
     DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size);
 float deepseek_v4_ds4_default_confidence_threshold(const char *support_path);

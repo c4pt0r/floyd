@@ -39,6 +39,70 @@ const char *deepseek_v4_ds4_backend_name(void) {
     return "metal-ds4";
 }
 
+int deepseek_v4_ds4_prefix_cache_bytes(uint64_t megabytes, uint64_t *bytes) {
+    const uint64_t bytes_per_megabyte = UINT64_C(1024) * 1024;
+    if (!bytes || megabytes > UINT64_MAX / bytes_per_megabyte) return 0;
+    *bytes = megabytes * bytes_per_megabyte;
+    return 1;
+}
+
+int deepseek_v4_ds4_request_config_validate(
+    const DeepSeekV4Ds4RequestConfig *config, char *error, size_t error_size) {
+    if (!config) return 0;
+    if (config->max_tokens <= 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "max_tokens must be positive");
+        return 0;
+    }
+    if (!isfinite(config->temperature) || config->temperature < 0.0f ||
+        config->temperature > 2.0f) {
+        if (error && error_size)
+            snprintf(error, error_size, "temperature must be finite and in 0..2");
+        return 0;
+    }
+    if (!isfinite(config->top_p) || config->top_p <= 0.0f ||
+        config->top_p > 1.0f) {
+        if (error && error_size)
+            snprintf(error, error_size, "top_p must be finite and in (0,1]");
+        return 0;
+    }
+    if (config->draft < 0 || config->draft > 16) {
+        if (error && error_size)
+            snprintf(error, error_size, "draft must be an integer in 0..16");
+        return 0;
+    }
+    if (config->temperature > 0.0f && config->draft > 1) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "sampling with speculative draft > 1 is not supported");
+        return 0;
+    }
+    return 1;
+}
+
+static uint64_t ds4_hash_bytes(uint64_t hash, const void *data, size_t size) {
+    const unsigned char *bytes = data;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+uint64_t deepseek_v4_ds4_request_config_key(
+    int max_context, const DeepSeekV4Ds4RequestConfig *config) {
+    if (!config) return 0;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    uint32_t temperature_bits = 0, top_p_bits = 0;
+    memcpy(&temperature_bits, &config->temperature, sizeof(temperature_bits));
+    memcpy(&top_p_bits, &config->top_p, sizeof(top_p_bits));
+    hash = ds4_hash_bytes(hash, &max_context, sizeof(max_context));
+    hash = ds4_hash_bytes(hash, &config->draft, sizeof(config->draft));
+    hash = ds4_hash_bytes(hash, &temperature_bits, sizeof(temperature_bits));
+    hash = ds4_hash_bytes(hash, &top_p_bits, sizeof(top_p_bits));
+    return hash;
+}
+
 float deepseek_v4_ds4_default_confidence_threshold(const char *support_path) {
     return support_path && strstr(support_path, "-Q4K") ? 0.52f : 0.53f;
 }
