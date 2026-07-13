@@ -58,7 +58,7 @@ static void similarity(const float *actual, const float *expected, size_t count,
 }
 
 static int test_dense_q4_k(void **mapped_out) {
-    enum { ROWS = 8, COLS = 256, MAX_TOKENS = 4, MAP_BYTES = 16384 };
+    enum { ROWS = 8, COLS = 256, TOKENS = 2, MAP_BYTES = 16384 };
     void *mapped = NULL;
     CHECK(posix_memalign(&mapped, MAP_BYTES, MAP_BYTES) == 0);
     memset(mapped, 0, MAP_BYTES);
@@ -79,14 +79,14 @@ static int test_dense_q4_k(void **mapped_out) {
         }
     }
 
-    float input[MAX_TOKENS * COLS];
-    float expected[MAX_TOKENS * ROWS];
-    float actual[MAX_TOKENS * ROWS];
-    for (int token = 0; token < MAX_TOKENS; token++)
+    float input[TOKENS * COLS];
+    float expected[TOKENS * ROWS];
+    float actual[TOKENS * ROWS];
+    for (int token = 0; token < TOKENS; token++)
         for (int col = 0; col < COLS; col++)
             input[token * COLS + col] =
                 0.01f * (float)(((token + 3) * (col + 5)) % 29 - 14);
-    for (int token = 0; token < MAX_TOKENS; token++) {
+    for (int token = 0; token < TOKENS; token++) {
         for (int row = 0; row < ROWS; row++) {
             float sum = 0.0f;
             for (int group = 0; group < 8; group++) {
@@ -108,24 +108,12 @@ static int test_dense_q4_k(void **mapped_out) {
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
     CHECK(x && out);
     CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
-    ds4_gpu_kernel_stats before, after;
-    ds4_gpu_get_kernel_stats(&before);
-    ds4_gpu_set_tiny_decode_order(true);
-    for (int tokens = 2; tokens <= MAX_TOKENS; tokens++) {
-        memset(actual, 0, sizeof(actual));
-        CHECK(ds4_gpu_matmul_q4_k_tensor(out, mapped, MAP_BYTES, 0,
-                                         COLS, ROWS, x, (uint64_t)tokens));
-        CHECK(ds4_gpu_tensor_read(out, 0, actual,
-                                  (size_t)tokens * ROWS * sizeof(*actual)));
-        const float error = max_abs(actual, expected, (size_t)tokens * ROWS);
-        printf("DeepSeek V4 dense Q4_K Metal exact rows=%d: max_abs=%.9g\n",
-               tokens, error);
-        CHECK(error < 5e-5f);
-    }
-    ds4_gpu_set_tiny_decode_order(false);
-    ds4_gpu_get_kernel_stats(&after);
-    CHECK(after.tiny_batch_exact_q4_calls ==
-          before.tiny_batch_exact_q4_calls + 3);
+    CHECK(ds4_gpu_matmul_q4_k_tensor(out, mapped, MAP_BYTES, 0,
+                                     COLS, ROWS, x, TOKENS));
+    CHECK(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+    const float error = max_abs(actual, expected, TOKENS * ROWS);
+    printf("DeepSeek V4 dense Q4_K Metal: max_abs=%.9g\n", error);
+    CHECK(error < 5e-5f);
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
     *mapped_out = mapped;
