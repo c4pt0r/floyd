@@ -35,6 +35,7 @@
 #include "moe_route.h"
 #include "tok_moon.h"                              /* tokenizer moonshot (Chat-Task 4): mtok_*, template builders */
 #include "deepseek_v4_chat.h"
+#include "moonlight_oracle.h"
 #ifdef COLI_CUDA
 #include <omp.h>
 #include "backend_cuda.h"
@@ -207,6 +208,15 @@ static float *falloc(int64_t n){
      * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld fuori range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+
+static void oracle_write_layer(int layer, const char *field,
+                               const float *data, size_t count) {
+    char name[96];
+    if (!moonlight_oracle_enabled()) return;
+    snprintf(name, sizeof(name), "layer.%d.%s", layer, field);
+    if (!moonlight_oracle_write_f32(name, data, count))
+        fprintf(stderr, "Moonlight oracle write failed: %s\n", name);
+}
 
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
@@ -1200,9 +1210,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     /* ---- FASE A: routing di tutte le S posizioni ---- */
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
+    float *oracle_router=moonlight_oracle_enabled()?falloc((int64_t)S*E):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
+        if(oracle_router) memcpy(oracle_router+(int64_t)s*E,logit,E*sizeof(float));
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         moe_route_select(logit,l->router_bias,E,Ksel,MOE_SCORE_SIGMOID,
@@ -1219,6 +1231,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         moe_route_finalize(w,Ke,c->norm_topk,c->routed_scale);
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
+    if(oracle_router) oracle_write_layer(layer,"router_scores",oracle_router,(size_t)S*E);
     if(g_looka && S==1 && layer<c->n_layers){
         int Ke=keff[0];
         if(m->enr[layer]>0){                       /* [0] vs routing del token precedente */
@@ -1294,15 +1307,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
+    oracle_write_layer(layer,"routed_mlp",out,(size_t)S*D);
     /* ---- FASE E: shared expert, un matmul a S righe ---- */
     float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
     matmul_qt(sg, x, &l->sh_gate, S);
     matmul_qt(su, x, &l->sh_up,   S);
     for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
     matmul_qt(hh, sg, &l->sh_down, S);
+    oracle_write_layer(layer,"shared_mlp",hh,(size_t)S*D);
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    oracle_write_layer(layer,"mlp",out,(size_t)S*D);
     free(logit); free(sig); free(choice); free(idxs); free(ws); free(keff); free(uniq);
-    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
+    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su); free(oracle_router);
 }
 
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
@@ -1389,17 +1405,24 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
+    oracle_write_layer(li,"input",x,(size_t)S*D);
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
+    oracle_write_layer(li,"input_norm",nrm,(size_t)S*D);
     attention(m,l,li,nrm,S,pos_base,tmp);
+    oracle_write_layer(li,"attn",tmp,(size_t)S*D);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    oracle_write_layer(li,"post_attn",x,(size_t)S*D);
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
+    oracle_write_layer(li,"post_norm",nrm,(size_t)S*D);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    if(!l->sparse) oracle_write_layer(li,"mlp",tmp,(size_t)S*D);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    oracle_write_layer(li,"output",x,(size_t)S*D);
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
@@ -1679,15 +1702,22 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    moonlight_oracle_write_f32("embed",x,(size_t)S*D);
     layers_forward(m,x,S,0);
     float *lo=falloc(c->vocab);
+    float *oracle_norm=moonlight_oracle_enabled()?falloc((int64_t)S*D):NULL;
+    float *oracle_logits=moonlight_oracle_enabled()?falloc((int64_t)S*c->vocab):NULL;
     for(int s=0;s<S;s++){
         float row[8192]; rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo, row, &m->lm_head, 1);
+        if(oracle_norm) memcpy(oracle_norm+(int64_t)s*D,row,D*sizeof(float));
+        if(oracle_logits) memcpy(oracle_logits+(int64_t)s*c->vocab,lo,c->vocab*sizeof(float));
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
     }
-    free(x); free(lo);
+    if(oracle_norm) moonlight_oracle_write_f32("final_norm",oracle_norm,(size_t)S*D);
+    if(oracle_logits) moonlight_oracle_write_f32("logits",oracle_logits,(size_t)S*c->vocab);
+    free(x); free(lo); free(oracle_norm); free(oracle_logits);
 }
 
 /* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */

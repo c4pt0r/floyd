@@ -1,5 +1,21 @@
 # Parity report: real Moonlight-16B-A3B-Instruct (int8 / int4 vs f32 oracle)
 
+## Metal migration baseline (2026-07-13)
+
+The temporary CPU oracle and the official native Transformers path now expose
+the same per-stage tensors. On the F32 tiny fixture, C vs Python measured
+`4.59e-6` max-absolute error at layer-0 attention, `2.76e-5` after final norm,
+and `2.73e-5` at logits, with 12/12 prefill argmax matches. The complete tiny
+reference remains 32/32 teacher-forcing and 20/20 greedy; CPU throughput was
+130.7 prefill positions/s and 47.9 decode tokens/s on the M3 Ultra.
+
+For `models/moonlight_i8`, the 28-token official prompt measured 27/28 prefill
+argmax matches and 21.7 positions/s. Quantization error grew from `0.00613`
+max-absolute at layer 0 output to `3.125` at final logits (logit cosine
+`0.99803`). The native Metal runtime must first match this container-level CPU
+oracle; the official F32 tensors separately measure the checkpoint's weight
+quantization loss.
+
 ## Machine
 
 - Apple M3 Ultra, 32 cores, 512 GiB RAM (`hw.memsize`=549755813888 bytes)
