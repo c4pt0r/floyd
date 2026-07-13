@@ -120,6 +120,92 @@ static int test_dense_q4_k(void **mapped_out) {
     return 0;
 }
 
+static int test_qkv_q8_pair_exact_rows(void **mapped_out) {
+    enum { TOKENS = 3, IN_DIM = 4096, Q_RANK = 1536, KV_DIM = 512 };
+    const size_t page_size = 16384u;
+    const size_t blocks_per_row = IN_DIM / 32u;
+    const size_t q_bytes =
+        (size_t)Q_RANK * blocks_per_row * sizeof(test_block_q8_0);
+    const size_t kv_bytes =
+        (size_t)KV_DIM * blocks_per_row * sizeof(test_block_q8_0);
+    const size_t weight_bytes = q_bytes + kv_bytes;
+    const size_t map_bytes =
+        (weight_bytes + page_size - 1u) & ~(page_size - 1u);
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, page_size, map_bytes) == 0);
+    memset(mapped, 0, map_bytes);
+    test_block_q8_0 *weights = mapped;
+    const size_t weight_blocks = weight_bytes / sizeof(*weights);
+    for (size_t block = 0; block < weight_blocks; block++) {
+        weights[block].d = 0x3000u;
+        for (int i = 0; i < 32; i++)
+            weights[block].qs[i] =
+                (int8_t)(((block * 13u + (size_t)i * 5u) % 15u) - 7);
+    }
+
+    const size_t input_count = (size_t)TOKENS * IN_DIM;
+    const size_t q_count = (size_t)TOKENS * Q_RANK;
+    const size_t kv_count = (size_t)TOKENS * KV_DIM;
+    float *input = malloc(input_count * sizeof(*input));
+    float *pair_q = malloc(q_count * sizeof(*pair_q));
+    float *pair_kv = malloc(kv_count * sizeof(*pair_kv));
+    float *separate_q = malloc(q_count * sizeof(*separate_q));
+    float *separate_kv = malloc(kv_count * sizeof(*separate_kv));
+    CHECK(input && pair_q && pair_kv && separate_q && separate_kv);
+    for (size_t i = 0; i < input_count; i++)
+        input[i] = (float)((int)((i * 19u + 7u) % 79u) - 39) / 128.0f;
+
+#define TENSOR(name, count) \
+    ds4_gpu_tensor *name = \
+        ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)); \
+    CHECK(name)
+    TENSOR(x, input_count);
+    TENSOR(q_pair, q_count);
+    TENSOR(kv_pair, kv_count);
+    TENSOR(q_separate, q_count);
+    TENSOR(kv_separate, kv_count);
+#undef TENSOR
+
+    CHECK(ds4_gpu_set_model_map_range(mapped, map_bytes, 0, map_bytes,
+                                       weight_bytes));
+    CHECK(ds4_gpu_tensor_write(x, 0, input, input_count * sizeof(float)));
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(
+        q_pair, kv_pair, mapped, map_bytes, 0, q_bytes,
+        IN_DIM, Q_RANK, KV_DIM, x, TOKENS));
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
+        q_separate, mapped, map_bytes, 0,
+        IN_DIM, Q_RANK, x, TOKENS));
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
+        kv_separate, mapped, map_bytes, q_bytes,
+        IN_DIM, KV_DIM, x, TOKENS));
+    CHECK(ds4_gpu_tensor_read(q_pair, 0, pair_q,
+                              q_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(kv_pair, 0, pair_kv,
+                              kv_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(q_separate, 0, separate_q,
+                              q_count * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(kv_separate, 0, separate_kv,
+                              kv_count * sizeof(float)));
+    const float q_error = max_abs(pair_q, separate_q, q_count);
+    const float kv_error = max_abs(pair_kv, separate_kv, kv_count);
+    printf("DeepSeek V4 QKV Q8 pair exact rows Metal: "
+           "q=%.9g kv=%.9g\n", q_error, kv_error);
+    CHECK(q_error == 0.0f && kv_error == 0.0f);
+
+    ds4_gpu_tensor_free(kv_separate);
+    ds4_gpu_tensor_free(q_separate);
+    ds4_gpu_tensor_free(kv_pair);
+    ds4_gpu_tensor_free(q_pair);
+    ds4_gpu_tensor_free(x);
+    free(separate_kv);
+    free(separate_q);
+    free(pair_kv);
+    free(pair_q);
+    free(input);
+    *mapped_out = mapped;
+    return 0;
+}
+
 static int test_attention_q8_hc_exact_rows(void **mapped_out) {
     enum { TOKENS = 3, IN_DIM = 2048, N_EMBD = 4096, N_HC = 4, MIX_HC = 24 };
     const size_t page_size = 16384u;
@@ -498,6 +584,8 @@ int main(int argc, char **argv) {
     CHECK(ds4_gpu_init());
     void *q4_mapped = NULL;
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
+    void *qkv_pair_mapped = NULL;
+    CHECK(test_qkv_q8_pair_exact_rows(&qkv_pair_mapped) == 0);
     void *attn_hc_mapped = NULL;
     CHECK(test_attention_q8_hc_exact_rows(&attn_hc_mapped) == 0);
     void *attn_low_mapped = NULL;
@@ -590,6 +678,7 @@ int main(int argc, char **argv) {
     free(shared_mapped);
     free(attn_low_mapped);
     free(attn_hc_mapped);
+    free(qkv_pair_mapped);
     free(q4_mapped);
     return 0;
 }
