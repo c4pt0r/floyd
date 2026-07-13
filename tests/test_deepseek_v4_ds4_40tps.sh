@@ -23,6 +23,7 @@ env SNAP="$model" CHAT=1 DSPARK_SPEC=0 \
     DS4_LOCK_FILE="$lock" ./floyd >"$greedy_out" 2>"$greedy_trace"
 
 perf=$(grep '^DEEPSEEK_V4_PERF ' "$trace")
+printf '%s\n' "$perf" | grep -q ' verify_layer_execute_ms=[0-9]'
 count=$(grep -c '^DEEPSEEK_V4_TOKEN ' "$trace")
 tps=$(printf '%s\n' "$perf" | sed -n 's/.* decode_tps=\([0-9.]*\).*/\1/p')
 replay=$(printf '%s\n' "$perf" | sed -n 's/.* replay_ms=\([0-9.]*\).*/\1/p')

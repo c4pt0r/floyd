@@ -151,6 +151,10 @@ int main(int argc, char **argv) {
     CHECK(spec_stats.target_ms > 0.0);
     CHECK(spec_stats.proposal_ms > 0.0);
     CHECK(spec_stats.verify_ms > 0.0);
+    CHECK(spec_stats.verify_layer_encode_ms > 0.0);
+    CHECK(spec_stats.verify_layer_execute_ms > 0.0);
+    CHECK(spec_stats.verify_head_ms > 0.0);
+    CHECK(spec_stats.verify_read_ms > 0.0);
     CHECK(spec_stats.replay_ms == 0.0);
 
     ds4_session_kernel_stats kernel_stats;
@@ -176,9 +180,12 @@ int main(int argc, char **argv) {
            (unsigned long long)kernel_stats.tiny_batch_exact_attn_calls,
            (unsigned long long)kernel_stats.tiny_batch_exact_q8_calls);
     printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
-           "verify=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
+           "verify=%.3f layer_encode=%.3f layer_execute=%.3f "
+           "head=%.3f read=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
            spec_stats.target_ms, spec_stats.proposal_ms,
-           spec_stats.verify_ms, spec_stats.replay_ms,
+           spec_stats.verify_ms, spec_stats.verify_layer_encode_ms,
+           spec_stats.verify_layer_execute_ms, spec_stats.verify_head_ms,
+           spec_stats.verify_read_ms, spec_stats.replay_ms,
            (unsigned long long)spec_stats.proposed_tokens,
            (unsigned long long)spec_stats.accepted_tokens);
 
