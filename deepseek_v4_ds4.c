@@ -530,6 +530,9 @@ int deepseek_v4_ds4_generate_user(
             stats->speculative_frontier_snapshots =
                 (int)(spec_after.frontier_snapshots -
                       spec_before.frontier_snapshots);
+            stats->speculative_proposal_early_skips =
+                (int)(spec_after.proposal_early_skips -
+                      spec_before.proposal_early_skips);
             stats->speculative_target_ms =
                 spec_after.target_ms - spec_before.target_ms;
             stats->speculative_proposal_ms =

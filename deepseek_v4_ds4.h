@@ -37,6 +37,7 @@ typedef struct {
     int speculative_direct_accepted;
     int speculative_prefix1_accepted;
     int speculative_frontier_snapshots;
+    int speculative_proposal_early_skips;
     double speculative_target_ms;
     double speculative_proposal_ms;
     double speculative_verify_ms;
