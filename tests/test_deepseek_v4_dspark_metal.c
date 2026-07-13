@@ -249,6 +249,82 @@ static int test_attention_q8_hc_exact_rows(void **mapped_out) {
     return 0;
 }
 
+static int test_attention_low_q8_exact_rows(void **mapped_out) {
+    enum { TOKENS = 3, GROUPS = 8, RANK = 256, GROUP_DIM = 2048 };
+    const size_t page_size = 16384u;
+    const size_t blocks_per_row = GROUP_DIM / 32u;
+    const size_t weight_bytes =
+        (size_t)GROUPS * RANK * blocks_per_row * sizeof(test_block_q8_0);
+    const size_t map_bytes = (weight_bytes + page_size - 1u) & ~(page_size - 1u);
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, page_size, map_bytes) == 0);
+    memset(mapped, 0, map_bytes);
+    test_block_q8_0 *weights = mapped;
+    const size_t weight_blocks = (size_t)GROUPS * RANK * blocks_per_row;
+    for (size_t block = 0; block < weight_blocks; block++) {
+        weights[block].d = 0x3000u;
+        for (int i = 0; i < 32; i++)
+            weights[block].qs[i] =
+                (int8_t)(((block * 5u + (size_t)i * 7u) % 15u) - 7);
+    }
+
+    const size_t heads_count = (size_t)TOKENS * GROUPS * GROUP_DIM;
+    const size_t low_count = (size_t)TOKENS * GROUPS * RANK;
+    float *heads = malloc(heads_count * sizeof(*heads));
+    float *batch = malloc(low_count * sizeof(*batch));
+    float *rowwise = malloc(low_count * sizeof(*rowwise));
+    CHECK(heads && batch && rowwise);
+    for (size_t i = 0; i < heads_count; i++)
+        heads[i] = (float)((int)((i * 17u + 11u) % 67u) - 33) / 128.0f;
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+    ds4_gpu_tensor *x_one = ds4_gpu_tensor_alloc(
+        (uint64_t)GROUPS * GROUP_DIM * sizeof(float));
+    ds4_gpu_tensor *low_one = ds4_gpu_tensor_alloc(
+        (uint64_t)GROUPS * RANK * sizeof(float));
+    CHECK(x && low && x_one && low_one);
+    CHECK(ds4_gpu_set_model_map_range(mapped, map_bytes, 0, map_bytes,
+                                       weight_bytes));
+    CHECK(ds4_gpu_tensor_write(x, 0, heads, heads_count * sizeof(float)));
+
+    ds4_gpu_kernel_stats before, after;
+    ds4_gpu_get_kernel_stats(&before);
+    CHECK(ds4_gpu_attention_output_low_q8_batch_tensor(
+        low, mapped, map_bytes, 0, GROUP_DIM, RANK, GROUPS, x, TOKENS));
+    CHECK(ds4_gpu_tensor_read(low, 0, batch, low_count * sizeof(float)));
+    for (int token = 0; token < TOKENS; token++) {
+        CHECK(ds4_gpu_tensor_write(x_one, 0,
+                                   heads + (size_t)token * GROUPS * GROUP_DIM,
+                                   (uint64_t)GROUPS * GROUP_DIM * sizeof(float)));
+        CHECK(ds4_gpu_attention_output_low_q8_batch_tensor(
+            low_one, mapped, map_bytes, 0, GROUP_DIM, RANK, GROUPS, x_one, 1));
+        CHECK(ds4_gpu_tensor_read(low_one, 0,
+                                  rowwise + (size_t)token * GROUPS * RANK,
+                                  (uint64_t)GROUPS * RANK * sizeof(float)));
+    }
+    ds4_gpu_get_kernel_stats(&after);
+    const float error = max_abs(batch, rowwise, low_count);
+    printf("DeepSeek V4 attention low Q8 exact rows Metal: "
+           "max_abs=%.9g calls=%llu\n",
+           error,
+           (unsigned long long)(after.tiny_batch_attn_low_exact_rows_calls -
+                                before.tiny_batch_attn_low_exact_rows_calls));
+    CHECK(error == 0.0f);
+    CHECK(after.tiny_batch_attn_low_exact_rows_calls ==
+          before.tiny_batch_attn_low_exact_rows_calls + 1);
+
+    ds4_gpu_tensor_free(low_one);
+    ds4_gpu_tensor_free(x_one);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(x);
+    free(rowwise);
+    free(batch);
+    free(heads);
+    *mapped_out = mapped;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -265,6 +341,8 @@ int main(int argc, char **argv) {
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
     void *attn_hc_mapped = NULL;
     CHECK(test_attention_q8_hc_exact_rows(&attn_hc_mapped) == 0);
+    void *attn_low_mapped = NULL;
+    CHECK(test_attention_low_q8_exact_rows(&attn_low_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -348,6 +426,7 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
+    free(attn_low_mapped);
     free(attn_hc_mapped);
     free(q4_mapped);
     return 0;
