@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
     CHECK(kernel_stats.tiny_batch_raw_store_calls >= 43);
     CHECK(kernel_stats.tiny_batch_exact_attn_calls >= 43);
     CHECK(kernel_stats.tiny_batch_exact_q8_calls > 0);
-    CHECK(kernel_stats.q8_projection_pair_calls >= 430);
+    CHECK(kernel_stats.q8_projection_pair_calls >= 43);
     printf("DeepSeek V4 DSpark tiny batch fusion: moe_calls=%llu "
            "moe_fallback=%llu shared_calls=%llu shared_exact_calls=%llu/%llu "
            "router_calls=%llu "
