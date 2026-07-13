@@ -2,6 +2,16 @@
 set -eu
 
 model=$1
+if make -n METAL=0 floyd >/dev/null 2>&1; then
+    echo "METAL=0 build unexpectedly succeeded" >&2
+    exit 1
+fi
+help=$(./floyd help)
+printf '%s\n' "$help" | grep -q '^usage:'
+if printf '%s\n' "$help" | grep -q '^uso:'; then
+    echo "help output is not English" >&2
+    exit 1
+fi
 set +e
 output=$(printf 'hello\n:exit\n' | env -u SNAP -u CHAT -u PROMPT -u SERVE \
     ./floyd --model "$model" --no-kvsave --ngen 1 2>&1)
