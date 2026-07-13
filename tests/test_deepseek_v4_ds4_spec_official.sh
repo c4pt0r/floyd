@@ -51,15 +51,15 @@ base_perf=$(grep 'DEEPSEEK_V4_PERF ' "$tmp/base.stderr" | tail -1)
 spec_perf=$(grep 'DEEPSEEK_V4_PERF ' "$tmp/spec.stderr" | tail -1)
 spec_rounds=$(printf '%s\n' "$spec_perf" |
     sed -n 's/.*spec_rounds=\([0-9][0-9]*\).*/\1/p')
-spec_tokens=$(printf '%s\n' "$spec_perf" |
-    sed -n 's/.*spec_tokens=\([0-9][0-9]*\).*/\1/p')
+spec_accepted=$(printf '%s\n' "$spec_perf" |
+    sed -n 's/.*spec_accepted=\([0-9][0-9]*\).*/\1/p')
 test -n "$spec_rounds"
-test -n "$spec_tokens"
+test -n "$spec_accepted"
 test "$spec_rounds" -gt 0
 
 printf '%s\n' "$base_perf"
 printf '%s\n' "$spec_perf"
-awk -v accepted="$spec_tokens" -v rounds="$spec_rounds" \
+awk -v accepted="$spec_accepted" -v rounds="$spec_rounds" \
     'BEGIN { printf "DeepSeek V4 DS4 spec: accepted_per_round=%.6f\n", accepted / rounds }'
 printf 'DeepSeek V4 DS4 spec token parity: %s/%s draft=%s margin=%s\n' \
     "$tokens" "$tokens" "$draft" "$margin"
