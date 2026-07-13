@@ -1,0 +1,245 @@
+diff --git a/ds4.c b/ds4.c
+index 9678a67..dba8582 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -28439,6 +28439,8 @@ int ds4_session_get_kernel_stats(const ds4_session *s,
+             gpu_stats.tiny_batch_attn_hc_calls;
+         out->tiny_batch_attn_hc_exact_rows_calls =
+             gpu_stats.tiny_batch_attn_hc_exact_rows_calls;
++        out->tiny_batch_attn_low_exact_rows_calls =
++            gpu_stats.tiny_batch_attn_low_exact_rows_calls;
+         out->tiny_batch_raw_store_calls =
+             gpu_stats.tiny_batch_raw_store_calls;
+         out->tiny_batch_exact_attn_calls =
+diff --git a/ds4.h b/ds4.h
+index f611180..20bb584 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -78,6 +78,7 @@ typedef struct {
+     uint64_t tiny_batch_router_calls;
+     uint64_t tiny_batch_attn_hc_calls;
+     uint64_t tiny_batch_attn_hc_exact_rows_calls;
++    uint64_t tiny_batch_attn_low_exact_rows_calls;
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
+     uint64_t tiny_batch_exact_q8_calls;
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 0f04f64..c272bd9 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -26,6 +26,7 @@ typedef struct {
+     uint64_t tiny_batch_router_calls;
+     uint64_t tiny_batch_attn_hc_calls;
+     uint64_t tiny_batch_attn_hc_exact_rows_calls;
++    uint64_t tiny_batch_attn_low_exact_rows_calls;
+     uint64_t tiny_batch_raw_store_calls;
+     uint64_t tiny_batch_exact_attn_calls;
+     uint64_t tiny_batch_exact_q8_calls;
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 8b8c017..f4aa8ef 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -347,6 +347,7 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
+ static uint64_t g_tiny_batch_router_calls;
+ static uint64_t g_tiny_batch_attn_hc_calls;
+ static uint64_t g_tiny_batch_attn_hc_exact_rows_calls;
++static uint64_t g_tiny_batch_attn_low_exact_rows_calls;
+ static uint64_t g_tiny_batch_raw_store_calls;
+ static uint64_t g_tiny_batch_exact_attn_calls;
+ static uint64_t g_tiny_batch_exact_q8_calls;
+@@ -364,6 +365,8 @@ void ds4_gpu_get_kernel_stats(ds4_gpu_kernel_stats *out) {
+     out->tiny_batch_attn_hc_calls = g_tiny_batch_attn_hc_calls;
+     out->tiny_batch_attn_hc_exact_rows_calls =
+         g_tiny_batch_attn_hc_exact_rows_calls;
++    out->tiny_batch_attn_low_exact_rows_calls =
++        g_tiny_batch_attn_low_exact_rows_calls;
+     out->tiny_batch_raw_store_calls = g_tiny_batch_raw_store_calls;
+     out->tiny_batch_exact_attn_calls = g_tiny_batch_exact_attn_calls;
+     out->tiny_batch_exact_q8_calls = g_tiny_batch_exact_q8_calls;
+@@ -4093,7 +4096,8 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
+         id<MTLBuffer>               dst,
+         NSUInteger                  dst_off,
+         NSUInteger                  threadgroup_bytes,
+-        NSUInteger                  nsg);
++        NSUInteger                  nsg,
++        bool                        exact_rows);
+ 
+ static int ds4_gpu_encode_attn_out_low_q8_mpp(
+         id<MTLCommandBuffer>           cb,
+@@ -6376,6 +6380,21 @@ int ds4_gpu_init(void) {
+                 return 0;
+             }
+         }
++        static const char *attn_low_exact_pipeline_names[] = {
++            "kernel_dsv4_attn_out_low_q8_0_f32_rows2",
++            "kernel_dsv4_attn_out_low_q8_0_f32_rows3",
++            "kernel_dsv4_attn_out_low_q8_0_f32_rows4",
++        };
++        for (size_t i = 0;
++             i < sizeof(attn_low_exact_pipeline_names) /
++                 sizeof(attn_low_exact_pipeline_names[0]);
++             i++) {
++            if (!ds4_gpu_get_mul_mv_pipeline(attn_low_exact_pipeline_names[i], 4)) {
++                g_queue = nil;
++                g_device = nil;
++                return 0;
++            }
++        }
+ 
+         g_initialized = 1;
+     }
+@@ -16725,6 +16744,8 @@ static int ds4_gpu_attention_output_q8_batch_impl(
+                                                 group_ids_buffer,
+                                                 0) != 0;
+             } else if (use_direct_low) {
++                const bool exact_rows = n_tokens >= 2 && n_tokens <= 4 &&
++                    getenv("DS4_METAL_DISABLE_ATTN_LOW_EXACT_ROWS") == NULL;
+                 ds4_gpu_mul_mv_id_args args = {
+                     .nei0 = (int32_t)n_groups,
+                     .nei1 = (int32_t)n_tokens,
+@@ -16747,8 +16768,13 @@ static int ds4_gpu_attention_output_q8_batch_impl(
+                     .nb1 = (uint64_t)rank * sizeof(float),
+                     .nr0 = 2,
+                 };
++                const char *pipeline_name = exact_rows
++                    ? (n_tokens == 2 ? "kernel_dsv4_attn_out_low_q8_0_f32_rows2" :
++                       (n_tokens == 3 ? "kernel_dsv4_attn_out_low_q8_0_f32_rows3" :
++                                        "kernel_dsv4_attn_out_low_q8_0_f32_rows4"))
++                    : "kernel_dsv4_attn_out_low_q8_0_f32";
+                 id<MTLComputePipelineState> pipeline =
+-                    ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
++                    ds4_gpu_get_mul_mv_pipeline(pipeline_name, 4);
+                 ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
+                                                              pipeline,
+                                                              &args,
+@@ -16759,7 +16785,9 @@ static int ds4_gpu_attention_output_q8_batch_impl(
+                                                              ds4_gpu_tensor_buffer(low),
+                                                              ds4_gpu_tensor_offset(low),
+                                                              32u * 2u * sizeof(float),
+-                                                             4) != 0;
++                                                             4,
++                                                             exact_rows) != 0;
++                if (ok && exact_rows) g_tiny_batch_attn_low_exact_rows_calls++;
+             } else {
+                 ds4_gpu_mul_mv_id_args args = {
+                     .nei0 = (int32_t)n_groups,
+@@ -17053,7 +17081,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
+                                                          ds4_gpu_tensor_buffer(low),
+                                                          ds4_gpu_tensor_offset(low),
+                                                          32u * 2u * sizeof(float),
+-                                                         4) != 0;
++                                                         4,
++                                                         false) != 0;
+         }
+ 
+         if (!had_batch) {
+@@ -21162,7 +21191,8 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
+         id<MTLBuffer>               dst,
+         NSUInteger                  dst_off,
+         NSUInteger                  threadgroup_bytes,
+-        NSUInteger                  nsg) {
++        NSUInteger                  nsg,
++        bool                        exact_rows) {
+     if (!cb || !pipeline || !args || !src0 || !src1 || !dst ||
+         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0) {
+         return 0;
+@@ -21170,7 +21200,8 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
+ 
+     const NSUInteger rows_per_group = (NSUInteger)args->nr0;
+     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+-    const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
++    const NSUInteger pairs = (NSUInteger)args->nei0 *
++        (exact_rows ? 1u : (NSUInteger)args->nei1);
+ 
+     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+     [enc setComputePipelineState:pipeline];
+diff --git a/metal/dense.metal b/metal/dense.metal
+index 1ae6ea7..e7c076c 100644
+--- a/metal/dense.metal
++++ b/metal/dense.metal
+@@ -190,9 +190,9 @@ kernel void kernel_mul_mv_q8_0_f32(
+     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
+-template<short NR1>
++template<short NR1, typename args_t>
+ void kernel_mul_mv_q8_0_f32_exact_rows_impl(
+-        constant ds4_metal_args_mul_mv & args,
++        args_t args,
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+diff --git a/metal/moe.metal b/metal/moe.metal
+index 7d34457..33ecdd2 100644
+--- a/metal/moe.metal
++++ b/metal/moe.metal
+@@ -1047,6 +1047,69 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
+         sgitg);
+ }
+ 
++template<short NR1>
++void kernel_dsv4_attn_out_low_q8_0_f32_exact_rows_impl(
++        constant ds4_metal_args_mul_mv_id & args,
++        device const char * src0s,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const int group = tgpig.z;
++    tgpig.y = 0;
++    tgpig.z = 0;
++
++    device const char *src0_cur = src0s + (uint64_t)group * args.nb02;
++    device const char *src1_cur = src1 + (uint64_t)group * args.nb11;
++    device char *dst_cur = dst +
++        (uint64_t)group * args.ne0 * sizeof(float);
++    ds4_metal_args_mul_mv args0 = {
++        /*.ne00 =*/ args.ne00,
++        /*.ne01 =*/ args.ne01,
++        /*.ne02 =*/ 1,
++        /*.nb00 =*/ args.nb00,
++        /*.nb01 =*/ args.nb01,
++        /*.nb02 =*/ args.nb02,
++        /*.nb03 =*/ args.nb02,
++        /*.ne10 =*/ args.ne10,
++        /*.ne11 =*/ NR1,
++        /*.ne12 =*/ 1,
++        /*.nb10 =*/ args.nb10,
++        /*.nb11 =*/ args.nb12,
++        /*.nb12 =*/ args.nb12 * NR1,
++        /*.nb13 =*/ args.nb12 * NR1,
++        /*.ne0  =*/ args.ne1 * args.ne0,
++        /*.ne1  =*/ NR1,
++        /*.nr0  =*/ args.nr0,
++        /*.r2   =*/ 1,
++        /*.r3   =*/ 1,
++    };
++    kernel_mul_mv_q8_0_f32_exact_rows_impl<NR1>(
++        args0, src0_cur, src1_cur, dst_cur, shmem,
++        tgpig, tiisg, sgitg);
++}
++
++#define DS4_ATTN_LOW_EXACT_ROWS_KERNEL(NR1) \
++[[host_name("kernel_dsv4_attn_out_low_q8_0_f32_rows" #NR1)]] \
++kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows##NR1( \
++        constant ds4_metal_args_mul_mv_id & args, \
++        device const char * src0s, device const char * src1, \
++        device char * dst, threadgroup char * shmem [[threadgroup(0)]], \
++        uint3 tgpig [[threadgroup_position_in_grid]], \
++        ushort tiisg [[thread_index_in_simdgroup]], \
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    kernel_dsv4_attn_out_low_q8_0_f32_exact_rows_impl<NR1>( \
++        args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg); \
++}
++
++DS4_ATTN_LOW_EXACT_ROWS_KERNEL(2)
++DS4_ATTN_LOW_EXACT_ROWS_KERNEL(3)
++DS4_ATTN_LOW_EXACT_ROWS_KERNEL(4)
++
++#undef DS4_ATTN_LOW_EXACT_ROWS_KERNEL
++
+ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
+         constant ds4_metal_args_mul_mv_id & args,
+         device const char * src0_gate,
