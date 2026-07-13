@@ -878,7 +878,8 @@ int deepseek_v4_ds4_generate_messages(
         return -1;
     }
 
-    if (message_count > 1 && cached_tokens < anchor_tokens) {
+    if (session->prefix_cache.budget_bytes > 0 &&
+        message_count > 1 && cached_tokens < anchor_tokens) {
         int full_tokens = prompt.len;
         prompt.len = anchor_tokens;
         if (ds4_session_sync(session->session, &prompt, error, error_size) != 0) {
