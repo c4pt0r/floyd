@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "moonlight_kernels_metal.h"
 #include "moonlight_metal.h"
@@ -68,6 +69,11 @@ struct MoonlightSession {
     int *kv_lengths;
     int *host_unique_experts;
     int *host_expert_row_counts;
+    float *host_activation;
+    float *host_norm;
+    float *host_temporary;
+    int *host_route_trace;
+    int last_forward_rows;
     int position;
 };
 
@@ -364,6 +370,7 @@ MoonlightModelInfo moonlight_model_info(const MoonlightModel *model) {
     result.experts_per_token = config->experts_per_token;
     result.moe_intermediate_size = config->moe_intermediate_size;
     result.shared_expert_count = config->shared_expert_count;
+    result.first_dense_layer_count = config->first_dense_layer_count;
     result.rms_norm_epsilon = config->rms_norm_epsilon;
     result.rope_theta = config->rope_theta;
     result.routed_scale = config->routed_scale;
@@ -441,8 +448,11 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
         !multiply_size(expert_input_size, sizeof(float), &expert_input_size))
         return set_error(error, error_size, "Moonlight session size overflow");
     shared_width = config->moe_intermediate_size * config->shared_expert_count;
+    int maximum_intermediate = MAX(config->moe_intermediate_size, shared_width);
+    maximum_intermediate = MAX(maximum_intermediate,
+                               config->dense_intermediate_size);
     if (!multiply_size((size_t)options->max_batch,
-                       (size_t)MAX(config->moe_intermediate_size, shared_width),
+                       (size_t)maximum_intermediate,
                        &expert_intermediate_size) ||
         !multiply_size(expert_intermediate_size, sizeof(float),
                        &expert_intermediate_size) ||
@@ -496,6 +506,18 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
     session->host_expert_row_counts =
         calloc((size_t)config->expert_count,
                sizeof(*session->host_expert_row_counts));
+    session->host_activation = calloc(
+        (size_t)options->max_batch * config->hidden_size,
+        sizeof(*session->host_activation));
+    session->host_norm = calloc(
+        (size_t)options->max_batch * config->hidden_size,
+        sizeof(*session->host_norm));
+    session->host_temporary = calloc(
+        (size_t)options->max_batch * config->hidden_size,
+        sizeof(*session->host_temporary));
+    session->host_route_trace = calloc(
+        (size_t)config->layer_count * options->max_batch *
+        config->experts_per_token, sizeof(*session->host_route_trace));
     if (!session->activation_a || !session->activation_b || !session->latent_kv ||
         !session->rope_kv || !session->token_ids || !session->logits ||
         !session->query || !session->compressed || !session->context ||
@@ -506,7 +528,9 @@ int moonlight_session_create(MoonlightSession **out, MoonlightModel *model,
         !session->expert_hidden || !session->expert_output ||
         !session->routed_output || !session->shared_output ||
         !session->kv_lengths || !session->host_unique_experts ||
-        !session->host_expert_row_counts) {
+        !session->host_expert_row_counts || !session->host_activation ||
+        !session->host_norm || !session->host_temporary ||
+        !session->host_route_trace) {
         moonlight_session_destroy(session);
         return 0;
     }
@@ -540,12 +564,17 @@ void moonlight_session_destroy(MoonlightSession *session) {
     free(session->kv_lengths);
     free(session->host_unique_experts);
     free(session->host_expert_row_counts);
+    free(session->host_activation);
+    free(session->host_norm);
+    free(session->host_temporary);
+    free(session->host_route_trace);
     free(session);
 }
 
 void moonlight_session_reset(MoonlightSession *session) {
     if (!session) return;
     session->position = 0;
+    session->last_forward_rows = 0;
     const MoonlightConfig *config =
         moonlight_model_data_config(session->model->data);
     memset(session->kv_lengths, 0,
@@ -869,10 +898,6 @@ int moonlight_test_attention(MoonlightSession *session, int layer,
     memcpy(output, session->activation_b.contents, output_size);
     session->kv_lengths[layer] = position + rows;
     if (session->position < position + rows) session->position = position + rows;
-    if (position == 0 && rows > 1)
-        session->stats.prefill_tokens += (uint64_t)rows;
-    else
-        session->stats.decode_tokens += (uint64_t)rows;
     return 1;
 }
 
@@ -925,8 +950,7 @@ int moonlight_test_moe(MoonlightSession *session, int layer,
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
 
-    if (!session || !input || !route_ids || !route_weights ||
-        !router_scores || !routed_output || !shared_output || !output ||
+    if (!session || !input || !output ||
         rows <= 0 || rows > session->options.max_batch) return 0;
     config = moonlight_model_data_config(session->model->data);
     if (layer < config->first_dense_layer_count || layer >= config->layer_count ||
@@ -1106,11 +1130,239 @@ int moonlight_test_moe(MoonlightSession *session, int layer,
     [encoder endEncoding];
     if (!finish_command(session, command)) return 0;
 
-    memcpy(route_ids, session->route_ids.contents, route_bytes);
-    memcpy(route_weights, session->route_weights.contents, route_bytes);
-    memcpy(router_scores, session->router_logits.contents, score_bytes);
-    memcpy(routed_output, session->routed_output.contents, hidden_bytes);
-    memcpy(shared_output, session->shared_output.contents, hidden_bytes);
+    if (route_ids) memcpy(route_ids, session->route_ids.contents, route_bytes);
+    if (route_weights)
+        memcpy(route_weights, session->route_weights.contents, route_bytes);
+    if (router_scores)
+        memcpy(router_scores, session->router_logits.contents, score_bytes);
+    if (routed_output)
+        memcpy(routed_output, session->routed_output.contents, hidden_bytes);
+    if (shared_output)
+        memcpy(shared_output, session->shared_output.contents, hidden_bytes);
     memcpy(output, session->activation_b.contents, hidden_bytes);
+    return 1;
+}
+
+static double monotonic_seconds(void) {
+    struct timespec value;
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return value.tv_sec + value.tv_nsec * 1e-9;
+}
+
+static int run_residual_add(MoonlightSession *session, const float *left,
+                            const float *right, int rows, float *output) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    uint32_t count = (uint32_t)((int64_t)rows * config->hidden_size);
+    size_t byte_count = (size_t)count * sizeof(float);
+    memcpy(session->activation_a.contents, left, byte_count);
+    memcpy(session->activation_b.contents, right, byte_count);
+    id<MTLCommandBuffer> command = [session->model->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:session->model->add_f32];
+    [encoder setBuffer:session->activation_a offset:0 atIndex:0];
+    [encoder setBuffer:session->activation_b offset:0 atIndex:1];
+    [encoder setBuffer:session->expert_output offset:0 atIndex:2];
+    [encoder setBytes:&count length:sizeof(count) atIndex:3];
+    dispatch_1d(encoder, session->model->add_f32, count);
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+    memcpy(output, session->expert_output.contents, byte_count);
+    return 1;
+}
+
+int moonlight_test_dense_mlp(MoonlightSession *session, int layer,
+                             const float *input, int rows, float *output) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    MoonlightMatrix gate_matrix;
+    MoonlightMatrix up_matrix;
+    MoonlightMatrix down_matrix;
+    char name[512];
+    size_t byte_count = (size_t)rows * config->hidden_size * sizeof(float);
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.gate_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        config->dense_intermediate_size, &gate_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.up_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->hidden_size,
+                        config->dense_intermediate_size, &up_matrix)) return 0;
+    if (snprintf(name, sizeof(name),
+                 "model.layers.%d.mlp.down_proj.weight", layer) >=
+            (int)sizeof(name) ||
+        !resolve_matrix(session->model, name, config->dense_intermediate_size,
+                        config->hidden_size, &down_matrix)) return 0;
+    memcpy(session->activation_a.contents, input, byte_count);
+    id<MTLCommandBuffer> command = [session->model->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    encode_matmul(session->model, encoder, &gate_matrix,
+                  session->activation_a, session->expert_gate, rows,
+                  config->hidden_size, config->dense_intermediate_size);
+    encode_matmul(session->model, encoder, &up_matrix,
+                  session->activation_a, session->expert_up, rows,
+                  config->hidden_size, config->dense_intermediate_size);
+    uint32_t intermediate_count =
+        (uint32_t)((int64_t)rows * config->dense_intermediate_size);
+    [encoder setComputePipelineState:session->model->silu_multiply];
+    [encoder setBuffer:session->expert_gate offset:0 atIndex:0];
+    [encoder setBuffer:session->expert_up offset:0 atIndex:1];
+    [encoder setBuffer:session->expert_hidden offset:0 atIndex:2];
+    [encoder setBytes:&intermediate_count length:sizeof(intermediate_count)
+              atIndex:3];
+    dispatch_1d(encoder, session->model->silu_multiply, intermediate_count);
+    encode_matmul(session->model, encoder, &down_matrix,
+                  session->expert_hidden, session->activation_b, rows,
+                  config->dense_intermediate_size, config->hidden_size);
+    [encoder endEncoding];
+    if (!finish_command(session, command)) return 0;
+    memcpy(output, session->activation_b.contents, byte_count);
+    return 1;
+}
+
+static int run_tokens(MoonlightSession *session, const int *ids, int count,
+                      int start_position, float *layer_outputs,
+                      float *last_logits,
+                      char *error, size_t error_size) {
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    char name[512];
+    if (!moonlight_test_embed(session, ids, count, session->host_activation))
+        return set_error(error, error_size, "Moonlight embedding failed");
+    for (int layer = 0; layer < config->layer_count; ++layer) {
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.input_layernorm.weight", layer) >=
+                (int)sizeof(name) ||
+            !moonlight_test_rmsnorm(session, session->host_activation, name,
+                                    count, config->hidden_size,
+                                    session->host_norm))
+            return set_error(error, error_size,
+                             "Moonlight input norm failed at layer %d", layer);
+        if (!moonlight_test_attention(session, layer, session->host_norm,
+                                      count, start_position,
+                                      session->host_temporary))
+            return set_error(error, error_size,
+                             "Moonlight attention failed at layer %d", layer);
+        if (!run_residual_add(session, session->host_activation,
+                              session->host_temporary, count,
+                              session->host_activation))
+            return set_error(error, error_size,
+                             "Moonlight attention residual failed at layer %d",
+                             layer);
+        if (snprintf(name, sizeof(name),
+                     "model.layers.%d.post_attention_layernorm.weight", layer) >=
+                (int)sizeof(name) ||
+            !moonlight_test_rmsnorm(session, session->host_activation, name,
+                                    count, config->hidden_size,
+                                    session->host_norm))
+            return set_error(error, error_size,
+                             "Moonlight post-attention norm failed at layer %d",
+                             layer);
+        if (layer < config->first_dense_layer_count) {
+            if (!moonlight_test_dense_mlp(session, layer, session->host_norm,
+                                          count, session->host_temporary))
+                return set_error(error, error_size,
+                                 "Moonlight dense MLP failed at layer %d", layer);
+        } else if (!moonlight_test_moe(
+                                       session, layer, session->host_norm,
+                                       count,
+                                       session->host_route_trace +
+                                           (int64_t)layer *
+                                           session->options.max_batch *
+                                           config->experts_per_token,
+                                       NULL, NULL, NULL, NULL,
+                                       session->host_temporary)) {
+            return set_error(error, error_size,
+                             "Moonlight MoE failed at layer %d", layer);
+        }
+        if (!run_residual_add(session, session->host_activation,
+                              session->host_temporary, count,
+                              session->host_activation))
+            return set_error(error, error_size,
+                             "Moonlight MLP residual failed at layer %d", layer);
+        if (layer_outputs)
+            memcpy(layer_outputs + (int64_t)layer * count * config->hidden_size,
+                   session->host_activation,
+                   (size_t)count * config->hidden_size * sizeof(float));
+    }
+    const float *last_hidden = session->host_activation +
+        (int64_t)(count - 1) * config->hidden_size;
+    if (!moonlight_test_rmsnorm(session, last_hidden, "model.norm.weight",
+                                1, config->hidden_size, session->host_norm))
+        return set_error(error, error_size, "Moonlight final norm failed");
+    if (!moonlight_test_matmul(session, "lm_head.weight", session->host_norm,
+                               1, config->hidden_size, config->vocab_size,
+                               last_logits))
+        return set_error(error, error_size, "Moonlight lm-head failed");
+    session->last_forward_rows = count;
+    return 1;
+}
+
+int moonlight_session_prefill(MoonlightSession *session, const int *ids,
+                              int count, float *last_logits,
+                              char *error, size_t error_size) {
+    if (!session || !ids || !last_logits || count <= 0 ||
+        count > session->options.max_batch ||
+        count > session->options.context_size)
+        return set_error(error, error_size, "invalid Moonlight prefill request");
+    if (session->position != 0)
+        return set_error(error, error_size,
+                         "Moonlight prefill requires an empty session");
+    double start = monotonic_seconds();
+    if (!run_tokens(session, ids, count, 0, NULL, last_logits,
+                    error, error_size))
+        return 0;
+    session->stats.prefill_tokens += (uint64_t)count;
+    session->stats.prefill_ms += (monotonic_seconds() - start) * 1000.0;
+    return 1;
+}
+
+int moonlight_session_decode(MoonlightSession *session, int token,
+                             float *logits, char *error, size_t error_size) {
+    if (!session || !logits || session->position < 0 ||
+        session->position >= session->options.context_size)
+        return set_error(error, error_size, "invalid Moonlight decode request");
+    int position = session->position;
+    double start = monotonic_seconds();
+    if (!run_tokens(session, &token, 1, position, NULL, logits,
+                    error, error_size))
+        return 0;
+    session->stats.decode_tokens++;
+    session->stats.decode_ms += (monotonic_seconds() - start) * 1000.0;
+    return 1;
+}
+
+int moonlight_test_prefill_layers(MoonlightSession *session, const int *ids,
+                                  int count, float *layer_outputs,
+                                  float *last_logits,
+                                  char *error, size_t error_size) {
+    if (!session || !ids || !layer_outputs || !last_logits || count <= 0 ||
+        count > session->options.max_batch || session->position != 0)
+        return set_error(error, error_size,
+                         "invalid Moonlight layer trace request");
+    double start = monotonic_seconds();
+    if (!run_tokens(session, ids, count, 0, layer_outputs, last_logits,
+                    error, error_size)) return 0;
+    session->stats.prefill_tokens += (uint64_t)count;
+    session->stats.prefill_ms += (monotonic_seconds() - start) * 1000.0;
+    return 1;
+}
+
+int moonlight_test_copy_routes(const MoonlightSession *session, int layer,
+                               int *route_ids, int capacity) {
+    if (!session || !route_ids || capacity < session->last_forward_rows)
+        return 0;
+    const MoonlightConfig *config =
+        moonlight_model_data_config(session->model->data);
+    if (layer < config->first_dense_layer_count ||
+        layer >= config->layer_count) return 0;
+    memcpy(route_ids,
+           session->host_route_trace +
+               (int64_t)layer * session->options.max_batch *
+               config->experts_per_token,
+           (size_t)session->last_forward_rows * config->experts_per_token *
+               sizeof(*route_ids));
     return 1;
 }

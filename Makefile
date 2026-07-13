@@ -246,7 +246,8 @@ test-moonlight-metal-moe: tests/test_moonlight_metal_moe
 
 test-moonlight-metal: tests/test_moonlight_metal_runtime
 	@test -n "$(MOONLIGHT_TINY)" || (echo "set MOONLIGHT_TINY=/path/to/fixture_tiny"; exit 2)
-	./tests/test_moonlight_metal_runtime "$(MOONLIGHT_TINY)"
+	@test -n "$(MOONLIGHT_ORACLE)" || (echo "set MOONLIGHT_ORACLE=/path/to/oracle"; exit 2)
+	./tests/test_moonlight_metal_runtime "$(MOONLIGHT_TINY)" "$(MOONLIGHT_ORACLE)"
 
 tests/test_st: tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

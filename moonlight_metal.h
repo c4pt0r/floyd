@@ -25,6 +25,7 @@ typedef struct {
     int experts_per_token;
     int moe_intermediate_size;
     int shared_expert_count;
+    int first_dense_layer_count;
     float rms_norm_epsilon;
     float rope_theta;
     float routed_scale;
@@ -55,6 +56,15 @@ void moonlight_session_destroy(MoonlightSession *session);
 void moonlight_session_reset(MoonlightSession *session);
 int moonlight_session_position(const MoonlightSession *session);
 MoonlightStats moonlight_session_stats(const MoonlightSession *session);
+int moonlight_session_prefill(MoonlightSession *session, const int *ids,
+                              int count, float *last_logits,
+                              char *error, size_t error_size);
+int moonlight_session_decode(MoonlightSession *session, int token,
+                             float *logits, char *error, size_t error_size);
+int moonlight_test_prefill_layers(MoonlightSession *session, const int *ids,
+                                  int count, float *layer_outputs,
+                                  float *last_logits,
+                                  char *error, size_t error_size);
 
 int moonlight_test_embed(MoonlightSession *session, const int *ids,
                          int count, float *output);
@@ -75,5 +85,9 @@ int moonlight_test_moe(MoonlightSession *session, int layer,
                        float *route_weights, float *router_scores,
                        float *routed_output, float *shared_output,
                        float *output);
+int moonlight_test_dense_mlp(MoonlightSession *session, int layer,
+                             const float *input, int rows, float *output);
+int moonlight_test_copy_routes(const MoonlightSession *session, int layer,
+                               int *route_ids, int capacity);
 
 #endif
