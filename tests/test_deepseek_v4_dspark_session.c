@@ -161,6 +161,7 @@ int main(int argc, char **argv) {
 
     ds4_session_kernel_stats kernel_stats;
     CHECK(ds4_session_get_kernel_stats(speculative, &kernel_stats));
+    CHECK(kernel_stats.moe_mv_id_nsg == 1);
     CHECK(kernel_stats.tiny_batch_pair_swiglu_calls >= 43);
     CHECK(kernel_stats.tiny_batch_activation_fallback_calls == 0);
     CHECK(kernel_stats.tiny_batch_shared_swiglu_calls >= 43);
