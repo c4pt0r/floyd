@@ -411,6 +411,12 @@ test-deepseek-v4-dspark-metal: tests/test_deepseek_v4_dspark_metal
 	cd "$(DS4_DIR)" && "$(abspath $<)" "$(abspath $(DS4_GGUF))" \
 	  "$(abspath $(DSPARK_SUPPORT))" "$(abspath fixture_dspark_dspark_decode)"
 
+test-deepseek-v4-dspark-q8-support: tests/test_deepseek_v4_dspark_metal
+	@test -n "$(DS4_GGUF)" || (echo "set DS4_GGUF=/path/to/base.gguf"; exit 2)
+	@test -n "$(DSPARK_Q8_SUPPORT)" || (echo "set DSPARK_Q8_SUPPORT=/path/to/q8-dspark.gguf"; exit 2)
+	cd "$(DS4_DIR)" && "$(abspath $<)" "$(abspath $(DS4_GGUF))" \
+	  "$(abspath $(DSPARK_Q8_SUPPORT))" "$(abspath fixture_dspark_dspark_decode)"
+
 tests/test_deepseek_v4_dspark_session: tests/test_deepseek_v4_dspark_session.c st.h json.h compat.h $(DS4_CORE_OBJS)
 	$(CC) -O2 -I$(DS4_DIR) $< $(DS4_CORE_OBJS) -o $@ -lm -pthread \
 	  -framework Accelerate -framework Metal -framework MetalKit -framework Foundation
