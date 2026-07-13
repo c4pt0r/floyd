@@ -21,6 +21,41 @@ static int touch_file(const char *path) {
 }
 
 int main(void) {
+    uint64_t cache_bytes = 0;
+    CHECK(deepseek_v4_ds4_prefix_cache_bytes(0, &cache_bytes));
+    CHECK(cache_bytes == 0);
+    CHECK(deepseek_v4_ds4_prefix_cache_bytes(256, &cache_bytes));
+    CHECK(cache_bytes == UINT64_C(256) * 1024 * 1024);
+    CHECK(!deepseek_v4_ds4_prefix_cache_bytes(UINT64_MAX, &cache_bytes));
+
+    DeepSeekV4Ds4RequestConfig request_config = {
+        .max_tokens = 32,
+        .temperature = 0.0f,
+        .top_p = 1.0f,
+        .draft = 3,
+    };
+    char request_error[256] = {0};
+    CHECK(deepseek_v4_ds4_request_config_validate(
+        &request_config, request_error, sizeof(request_error)));
+    uint64_t request_key = deepseek_v4_ds4_request_config_key(
+        32768, &request_config);
+    request_config.max_tokens = 64;
+    CHECK(deepseek_v4_ds4_request_config_key(32768, &request_config) == request_key);
+    request_config.draft = 2;
+    CHECK(deepseek_v4_ds4_request_config_key(32768, &request_config) != request_key);
+    request_config.draft = 3;
+    request_config.temperature = 0.7f;
+    request_config.top_p = 0.9f;
+    CHECK(!deepseek_v4_ds4_request_config_validate(
+        &request_config, request_error, sizeof(request_error)));
+    CHECK(strstr(request_error, "sampling") != NULL);
+    request_config.draft = 1;
+    CHECK(deepseek_v4_ds4_request_config_validate(
+        &request_config, request_error, sizeof(request_error)));
+    CHECK(deepseek_v4_ds4_request_config_key(32768, &request_config) != request_key);
+    CHECK(deepseek_v4_ds4_request_config_key(16384, &request_config) !=
+          deepseek_v4_ds4_request_config_key(32768, &request_config));
+
     DeepSeekV4Ds4SpecConfig spec;
     char spec_error[256] = {0};
     unsetenv("DRAFT");
