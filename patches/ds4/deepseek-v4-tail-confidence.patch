@@ -1,0 +1,87 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -22857,6 +22857,7 @@
+     int mtp_draft_tokens;
+     float mtp_margin;
+     float dspark_confidence_threshold;
++    float dspark_confidence_tail_threshold;
+     char *directional_steering_file;
+     float *directional_steering_dirs;
+     float directional_steering_attn_scale;
+@@ -25105,17 +25106,27 @@
+     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+ }
+ 
+-int ds4_dspark_confident_prefix_length(const float *confidence_logits,
+-                                       int block_size, float threshold) {
++int ds4_dspark_confident_prefix_length_staged(
++        const float *confidence_logits,
++        int block_size,
++        float first_threshold,
++        float tail_threshold) {
+     if (!confidence_logits || block_size <= 0) return 0;
+-    if (threshold <= 0.0f) return block_size;
+     for (int i = 0; i < block_size; i++) {
++        const float threshold = i == 0 ? first_threshold : tail_threshold;
++        if (threshold <= 0.0f) continue;
+         const float probability = 1.0f / (1.0f + expf(-confidence_logits[i]));
+         if (probability < threshold) return i;
+     }
+     return block_size;
+ }
+ 
++int ds4_dspark_confident_prefix_length(const float *confidence_logits,
++                                       int block_size, float threshold) {
++    return ds4_dspark_confident_prefix_length_staged(
++        confidence_logits, block_size, threshold, threshold);
++}
++
+ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
+     return s ? &s->checkpoint : NULL;
+ }
+@@ -26714,5 +26727,10 @@
+         opt->dspark_confidence_threshold <= 1.0f
+             ? opt->dspark_confidence_threshold : 0.0f;
++    e->dspark_confidence_tail_threshold =
++        opt->dspark_confidence_tail_threshold >= 0.0f &&
++        opt->dspark_confidence_tail_threshold <= 1.0f
++            ? opt->dspark_confidence_tail_threshold
++            : e->dspark_confidence_threshold;
+     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
+         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
+     {
+@@ -28343,11 +28361,12 @@
+                 proposal_count,
+                 s->dspark_proposals,
+                 s->dspark_confidence)) {
+             const int sampled_count = proposal_count - 1;
+-            const int confident_count = ds4_dspark_confident_prefix_length(
++            const int confident_count = ds4_dspark_confident_prefix_length_staged(
+                     s->dspark_confidence,
+                     sampled_count,
+-                    e->dspark_confidence_threshold);
++                    e->dspark_confidence_threshold,
++                    e->dspark_confidence_tail_threshold);
+             s->dspark_proposal_count = confident_count > 0
+                 ? 1 + confident_count : 0;
+             s->dspark_proposals_valid = s->dspark_proposal_count > 0;
+--- a/ds4.h
++++ b/ds4.h
+@@ -125,6 +125,7 @@
+     int mtp_draft_tokens;
+     float mtp_margin;
+     float dspark_confidence_threshold;
++    float dspark_confidence_tail_threshold;
+     const char *directional_steering_file;
+     const char *expert_profile_path;
+     float directional_steering_attn;
+@@ -311,6 +312,9 @@
+ int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+ int ds4_dspark_confident_prefix_length(const float *confidence_logits,
+                                        int block_size, float threshold);
++int ds4_dspark_confident_prefix_length_staged(
++    const float *confidence_logits, int block_size,
++    float first_threshold, float tail_threshold);
+ int ds4_dspark_support_validate(const char *path, int *stage_count);
+ int ds4_dspark_probe_stages(const char *base_path, const char *support_path,
+                             const float *prefill_kv, unsigned prefill_count,

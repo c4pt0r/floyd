@@ -43,6 +43,11 @@ float deepseek_v4_ds4_default_confidence_threshold(const char *support_path) {
     return support_path && strstr(support_path, "-Q4K") ? 0.52f : 0.53f;
 }
 
+float deepseek_v4_ds4_default_tail_confidence_threshold(
+    const char *support_path) {
+    return support_path && strstr(support_path, "-Q4K") ? 0.48f : 0.53f;
+}
+
 int deepseek_v4_ds4_spec_config_from_env(
     DeepSeekV4Ds4SpecConfig *config, char *error, size_t error_size) {
     if (!config) return 0;
@@ -50,6 +55,8 @@ int deepseek_v4_ds4_spec_config_from_env(
     config->margin = 3.0f;
     config->confidence_threshold =
         deepseek_v4_ds4_default_confidence_threshold(NULL);
+    config->tail_confidence_threshold =
+        deepseek_v4_ds4_default_tail_confidence_threshold(NULL);
 
     const char *draft = getenv("DRAFT");
     if (draft && *draft) {
@@ -92,6 +99,22 @@ int deepseek_v4_ds4_spec_config_from_env(
             return 0;
         }
         config->confidence_threshold = value;
+    }
+
+    const char *tail_threshold =
+        getenv("FLOYD_DEEPSEEK_V4_DS4_TAIL_CONFIDENCE_THRESHOLD");
+    if (tail_threshold && *tail_threshold) {
+        char *end = NULL;
+        errno = 0;
+        float value = strtof(tail_threshold, &end);
+        if (errno || !end || *end || !isfinite(value) ||
+            value < 0.0f || value > 1.0f) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "FLOYD_DEEPSEEK_V4_DS4_TAIL_CONFIDENCE_THRESHOLD must be finite and in 0..1");
+            return 0;
+        }
+        config->tail_confidence_threshold = value;
     }
     return 1;
 }
@@ -347,6 +370,7 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         .draft_tokens = 1,
         .margin = 3.0f,
         .confidence_threshold = 0.5f,
+        .tail_confidence_threshold = 0.5f,
     };
     if (spec_kind != DEEPSEEK_V4_DS4_SPEC_NONE &&
         !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {
@@ -360,6 +384,13 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         spec.confidence_threshold =
             deepseek_v4_ds4_default_confidence_threshold(dspark_path);
     }
+    const char *tail_threshold_override =
+        getenv("FLOYD_DEEPSEEK_V4_DS4_TAIL_CONFIDENCE_THRESHOLD");
+    if (spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK &&
+        (!tail_threshold_override || !*tail_threshold_override)) {
+        spec.tail_confidence_threshold =
+            deepseek_v4_ds4_default_tail_confidence_threshold(dspark_path);
+    }
     ds4_engine_options options = {
         .model_path = model_path,
         .mtp_path = mtp_path,
@@ -369,6 +400,7 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         .mtp_draft_tokens = spec.draft_tokens,
         .mtp_margin = spec.margin,
         .dspark_confidence_threshold = spec.confidence_threshold,
+        .dspark_confidence_tail_threshold = spec.tail_confidence_threshold,
     };
     double started = ds4_now_ms();
     if (ds4_engine_open(&result->engine, &options) != 0 ||
@@ -390,8 +422,10 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
             const char *backend = spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK
                 ? "dspark" : "mtp";
             fprintf(stderr,
-                    "DEEPSEEK_V4_SPEC backend=%s draft=%d confidence_threshold=%.3f\n",
-                    backend, spec.draft_tokens, spec.confidence_threshold);
+                    "DEEPSEEK_V4_SPEC backend=%s draft=%d confidence_threshold=%.3f "
+                    "tail_confidence_threshold=%.3f\n",
+                    backend, spec.draft_tokens, spec.confidence_threshold,
+                    spec.tail_confidence_threshold);
         }
     }
     return result;
