@@ -98,6 +98,71 @@ int main(void) {
     CHECK(max0 == 0.0f);
     CHECK(max1 == 0.0f);
 
+    enum { BATCH_TOKENS = 3 };
+    float batch_x_host[BATCH_TOKENS * IN_DIM];
+    for (uint32_t token = 0; token < BATCH_TOKENS; token++) {
+        for (uint32_t i = 0; i < IN_DIM; i++) {
+            batch_x_host[token * IN_DIM + i] =
+                ((int)((i * 7u + token * 13u) % 47u) - 23) / 64.0f;
+        }
+    }
+    const uint64_t batch_x_bytes = sizeof(batch_x_host);
+    const uint64_t batch0_bytes =
+        (uint64_t)BATCH_TOKENS * OUT0_DIM * sizeof(float);
+    const uint64_t batch1_bytes =
+        (uint64_t)BATCH_TOKENS * OUT1_DIM * sizeof(float);
+    ds4_gpu_tensor *batch_x = ds4_gpu_tensor_alloc(batch_x_bytes);
+    ds4_gpu_tensor *batch_ref0 = ds4_gpu_tensor_alloc(batch0_bytes);
+    ds4_gpu_tensor *batch_ref1 = ds4_gpu_tensor_alloc(batch1_bytes);
+    ds4_gpu_tensor *batch_pair0 = ds4_gpu_tensor_alloc(batch0_bytes);
+    ds4_gpu_tensor *batch_pair1 = ds4_gpu_tensor_alloc(batch1_bytes);
+    CHECK(batch_x && batch_ref0 && batch_ref1 && batch_pair0 && batch_pair1);
+    CHECK(ds4_gpu_tensor_write(batch_x, 0, batch_x_host,
+                               batch_x_bytes) != 0);
+
+    ds4_gpu_set_tiny_decode_order(true);
+    CHECK(ds4_gpu_begin_commands() != 0);
+    CHECK(ds4_gpu_matmul_q8_0_tensor(batch_ref0, model, allocation, 0,
+                                     IN_DIM, OUT0_DIM, batch_x,
+                                     BATCH_TOKENS) != 0);
+    CHECK(ds4_gpu_matmul_q8_0_tensor(batch_ref1, model, allocation,
+                                     weight0_bytes, IN_DIM, OUT1_DIM,
+                                     batch_x, BATCH_TOKENS) != 0);
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(
+              batch_pair0, batch_pair1, model, allocation,
+              0, weight0_bytes, IN_DIM, OUT0_DIM, OUT1_DIM,
+              batch_x, BATCH_TOKENS) != 0);
+    CHECK(ds4_gpu_end_commands() != 0);
+    ds4_gpu_set_tiny_decode_order(false);
+
+    float batch_ref0_host[BATCH_TOKENS * OUT0_DIM];
+    float batch_ref1_host[BATCH_TOKENS * OUT1_DIM];
+    float batch_pair0_host[BATCH_TOKENS * OUT0_DIM];
+    float batch_pair1_host[BATCH_TOKENS * OUT1_DIM];
+    CHECK(ds4_gpu_tensor_read(batch_ref0, 0, batch_ref0_host,
+                              batch0_bytes) != 0);
+    CHECK(ds4_gpu_tensor_read(batch_ref1, 0, batch_ref1_host,
+                              batch1_bytes) != 0);
+    CHECK(ds4_gpu_tensor_read(batch_pair0, 0, batch_pair0_host,
+                              batch0_bytes) != 0);
+    CHECK(ds4_gpu_tensor_read(batch_pair1, 0, batch_pair1_host,
+                              batch1_bytes) != 0);
+    const float batch_max0 = max_abs_diff(
+        batch_ref0_host, batch_pair0_host, BATCH_TOKENS * OUT0_DIM);
+    const float batch_max1 = max_abs_diff(
+        batch_ref1_host, batch_pair1_host, BATCH_TOKENS * OUT1_DIM);
+    printf("DeepSeek V4 Q8 batch pair parity: "
+           "out0_max_abs=%.9g out1_max_abs=%.9g\n",
+           batch_max0, batch_max1);
+    CHECK(batch_max0 == 0.0f);
+    CHECK(batch_max1 == 0.0f);
+
+    ds4_gpu_tensor_free(batch_pair1);
+    ds4_gpu_tensor_free(batch_pair0);
+    ds4_gpu_tensor_free(batch_ref1);
+    ds4_gpu_tensor_free(batch_ref0);
+    ds4_gpu_tensor_free(batch_x);
+
     ds4_gpu_tensor_free(pair1);
     ds4_gpu_tensor_free(pair0);
     ds4_gpu_tensor_free(ref1);
