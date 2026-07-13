@@ -117,7 +117,6 @@ int main(int argc, char **argv) {
     CHECK(ds4_session_sync(greedy, &prompt, error, sizeof(error)) == 0);
     CHECK(ds4_session_sync(speculative, &prompt, error, sizeof(error)) == 0);
     CHECK(setenv("DS4_METAL_VERIFY_SPLIT_LAYERS", "4", 1) == 0);
-    CHECK(setenv("DS4_METAL_ENABLE_INLINE_VERIFY_APPEND", "1", 1) == 0);
 
     int greedy_ids[6], spec_ids[6], spec_count = 0, max_round = 0;
     int eval_rounds = 0;
@@ -161,7 +160,6 @@ int main(int argc, char **argv) {
     CHECK(spec_stats.verify_split_flushes > 0);
     CHECK(spec_stats.verify_outcome_calls[4][4] == 1);
     CHECK(spec_stats.verify_outcome_ms[4][4] > 0.0);
-    CHECK(spec_stats.inline_verify_append_calls > 0);
 
     ds4_session_kernel_stats kernel_stats;
     CHECK(ds4_session_get_kernel_stats(speculative, &kernel_stats));
@@ -200,15 +198,13 @@ int main(int argc, char **argv) {
            (unsigned long long)kernel_stats.q8_projection_pair_calls);
     printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
            "verify=%.3f layer_encode=%.3f layer_execute=%.3f "
-           "head=%.3f read=%.3f replay=%.3f proposed=%llu accepted=%llu "
-           "inline_append=%llu\n",
+           "head=%.3f read=%.3f replay=%.3f proposed=%llu accepted=%llu\n",
            spec_stats.target_ms, spec_stats.proposal_ms,
            spec_stats.verify_ms, spec_stats.verify_layer_encode_ms,
            spec_stats.verify_layer_execute_ms, spec_stats.verify_head_ms,
            spec_stats.verify_read_ms, spec_stats.replay_ms,
            (unsigned long long)spec_stats.proposed_tokens,
-           (unsigned long long)spec_stats.accepted_tokens,
-           (unsigned long long)spec_stats.inline_verify_append_calls);
+           (unsigned long long)spec_stats.accepted_tokens);
 
     ds4_session_free(speculative);
     ds4_session_free(greedy);
@@ -216,6 +212,5 @@ int main(int argc, char **argv) {
     CHECK(unlink(lock_path) == 0);
     unsetenv("DS4_LOCK_FILE");
     unsetenv("DS4_METAL_VERIFY_SPLIT_LAYERS");
-    unsetenv("DS4_METAL_ENABLE_INLINE_VERIFY_APPEND");
     return 0;
 }
