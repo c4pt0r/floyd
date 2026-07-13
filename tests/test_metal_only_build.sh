@@ -37,6 +37,12 @@ if nm floyd | grep -Eq \
     exit 1
 fi
 
+if nm floyd | grep -Eq \
+    '_cpu_decode_scratch_init$|_forward_first_token_cpu$|_prefill_layer_major_cpu$|_session_cpu_reset_cache$'; then
+    echo "floyd still contains the DS4 CPU inference backend" >&2
+    exit 1
+fi
+
 for path in \
     moonlight_oracle.c \
     moonlight_oracle.h \
