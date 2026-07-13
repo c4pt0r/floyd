@@ -315,6 +315,12 @@ test-deepseek-v4-ds4-40tps: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	sh tests/test_deepseek_v4_ds4_40tps.sh "$(DSPARK)" 32
 
+test-deepseek-v4-ds4-q4-output: floyd
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	@test -n "$(DS4_GGUF)" || (echo "set DS4_GGUF=/path/to/q8-base.gguf"; exit 2)
+	@test -n "$(DS4_Q4_GGUF)" || (echo "set DS4_Q4_GGUF=/path/to/q4-output.gguf"; exit 2)
+	sh tests/test_deepseek_v4_ds4_q4_output.sh "$(DSPARK)" "$(DS4_GGUF)" "$(DS4_Q4_GGUF)"
+
 test-deepseek-v4-ds4-draft2-tail: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	sh tests/test_deepseek_v4_ds4_draft2_tail.sh "$(DSPARK)"
