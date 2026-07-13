@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -11,6 +12,13 @@
 #define HC 4
 #define DRAFT 5
 #define KV 512
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+} test_block_q4_k;
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -44,6 +52,69 @@ static void similarity(const float *actual, const float *expected, size_t count,
     *cosine = (float)(ae / sqrt(aa * ee));
 }
 
+static int test_dense_q4_k(void **mapped_out) {
+    enum { ROWS = 8, COLS = 256, TOKENS = 2, MAP_BYTES = 4096 };
+    void *mapped = NULL;
+    CHECK(posix_memalign(&mapped, MAP_BYTES, MAP_BYTES) == 0);
+    memset(mapped, 0, MAP_BYTES);
+    test_block_q4_k *blocks = mapped;
+    for (int row = 0; row < ROWS; row++) {
+        blocks[row].d = 0x3c00;
+        for (int group = 0; group < 4; group++)
+            blocks[row].scales[group] = 1;
+        for (int group = 4; group < 8; group++)
+            blocks[row].scales[group + 4] = 1;
+        for (int pair = 0; pair < 4; pair++) {
+            for (int col = 0; col < 32; col++) {
+                const uint8_t low = (uint8_t)((row + pair + col) & 15);
+                const uint8_t high = (uint8_t)((15 - row + pair + col) & 15);
+                blocks[row].qs[pair * 32 + col] =
+                    (uint8_t)(low | (high << 4));
+            }
+        }
+    }
+
+    float input[TOKENS * COLS];
+    float expected[TOKENS * ROWS];
+    float actual[TOKENS * ROWS];
+    for (int token = 0; token < TOKENS; token++)
+        for (int col = 0; col < COLS; col++)
+            input[token * COLS + col] =
+                0.01f * (float)(((token + 3) * (col + 5)) % 29 - 14);
+    for (int token = 0; token < TOKENS; token++) {
+        for (int row = 0; row < ROWS; row++) {
+            float sum = 0.0f;
+            for (int group = 0; group < 8; group++) {
+                const int pair = group / 2;
+                const int shift = (group & 1) * 4;
+                for (int col = 0; col < 32; col++) {
+                    const float value =
+                        (float)((blocks[row].qs[pair * 32 + col] >> shift) & 15);
+                    sum += input[token * COLS + group * 32 + col] * value;
+                }
+            }
+            expected[token * ROWS + row] = sum;
+        }
+    }
+
+    CHECK(ds4_gpu_set_model_map_range(mapped, MAP_BYTES, 0, MAP_BYTES,
+                                       sizeof(test_block_q4_k) * ROWS));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(input));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
+    CHECK(x && out);
+    CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+    CHECK(ds4_gpu_matmul_q4_k_tensor(out, mapped, MAP_BYTES, 0,
+                                     COLS, ROWS, x, TOKENS));
+    CHECK(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+    const float error = max_abs(actual, expected, TOKENS * ROWS);
+    printf("DeepSeek V4 dense Q4_K Metal: max_abs=%.9g\n", error);
+    CHECK(error < 5e-5f);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    *mapped_out = mapped;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -56,6 +127,8 @@ int main(int argc, char **argv) {
     argmax_logits[17] = 3.0f;
     argmax_logits[42] = 3.0f;
     CHECK(ds4_gpu_init());
+    void *q4_mapped = NULL;
+    CHECK(test_dense_q4_k(&q4_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -139,5 +212,6 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
+    free(q4_mapped);
     return 0;
 }
