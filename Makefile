@@ -63,7 +63,8 @@ DS4_PATCHES = patches/ds4/deepseek-v4-dspark-quantizer.patch \
 	patches/ds4/deepseek-v4-attn-hc-exact-rows.patch \
 	patches/ds4/deepseek-v4-attn-low-exact-rows.patch \
 	patches/ds4/deepseek-v4-shared-exact-rows.patch \
-	patches/ds4/deepseek-v4-early-confidence.patch
+	patches/ds4/deepseek-v4-early-confidence.patch \
+	patches/ds4/deepseek-v4-q8-projection-pair.patch
 DS4_REV_STAMP = $(DS4_DIR)/.floyd-revision-$(DS4_REV)
 DS4_CORE_OBJS = $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_distributed.o \
 	$(DS4_DIR)/ds4_ssd.o $(DS4_DIR)/ds4_metal.o
