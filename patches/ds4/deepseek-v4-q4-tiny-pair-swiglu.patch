@@ -1,0 +1,31 @@
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 5386554..1725c5b 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -26156,10 +26156,15 @@ int ds4_gpu_routed_moe_batch_tensor(
+             !use_mm_id &&
+             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||
+              (gate_type == DS4_METAL_TENSOR_Q4_K && g_moe_mul_mv_id_q4_k_pair_pipeline));
++        id<MTLComputePipelineState> tiny_pair_swiglu_pipeline =
++            gate_type == DS4_METAL_TENSOR_IQ2_XXS
++                ? g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline
++                : (gate_type == DS4_METAL_TENSOR_Q4_K
++                    ? g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline
++                    : nil);
+         const bool use_tiny_pair_swiglu =
+             use_tiny_pair_mv &&
+-            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+-            g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline != nil &&
++            tiny_pair_swiglu_pipeline != nil &&
+             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+             getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+             getenv("DS4_METAL_DISABLE_TINY_BATCH_PAIR_SWIGLU") == NULL;
+@@ -26606,7 +26611,7 @@ int ds4_gpu_routed_moe_batch_tensor(
+             };
+             ok = ds4_gpu_encode_mul_mv_id_pair_swiglu(
+                     cb,
+-                    g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline,
++                    tiny_pair_swiglu_pipeline,
+                     &gate_args,
+                     &act_args,
+                     gate_buf,
