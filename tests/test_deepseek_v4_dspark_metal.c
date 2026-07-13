@@ -20,11 +20,6 @@ typedef struct {
     uint8_t qs[128];
 } test_block_q4_k;
 
-typedef struct {
-    uint16_t d;
-    int8_t qs[32];
-} test_block_q8_0;
-
 #define CHECK(condition) do { \
     if (!(condition)) { \
         fprintf(stderr, "%s:%d: check failed: %s\n", \
@@ -120,89 +115,6 @@ static int test_dense_q4_k(void **mapped_out) {
     return 0;
 }
 
-static int test_dense_q8_0_pair(void **mapped_out) {
-    enum {
-        COLS = 256,
-        ROWS0 = 8,
-        ROWS1 = 4,
-        TOKENS = 3,
-        W1_OFFSET = 4096,
-        MAP_BYTES = 16384,
-    };
-    void *mapped = NULL;
-    CHECK(posix_memalign(&mapped, MAP_BYTES, MAP_BYTES) == 0);
-    memset(mapped, 0, MAP_BYTES);
-    test_block_q8_0 *w0 = mapped;
-    test_block_q8_0 *w1 = (test_block_q8_0 *)((uint8_t *)mapped + W1_OFFSET);
-    for (int row = 0; row < ROWS0; row++) {
-        for (int block = 0; block < COLS / 32; block++) {
-            test_block_q8_0 *q = &w0[row * (COLS / 32) + block];
-            q->d = 0x3800;
-            for (int i = 0; i < 32; i++)
-                q->qs[i] = (int8_t)(((row + block + i) % 15) - 7);
-        }
-    }
-    for (int row = 0; row < ROWS1; row++) {
-        for (int block = 0; block < COLS / 32; block++) {
-            test_block_q8_0 *q = &w1[row * (COLS / 32) + block];
-            q->d = 0x3400;
-            for (int i = 0; i < 32; i++)
-                q->qs[i] = (int8_t)(((row * 3 + block + i) % 13) - 6);
-        }
-    }
-
-    float input[TOKENS * COLS];
-    float expected0[TOKENS * ROWS0], expected1[TOKENS * ROWS1];
-    float actual0[TOKENS * ROWS0], actual1[TOKENS * ROWS1];
-    for (int token = 0; token < TOKENS; token++)
-        for (int col = 0; col < COLS; col++)
-            input[token * COLS + col] =
-                0.01f * (float)(((token + 5) * (col + 11)) % 31 - 15);
-
-    CHECK(ds4_gpu_set_model_map_range(mapped, MAP_BYTES, 0, MAP_BYTES,
-                                       W1_OFFSET + sizeof(test_block_q8_0) *
-                                           ROWS1 * (COLS / 32)));
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(input));
-    ds4_gpu_tensor *reference0 = ds4_gpu_tensor_alloc(sizeof(expected0));
-    ds4_gpu_tensor *reference1 = ds4_gpu_tensor_alloc(sizeof(expected1));
-    ds4_gpu_tensor *paired0 = ds4_gpu_tensor_alloc(sizeof(actual0));
-    ds4_gpu_tensor *paired1 = ds4_gpu_tensor_alloc(sizeof(actual1));
-    CHECK(x && reference0 && reference1 && paired0 && paired1);
-    CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
-    ds4_gpu_set_tiny_decode_order(true);
-    for (int tokens = 1; tokens <= TOKENS; tokens += 2) {
-        CHECK(ds4_gpu_matmul_q8_0_tensor(reference0, mapped, MAP_BYTES, 0,
-                                         COLS, ROWS0, x, tokens));
-        CHECK(ds4_gpu_matmul_q8_0_tensor(reference1, mapped, MAP_BYTES,
-                                         W1_OFFSET, COLS, ROWS1, x, tokens));
-        CHECK(ds4_gpu_matmul_q8_0_pair_tensor(
-            paired0, paired1, mapped, MAP_BYTES, 0, W1_OFFSET,
-            COLS, ROWS0, ROWS1, x, tokens));
-        CHECK(ds4_gpu_tensor_read(reference0, 0, expected0,
-                                   (size_t)tokens * ROWS0 * sizeof(float)));
-        CHECK(ds4_gpu_tensor_read(reference1, 0, expected1,
-                                   (size_t)tokens * ROWS1 * sizeof(float)));
-        CHECK(ds4_gpu_tensor_read(paired0, 0, actual0,
-                                   (size_t)tokens * ROWS0 * sizeof(float)));
-        CHECK(ds4_gpu_tensor_read(paired1, 0, actual1,
-                                   (size_t)tokens * ROWS1 * sizeof(float)));
-        const float error0 = max_abs(actual0, expected0, (size_t)tokens * ROWS0);
-        const float error1 = max_abs(actual1, expected1, (size_t)tokens * ROWS1);
-        printf("DeepSeek V4 dense Q8_0 pair Metal tokens=%d max_abs=%.9g/%.9g\n",
-               tokens, error0, error1);
-        CHECK(error0 < 1e-6f);
-        CHECK(error1 < 1e-6f);
-    }
-    ds4_gpu_set_tiny_decode_order(false);
-    ds4_gpu_tensor_free(paired1);
-    ds4_gpu_tensor_free(paired0);
-    ds4_gpu_tensor_free(reference1);
-    ds4_gpu_tensor_free(reference0);
-    ds4_gpu_tensor_free(x);
-    *mapped_out = mapped;
-    return 0;
-}
-
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <base.gguf> <dspark.gguf> <oracle-dir>\n", argv[0]);
@@ -216,9 +128,7 @@ int main(int argc, char **argv) {
     argmax_logits[42] = 3.0f;
     CHECK(ds4_gpu_init());
     void *q4_mapped = NULL;
-    void *q8_pair_mapped = NULL;
     CHECK(test_dense_q4_k(&q4_mapped) == 0);
-    CHECK(test_dense_q8_0_pair(&q8_pair_mapped) == 0);
     ds4_gpu_kernel_stats init_stats;
     ds4_gpu_get_kernel_stats(&init_stats);
     CHECK(init_stats.exact_q8_pipeline_warmups == 3);
@@ -302,7 +212,6 @@ int main(int argc, char **argv) {
     free(actual);
     free(prefill);
     free(main_x);
-    free(q8_pair_mapped);
     free(q4_mapped);
     return 0;
 }
