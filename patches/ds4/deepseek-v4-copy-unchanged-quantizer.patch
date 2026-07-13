@@ -1,0 +1,96 @@
+--- a/gguf-tools/deepseek4-quantize.c
++++ b/gguf-tools/deepseek4-quantize.c
+@@ -1676,9 +1676,17 @@
+ 
+ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
+                             const char *out_path, int n_experts, int n_threads,
+-                            const imatrix_store *imatrix) {
++                            const imatrix_store *imatrix, bool copy_unchanged) {
+     FILE *fp = fopen(out_path, "wb");
+     if (!fp) die_errno("open output", out_path);
++    FILE *template_fp = NULL;
++    uint8_t *copy_buf = NULL;
++    const size_t copy_buf_size = 8u * 1024u * 1024u;
++    if (copy_unchanged) {
++        template_fp = fopen(tmpl->path, "rb");
++        if (!template_fp) die_errno("open template", tmpl->path);
++        copy_buf = xmalloc(copy_buf_size);
++    }
+     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
+     write_u32(fp, tmpl->version);
+     write_u64(fp, tmpl->n_tensors);
+@@ -1702,6 +1710,29 @@
+         const tensor_meta *src = &tmpl->tensors[i];
+         const tensor_meta *dst = &out_ctx->tensors[i];
+         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
++        if (copy_unchanged && src->type == dst->type) {
++            if (src->size != dst->size) die("unchanged tensor size mismatch");
++            if (fseeko(template_fp,
++                       (off_t)(tmpl->data_offset + src->old_offset),
++                       SEEK_SET) != 0) {
++                die_errno("seek template tensor", tmpl->path);
++            }
++            size_t remaining = src->size;
++            while (remaining) {
++                const size_t chunk = remaining < copy_buf_size
++                    ? remaining : copy_buf_size;
++                if (fread(copy_buf, 1, chunk, template_fp) != chunk)
++                    die_errno("read template tensor", tmpl->path);
++                if (fwrite(copy_buf, 1, chunk, fp) != chunk)
++                    die_errno("write copied tensor", out_path);
++                remaining -= chunk;
++            }
++            const size_t padded = ds4q_pad(src->size, out_ctx->alignment);
++            write_padding(fp, padded - src->size);
++            fprintf(stderr, "       copied %.2f MiB\n",
++                    (double)src->size / 1048576.0);
++            continue;
++        }
+         byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+         size_t expected = dst->size;
+         if (data.size != expected) {
+@@ -1714,6 +1745,8 @@
+         fprintf(stderr, "       generated %.2f MiB\n", (double)data.size / 1048576.0);
+         free(data.data);
+     }
++    free(copy_buf);
++    if (template_fp) fclose(template_fp);
+     fclose(fp);
+ }
+ 
+@@ -1755,6 +1788,7 @@
+     bool dry_run;
+     bool overwrite;
+     bool imatrix_strict;
++    bool copy_unchanged;
+ } params;
+ 
+ static void usage(const char *argv0) {
+@@ -1770,6 +1804,7 @@
+     printf("  --map-imatrix NAME     print the DSpark imatrix proxy tensor and exit\n");
+     printf("  --overwrite            replace --out if it already exists\n");
+     printf("  --dry-run              print output plan without reading HF tensor data\n");
++    printf("  --copy-unchanged       copy tensors whose planned type matches the template\n");
+     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
+     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
+@@ -1834,6 +1869,8 @@
+             p.overwrite = true;
+         } else if (strcmp(arg, "--dry-run") == 0) {
+             p.dry_run = true;
++        } else if (strcmp(arg, "--copy-unchanged") == 0) {
++            p.copy_unchanged = true;
+         } else if (strcmp(arg, "--imatrix") == 0) {
+             p.imatrix_file = need_value(argc, argv, &i, arg);
+         } else if (strcmp(arg, "--imatrix-strict") == 0) {
+@@ -2000,7 +2037,9 @@
+         free(out_ctx.tensors);
+         return 0;
+     }
+-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
++    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf,
++                    p.n_experts, p.n_threads, &imatrix,
++                    p.copy_unchanged);
+     fprintf(stderr, "wrote %s\n", p.out_gguf);
+ 
+     db_close(&db);
