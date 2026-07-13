@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
     CHECK(spec_stats.verify_split_flushes > 0);
     CHECK(spec_stats.verify_outcome_calls[4][4] == 1);
     CHECK(spec_stats.verify_outcome_ms[4][4] > 0.0);
-    CHECK(spec_stats.target_device_argmax_calls > 0);
+    CHECK(spec_stats.target_cached_argmax_calls > 0);
     CHECK(spec_stats.verifier_next_argmax_calls > 0);
     CHECK(spec_stats.cached_argmax_hits > 0);
 
@@ -202,14 +202,14 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4 DSpark timing: target=%.3f proposal=%.3f "
            "verify=%.3f layer_encode=%.3f layer_execute=%.3f "
            "head=%.3f read=%.3f replay=%.3f proposed=%llu accepted=%llu "
-           "device_argmax=%llu verifier_next=%llu cache_hits=%llu\n",
+           "target_cached=%llu verifier_next=%llu cache_hits=%llu\n",
            spec_stats.target_ms, spec_stats.proposal_ms,
            spec_stats.verify_ms, spec_stats.verify_layer_encode_ms,
            spec_stats.verify_layer_execute_ms, spec_stats.verify_head_ms,
            spec_stats.verify_read_ms, spec_stats.replay_ms,
            (unsigned long long)spec_stats.proposed_tokens,
            (unsigned long long)spec_stats.accepted_tokens,
-           (unsigned long long)spec_stats.target_device_argmax_calls,
+           (unsigned long long)spec_stats.target_cached_argmax_calls,
            (unsigned long long)spec_stats.verifier_next_argmax_calls,
            (unsigned long long)spec_stats.cached_argmax_hits);
 
