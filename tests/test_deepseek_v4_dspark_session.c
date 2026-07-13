@@ -108,6 +108,15 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4 DSpark resident confidence: max_abs=%.9g\n",
            confidence_max_abs);
     CHECK(confidence_max_abs < 0.5f);
+    float margins[5] = {NAN, NAN, NAN, NAN, NAN};
+    int margin_count = ds4_session_copy_dspark_margins(session, margins, 5);
+    CHECK(margin_count == proposal_count - 1);
+    for (int i = 0; i < margin_count; i++) {
+        CHECK(isfinite(margins[i]));
+        CHECK(margins[i] >= 0.0f);
+    }
+    printf("DeepSeek V4 DSpark resident margins: %.6g/%.6g/%.6g\n",
+           margins[0], margins[1], margins[2]);
 
     ds4_session_free(session);
     session = NULL;
