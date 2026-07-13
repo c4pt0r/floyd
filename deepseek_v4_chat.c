@@ -6,6 +6,7 @@
 #include "tok.h"
 #include "deepseek_v4_chat_format.h"
 #include "deepseek_v4_runtime.h"
+#include "deepseek_v4_serve.h"
 #include "json.h"
 
 #ifdef FLOYD_DEEPSEEK_V4_GGML
@@ -175,7 +176,141 @@ static int deepseek_v4_chat_run_ds4(const DeepSeekV4ChatOptions *options,
     deepseek_v4_ds4_close(session);
     return status;
 }
+
+typedef struct {
+    DeepSeekV4Ds4Session *session;
+    const DeepSeekV4ServeOptions *options;
+    char *output;
+    size_t output_size;
+    size_t output_capacity;
+} DeepSeekV4ServeContext;
+
+static int deepseek_v4_serve_ds4_emit(
+    int token, const char *piece, size_t piece_size, void *user_data) {
+    DeepSeekV4ServeContext *context = user_data;
+    (void)token;
+    if (piece_size > SIZE_MAX - context->output_size - 1) return 0;
+    size_t required = context->output_size + piece_size + 1;
+    if (required > context->output_capacity) {
+        size_t capacity = context->output_capacity ? context->output_capacity : 256;
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2) { capacity = required; break; }
+            capacity *= 2;
+        }
+        char *grown = realloc(context->output, capacity);
+        if (!grown) return 0;
+        context->output = grown;
+        context->output_capacity = capacity;
+    }
+    memcpy(context->output + context->output_size, piece, piece_size);
+    context->output_size += piece_size;
+    context->output[context->output_size] = 0;
+    return 1;
+}
+
+static int deepseek_v4_serve_ds4_request(
+    void *user_data, const DeepSeekV4ServeRequest *request,
+    DeepSeekV4ServeResponse *response, char *error, size_t error_size) {
+    DeepSeekV4ServeContext *context = user_data;
+    context->output_size = 0;
+    if (context->output) context->output[0] = 0;
+
+    size_t message_count = request->prompt ? (request->system ? 2u : 1u)
+                                            : request->message_count;
+    DeepSeekV4Ds4Message *messages = calloc(message_count, sizeof(*messages));
+    if (!messages) {
+        snprintf(error, error_size, "out of memory preparing messages");
+        return 0;
+    }
+    if (request->prompt) {
+        size_t index = 0;
+        if (request->system) {
+            messages[index].role = "system";
+            messages[index++].content = request->system;
+        }
+        messages[index].role = "user";
+        messages[index].content = request->prompt;
+    } else {
+        for (size_t i = 0; i < message_count; i++) {
+            messages[i].role = request->messages[i].role;
+            messages[i].content = request->messages[i].content;
+        }
+    }
+
+    int draft = request->draft >= 0 ? request->draft : context->options->draft;
+    if (request->draft < 0 && request->temperature > 0.0f) draft = 1;
+    DeepSeekV4Ds4RequestConfig config = {
+        .max_tokens = request->max_tokens > 0
+            ? request->max_tokens : context->options->max_new_tokens,
+        .temperature = request->temperature,
+        .top_p = request->top_p,
+        .draft = draft,
+    };
+    DeepSeekV4Ds4Stats stats;
+    int generated = deepseek_v4_ds4_generate_messages(
+        context->session, messages, message_count, &config,
+        deepseek_v4_serve_ds4_emit, context, &stats, error, error_size);
+    free(messages);
+    if (generated < 0) return 0;
+
+    response->text = context->output ? context->output : "";
+    response->prompt_tokens = stats.prompt_tokens + stats.cached_tokens;
+    response->cached_tokens = stats.cached_tokens;
+    response->completion_tokens = stats.generated_tokens;
+    response->prompt_ms = stats.prompt_ms;
+    response->decode_ms = stats.decode_ms;
+    response->cache_hit = stats.cache_hit;
+    response->cache_prefix_tokens = stats.cache_prefix_tokens;
+    response->cache_entries = stats.cache_entries;
+    response->cache_bytes = stats.cache_bytes;
+    return 1;
+}
 #endif
+
+int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
+    if (!options || !options->model_dir || options->max_context <= 0 ||
+        options->max_new_tokens <= 0 || options->draft < 0 ||
+        options->draft > 16) {
+        fprintf(stderr, "invalid DeepSeek V4 serve options\n");
+        return 2;
+    }
+#ifdef FLOYD_DEEPSEEK_V4_DS4
+    char model_path[4096], error[4096] = {0};
+    if (!deepseek_v4_ds4_find_model(
+            options->model_dir, model_path, sizeof(model_path),
+            error, sizeof(error))) {
+        fprintf(stderr, "%s\n", error);
+        return 2;
+    }
+    fprintf(stderr,
+            "DEEPSEEK_V4_SERVE transport=stdio backend=%s "
+            "prefix_cache_mb=%llu gguf=%s\n",
+            deepseek_v4_ds4_backend_name(),
+            (unsigned long long)(options->prefix_cache_bytes / (1024 * 1024)),
+            model_path);
+    DeepSeekV4Ds4Session *session = deepseek_v4_ds4_open_cached(
+        model_path, options->max_context, options->draft > 1,
+        options->prefix_cache_bytes, error, sizeof(error));
+    if (!session) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    DeepSeekV4ServeContext context = {
+        .session = session,
+        .options = options,
+    };
+    int status = deepseek_v4_serve_stdio(
+        stdin, stdout, deepseek_v4_serve_ds4_request, &context);
+    free(context.output);
+    deepseek_v4_ds4_close(session);
+    return status;
+#else
+    fprintf(stderr,
+            "DeepSeek V4 serve requires the DS4 Metal runtime; "
+            "rebuild with: make METAL=1 floyd\n");
+    return 2;
+#endif
+}
 
 #ifdef FLOYD_DEEPSEEK_V4_GGML
 static int deepseek_v4_chat_ggml_emit(int token, const char *piece,

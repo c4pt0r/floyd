@@ -23,6 +23,7 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <errno.h>
 #include <pthread.h>                              /* thread I/O del PILOTA */
 #include <unistd.h>
 #include <sys/resource.h>
@@ -2501,7 +2502,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
  * il vecchio corpo di main() (che legge solo getenv + argv[1..3] posizionali)
  * resta identico. Le variabili d'ambiente restano l'interfaccia legacy/debug
  * (IDOT, DSA, MTP, PILOT, STATS, ...): questo strato copre solo le manopole
- * che un utente normale deve toccare per usare chat/run/tf/gen. */
+ * che un utente normale deve toccare per usare chat/run/serve/tf/gen. */
 static void usage(int code){
     fputs(
 "floyd — Moonlight and DeepSeek V4 inference in pure C\n"
@@ -2510,6 +2511,7 @@ static void usage(int code){
 "comandi:\n"
 "  chat   conversazione interattiva     floyd --model DIR (predefinito)\n"
 "  run    generazione singola           floyd run  --model DIR --prompt \"...\"\n"
+"  serve  JSONL persistente su stdio    floyd serve --stdio --model DIR\n"
 "  tf     teacher-forcing vs oracolo    floyd tf   --model DIR --ref ref.json\n"
 "  gen    greedy vs oracolo             floyd gen  --model DIR --ref ref.json\n"
 "  help   questo testo\n\n"
@@ -2517,6 +2519,8 @@ static void usage(int code){
 "  --dbits 4|8|16 (8) | --ram GB | --metal\n"
 "chat/run:  --ngen N (chat Moonlight:512, DeepSeek V4:16; run:256)\n"
 "  --ctx N (Moonlight:4096, DeepSeek V4:512) | --draft N\n"
+"serve:     --stdio (obbligatorio) | --prefix-cache-mb N (256; 0 disattiva)\n"
+"DeepSeek V4: --ds4-model FILE | --ds4-support FILE | --trace\n"
 "Moonlight: --temp T (0.7) | --top-p P (0.90) | --system \"...\"\n"
 "run:       --prompt \"...\" (obbligatorio)\n"
 "chat:      --no-kvsave (Moonlight; DeepSeek V4 non persiste ancora la KV)\n"
@@ -2526,7 +2530,7 @@ static void usage(int code){
     code?stderr:stdout); exit(code);
 }
 
-/* Ritorna 1 per i cinque comandi espliciti o quando argv[1] e' un long flag:
+/* Ritorna 1 per i comandi espliciti o quando argv[1] e' un long flag:
  * in quest'ultimo caso chat e' il comando predefinito. Riempie cap/ebits/dbits
  * quando le rispettive flag sono presenti, altrimenti li lascia a -1. */
 static int g_cli_temp_set, g_cli_top_p_set, g_cli_system_set;
@@ -2537,14 +2541,14 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
     int first_flag=2;
     if(!strcmp(cmd,"--help") || !strcmp(cmd,"-h")) usage(0);   /* CLI polish: alias di 'help' */
     if(strcmp(cmd,"chat") && strcmp(cmd,"run") && strcmp(cmd,"tf") &&
-       strcmp(cmd,"gen") && strcmp(cmd,"help")) {
+       strcmp(cmd,"gen") && strcmp(cmd,"serve") && strcmp(cmd,"help")) {
         if(strncmp(cmd,"--",2)) return 0;
         cmd="chat";
         first_flag=1;
     }
     if(!strcmp(cmd,"help")) usage(0);
 
-    int have_model=0, have_ref=0, have_prompt=0, have_ngen=0;
+    int have_model=0, have_ref=0, have_prompt=0, have_ngen=0, have_stdio=0;
     *cap=-1; *ebits=-1; *dbits=-1;
     for(int i=first_flag;i<argc;i++){
         const char *a=argv[i];
@@ -2580,8 +2584,32 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
             setenv("PROMPT",argv[i],1); have_prompt=1;
         } else if(!strcmp(a,"--draft")){
             if(++i>=argc) usage(2);
-            long v=strtol(argv[i],&e,10); if(*e||v<0) usage(2);
+            long v=strtol(argv[i],&e,10); if(*e||v<0||v>16) usage(2);
             setenv("DRAFT",argv[i],1);
+        } else if(!strcmp(a,"--stdio")){
+            if(strcmp(cmd,"serve")){ fprintf(stderr,"--stdio is only for serve\n"); usage(2); }
+            have_stdio=1;
+        } else if(!strcmp(a,"--prefix-cache-mb")){
+            if(strcmp(cmd,"serve") || ++i>=argc){
+                fprintf(stderr,"--prefix-cache-mb is only for serve and requires a value\n");
+                usage(2);
+            }
+            errno=0;
+            unsigned long long v=strtoull(argv[i],&e,10);
+            if(errno||*e||argv[i][0]=='-'||
+               v>UINT64_MAX/(UINT64_C(1024)*1024)){
+                fprintf(stderr,"prefix-cache-mb must be a non-negative integer\n");
+                usage(2);
+            }
+            setenv("FLOYD_PREFIX_CACHE_MB",argv[i],1);
+        } else if(!strcmp(a,"--ds4-model")){
+            if(++i>=argc) usage(2);
+            setenv("FLOYD_DEEPSEEK_V4_DS4_GGUF",argv[i],1);
+        } else if(!strcmp(a,"--ds4-support")){
+            if(++i>=argc) usage(2);
+            setenv("FLOYD_DEEPSEEK_V4_DS4_DSPARK",argv[i],1);
+        } else if(!strcmp(a,"--trace")){
+            setenv("DEEPSEEK_V4_CHAT_TRACE","1",1);
         } else if(!strcmp(a,"--ram")){
             if(++i>=argc) usage(2);
             double v=strtod(argv[i],&e); if(*e||v<=0) usage(2);
@@ -2607,6 +2635,9 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
         }
     }
     if(!have_model){ fprintf(stderr,"manca --model\n"); usage(2); }
+    if(!strcmp(cmd,"serve") && !have_stdio){
+        fprintf(stderr,"serve requires --stdio\n"); usage(2);
+    }
     /* Isolamento modo (new-style): un env di modo ereditato dalla shell (PROMPT=,
      * SERVE=1, CHAT=1, ...) puo' anticipare il dispatch di main() rispetto al
      * comando appena scelto (main() controlla SCORE/SERVE/PROMPT/CHAT/REPLAY/TF
@@ -2617,18 +2648,26 @@ static int cli_adapt(int argc, char **argv, int *cap, int *ebits, int *dbits){
      * subcommand): non tocca nulla, cli_adapt torna 0 subito. */
     if(!strcmp(cmd,"chat")){
         setenv("CHAT","1",1);
+        unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("PROMPT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     } else if(!strcmp(cmd,"run")){
         if(!have_prompt){ fprintf(stderr,"run richiede --prompt\n"); usage(2); }
         if(!have_ngen) setenv("NGEN","256",0);   /* run_text legge NGEN con default 64: alziamolo qui,
                                                    * ma senza sovrascrivere un NGEN ereditato esplicito */
+        unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
+    } else if(!strcmp(cmd,"serve")){
+        setenv("FLOYD_STDIO_SERVE","1",1);
+        unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE");
+        unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     } else if(!strcmp(cmd,"tf")){
         if(!have_ref){ fprintf(stderr,"tf richiede --ref\n"); usage(2); }
         setenv("TF","1",1);
+        unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY");
     } else if(!strcmp(cmd,"gen")){
         if(!have_ref){ fprintf(stderr,"gen richiede --ref\n"); usage(2); }
+        unsetenv("FLOYD_STDIO_SERVE");
         unsetenv("PROMPT"); unsetenv("CHAT"); unsetenv("SERVE"); unsetenv("SCORE"); unsetenv("REPLAY"); unsetenv("TF");
     }
     return 1;
@@ -2643,7 +2682,24 @@ int main(int argc, char **argv){
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
-    if(getenv("CHAT") && deepseek_v4_model_dir(snap)) {
+    if(getenv("FLOYD_STDIO_SERVE")) {
+        if(!deepseek_v4_model_dir(snap)) {
+            fprintf(stderr,"floyd serve --stdio currently requires a DeepSeek V4 model\n");
+            return 2;
+        }
+        const char *draft=getenv("DRAFT");
+        const char *cache_mb=getenv("FLOYD_PREFIX_CACHE_MB");
+        uint64_t megabytes=cache_mb?strtoull(cache_mb,NULL,10):256;
+        DeepSeekV4ServeOptions options={
+            .model_dir=snap,
+            .max_context=getenv("CTX")?atoi(getenv("CTX")):512,
+            .max_new_tokens=getenv("NGEN")?atoi(getenv("NGEN")):16,
+            .draft=draft?atoi(draft):3,
+            .prefix_cache_bytes=megabytes*UINT64_C(1024)*1024,
+        };
+        return deepseek_v4_serve_run(&options);
+    }
+    if((getenv("CHAT") || getenv("PROMPT")) && deepseek_v4_model_dir(snap)) {
         if(g_cli_temp_set) {
             fprintf(stderr,"DeepSeek V4 chat does not support --temp\n");
             return 2;

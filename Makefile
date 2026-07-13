@@ -27,6 +27,7 @@ DEEPSEEK_V4_GGML_OBJ =
 DEEPSEEK_V4_DS4_OBJ =
 FLOYD_OBJ = floyd.o
 DEEPSEEK_V4_CHAT_OBJ = deepseek_v4_chat.o
+DEEPSEEK_V4_SERVE_OBJ = deepseek_v4_serve.o deepseek_v4_prefix_cache.o
 FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
@@ -94,8 +95,8 @@ all: floyd
 
 DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_runtime.h deepseek_v4_chat_format.h deepseek_v4_forward.h deepseek_v4_quant.h deepseek_v4_hc.h deepseek_v4_kv_cache.h deepseek_v4_compress.h deepseek_v4_indexer.h moe_route.h st.h json.h tok.h tok_unicode.h compat.h
 
-floyd: $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
-	$(FLOYD_LINK) $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(METAL_OBJ) \
+floyd: $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(METAL_OBJ) $(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
+	$(FLOYD_LINK) $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(METAL_OBJ) \
 		$(DEEPSEEK_V4_GGML_OBJ) $(DEEPSEEK_V4_DS4_OBJ) \
 		$(if $(DEEPSEEK_V4_GGML_OBJ),$(LLAMA_STATIC_LIBS)) \
 		$(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS)) \
@@ -107,10 +108,10 @@ floyd.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_mo
 floyd_metal.o: floyd.c $(DEEPSEEK_V4_CHAT_DEPS) st.h json.h tok.h tok_unicode.h tok_moon.h moe_route.h compat.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-deepseek_v4_chat.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h deepseek_v4_ds4.h
+deepseek_v4_chat.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h deepseek_v4_ds4.h deepseek_v4_serve.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-deepseek_v4_chat_metal.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h deepseek_v4_ds4.h
+deepseek_v4_chat_metal.o: deepseek_v4_chat.c $(DEEPSEEK_V4_CHAT_DEPS) deepseek_v4_ggml.h deepseek_v4_ds4.h deepseek_v4_serve.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(LLAMA_REV_STAMP): $(LLAMA_PATCHES)
@@ -162,13 +163,19 @@ $(DS4_REV_STAMP): $(DS4_PATCHES)
 $(DS4_CORE_OBJS): $(DS4_REV_STAMP)
 	$(MAKE) -C "$(DS4_DIR)" ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 
-deepseek_v4_ds4.o: deepseek_v4_ds4.c deepseek_v4_ds4.h $(DS4_CORE_OBJS)
+deepseek_v4_ds4.o: deepseek_v4_ds4.c deepseek_v4_ds4.h deepseek_v4_prefix_cache.h $(DS4_CORE_OBJS)
 	$(CC) -O3 -std=c99 -DFLOYD_DEEPSEEK_V4_DS4 \
 		-DFLOYD_DS4_SOURCE_DIR=\"$(abspath $(DS4_DIR))\" \
 		-I$(DS4_DIR) -c $< -o $@
 
 backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 	clang -O2 -fobjc-arc -c backend_metal.m -o $@
+
+deepseek_v4_serve.o: deepseek_v4_serve.c deepseek_v4_serve.h json.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+deepseek_v4_prefix_cache.o: deepseek_v4_prefix_cache.c deepseek_v4_prefix_cache.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
 kernels_metal.h: kernels.metal
 	xxd -i kernels.metal > kernels_metal.h
