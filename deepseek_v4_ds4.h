@@ -24,6 +24,11 @@ typedef struct {
     int draft;
 } DeepSeekV4Ds4RequestConfig;
 
+typedef struct {
+    const char *role;
+    const char *content;
+} DeepSeekV4Ds4Message;
+
 typedef enum {
     DEEPSEEK_V4_DS4_SPEC_NONE = 0,
     DEEPSEEK_V4_DS4_SPEC_MTP,
@@ -38,7 +43,12 @@ typedef struct {
     double prompt_ms;
     double decode_ms;
     int prompt_tokens;
+    int cached_tokens;
     int generated_tokens;
+    int cache_hit;
+    int cache_prefix_tokens;
+    unsigned long long cache_entries;
+    unsigned long long cache_bytes;
     int speculative_rounds;
     int speculative_tokens;
     int speculative_proposed;
@@ -82,9 +92,18 @@ int deepseek_v4_ds4_resolve_spec_model(
 DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     const char *model_path, int max_context, int use_spec,
     char *error, size_t error_size);
+DeepSeekV4Ds4Session *deepseek_v4_ds4_open_cached(
+    const char *model_path, int max_context, int use_spec,
+    uint64_t prefix_cache_bytes, char *error, size_t error_size);
 int deepseek_v4_ds4_reset(DeepSeekV4Ds4Session *session);
 int deepseek_v4_ds4_generate_user(
     DeepSeekV4Ds4Session *session, const char *text, int max_new_tokens,
+    DeepSeekV4Ds4TokenCallback callback, void *user_data,
+    DeepSeekV4Ds4Stats *stats, char *error, size_t error_size);
+int deepseek_v4_ds4_generate_messages(
+    DeepSeekV4Ds4Session *session,
+    const DeepSeekV4Ds4Message *messages, size_t message_count,
+    const DeepSeekV4Ds4RequestConfig *config,
     DeepSeekV4Ds4TokenCallback callback, void *user_data,
     DeepSeekV4Ds4Stats *stats, char *error, size_t error_size);
 void deepseek_v4_ds4_close(DeepSeekV4Ds4Session *session);

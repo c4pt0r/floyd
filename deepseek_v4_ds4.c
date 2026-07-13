@@ -9,6 +9,12 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
+#include "deepseek_v4_prefix_cache.h"
+
 #ifdef FLOYD_DEEPSEEK_V4_DS4
 #include "ds4.h"
 #endif
@@ -357,7 +363,11 @@ struct DeepSeekV4Ds4Session {
     ds4_tokens transcript;
     int max_context;
     int use_spec;
+    int draft_tokens;
     double load_ms;
+    char *fingerprint;
+    DeepSeekV4PrefixCache prefix_cache;
+    uint64_t rng;
 };
 
 static double ds4_now_ms(void) {
@@ -411,9 +421,38 @@ static int ds4_configure_metal_sources(char *error, size_t error_size) {
     return 1;
 }
 
-DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
+static char *ds4_model_fingerprint(
+    const char *model_path, const char *support_path) {
+    char model_real[4096], support_real[4096];
+    const char *model = realpath(model_path, model_real) ? model_real : model_path;
+    const char *support = "none";
+    if (support_path && *support_path)
+        support = realpath(support_path, support_real) ? support_real : support_path;
+    struct stat model_stat = {0}, support_stat = {0};
+    if (stat(model_path, &model_stat) != 0) return NULL;
+    if (support_path && *support_path && stat(support_path, &support_stat) != 0)
+        return NULL;
+    int needed = snprintf(
+        NULL, 0, "ds4-payload-v%u|%s|%lld|%lld|%s|%lld|%lld",
+        DS4_SESSION_PAYLOAD_VERSION, model,
+        (long long)model_stat.st_size, (long long)model_stat.st_mtime,
+        support, (long long)support_stat.st_size,
+        (long long)support_stat.st_mtime);
+    if (needed < 0) return NULL;
+    char *fingerprint = malloc((size_t)needed + 1);
+    if (!fingerprint) return NULL;
+    snprintf(fingerprint, (size_t)needed + 1,
+             "ds4-payload-v%u|%s|%lld|%lld|%s|%lld|%lld",
+             DS4_SESSION_PAYLOAD_VERSION, model,
+             (long long)model_stat.st_size, (long long)model_stat.st_mtime,
+             support, (long long)support_stat.st_size,
+             (long long)support_stat.st_mtime);
+    return fingerprint;
+}
+
+DeepSeekV4Ds4Session *deepseek_v4_ds4_open_cached(
     const char *model_path, int max_context, int use_spec,
-    char *error, size_t error_size) {
+    uint64_t prefix_cache_bytes, char *error, size_t error_size) {
     if (!model_path || max_context <= 0) return NULL;
     if (!ds4_configure_metal_sources(error, error_size)) return NULL;
     DeepSeekV4Ds4Session *result = calloc(1, sizeof(*result));
@@ -430,6 +469,14 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         ? support_path : NULL;
     const char *dspark_path = spec_kind == DEEPSEEK_V4_DS4_SPEC_DSPARK
         ? support_path : NULL;
+    result->fingerprint = ds4_model_fingerprint(model_path, support_path);
+    if (!result->fingerprint) {
+        if (error && error_size)
+            snprintf(error, error_size, "failed to fingerprint DS4 model files");
+        free(result);
+        return NULL;
+    }
+    deepseek_v4_prefix_cache_init(&result->prefix_cache, prefix_cache_bytes);
     DeepSeekV4Ds4SpecConfig spec = {
         .draft_tokens = 1,
         .margin = 3.0f,
@@ -438,6 +485,8 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
     };
     if (spec_kind != DEEPSEEK_V4_DS4_SPEC_NONE &&
         !deepseek_v4_ds4_spec_config_from_env(&spec, error, error_size)) {
+        deepseek_v4_prefix_cache_free(&result->prefix_cache);
+        free(result->fingerprint);
         free(result);
         return NULL;
     }
@@ -472,13 +521,17 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         if (error && error_size)
             snprintf(error, error_size, "failed to initialize resident DS4 Metal runtime");
         if (result->engine) ds4_engine_close(result->engine);
+        deepseek_v4_prefix_cache_free(&result->prefix_cache);
+        free(result->fingerprint);
         free(result);
         return NULL;
     }
     ds4_chat_begin(result->engine, &result->transcript);
     result->max_context = max_context;
     result->use_spec = ds4_engine_mtp_draft_tokens(result->engine) > 1;
+    result->draft_tokens = ds4_engine_mtp_draft_tokens(result->engine);
     result->load_ms = ds4_now_ms() - started;
+    result->rng = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)result;
     if (use_spec) {
         if (!result->use_spec) {
             fprintf(stderr, "DEEPSEEK_V4_SPEC disabled=dspark-not-prepared\n");
@@ -493,6 +546,13 @@ DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
         }
     }
     return result;
+}
+
+DeepSeekV4Ds4Session *deepseek_v4_ds4_open(
+    const char *model_path, int max_context, int use_spec,
+    char *error, size_t error_size) {
+    return deepseek_v4_ds4_open_cached(
+        model_path, max_context, use_spec, 0, error, error_size);
 }
 
 int deepseek_v4_ds4_reset(DeepSeekV4Ds4Session *session) {
@@ -630,11 +690,294 @@ int deepseek_v4_ds4_generate_user(
     return generated;
 }
 
+static uint64_t ds4_available_memory_bytes(void) {
+#ifdef __APPLE__
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    vm_statistics64_data_t stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_page_size(host, &page_size) != KERN_SUCCESS ||
+        host_statistics64(host, HOST_VM_INFO64,
+                          (host_info64_t)&stats, &count) != KERN_SUCCESS)
+        return UINT64_MAX;
+    uint64_t pages = (uint64_t)stats.free_count + stats.inactive_count +
+                     stats.purgeable_count;
+    return pages > UINT64_MAX / page_size ? UINT64_MAX : pages * page_size;
+#elif defined(__linux__)
+    FILE *file = fopen("/proc/meminfo", "r");
+    if (!file) return UINT64_MAX;
+    char line[256];
+    unsigned long long kilobytes = 0;
+    while (fgets(line, sizeof(line), file)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kilobytes) == 1) break;
+    }
+    fclose(file);
+    return kilobytes > UINT64_MAX / 1024 ? UINT64_MAX : kilobytes * 1024;
+#else
+    return UINT64_MAX;
+#endif
+}
+
+static void ds4_cache_save(
+    DeepSeekV4Ds4Session *session, const ds4_tokens *tokens,
+    uint64_t config_key) {
+    if (!session || !tokens || tokens->len <= 0 ||
+        session->prefix_cache.budget_bytes == 0) return;
+    uint64_t payload_bytes = ds4_session_payload_bytes(session->session);
+    uint64_t entry_bytes = deepseek_v4_prefix_cache_entry_bytes(
+        session->fingerprint, (size_t)tokens->len, payload_bytes);
+    if (!deepseek_v4_prefix_cache_prepare_insert(
+            &session->prefix_cache, entry_bytes,
+            ds4_available_memory_bytes())) return;
+
+    ds4_session_snapshot snapshot = {0};
+    char cache_error[256] = {0};
+    if (ds4_session_save_snapshot(
+            session->session, &snapshot,
+            cache_error, sizeof(cache_error)) != 0) {
+        ds4_session_snapshot_free(&snapshot);
+        return;
+    }
+    if (deepseek_v4_prefix_cache_put_take(
+            &session->prefix_cache, session->fingerprint, config_key,
+            tokens->v, (size_t)tokens->len, snapshot.ptr, snapshot.len)) {
+        snapshot.ptr = NULL;
+        snapshot.len = snapshot.cap = 0;
+    }
+    ds4_session_snapshot_free(&snapshot);
+}
+
+static int ds4_messages_validate(
+    const DeepSeekV4Ds4Message *messages, size_t message_count,
+    char *error, size_t error_size) {
+    if (!messages || message_count == 0) {
+        if (error && error_size) snprintf(error, error_size, "messages must not be empty");
+        return 0;
+    }
+    for (size_t i = 0; i < message_count; i++) {
+        const char *role = messages[i].role;
+        if (!role || !messages[i].content ||
+            (strcmp(role, "system") && strcmp(role, "user") &&
+             strcmp(role, "assistant"))) {
+            if (error && error_size)
+                snprintf(error, error_size, "messages contain an unsupported role");
+            return 0;
+        }
+        if (!strcmp(role, "system") && i != 0) {
+            if (error && error_size)
+                snprintf(error, error_size, "system message must be first");
+            return 0;
+        }
+    }
+    if (strcmp(messages[message_count - 1].role, "user") != 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "last message must have role user");
+        return 0;
+    }
+    return 1;
+}
+
+static void ds4_stats_add_spec_delta(
+    DeepSeekV4Ds4Stats *stats,
+    const ds4_session_spec_stats *before,
+    const ds4_session_spec_stats *after) {
+    if (!stats || !before || !after) return;
+    stats->speculative_proposed =
+        (int)(after->proposed_tokens - before->proposed_tokens);
+    stats->speculative_direct_accepted =
+        (int)(after->direct_accepted_tokens - before->direct_accepted_tokens);
+    stats->speculative_prefix1_accepted =
+        (int)(after->prefix1_accepted_tokens - before->prefix1_accepted_tokens);
+    stats->speculative_frontier_snapshots =
+        (int)(after->frontier_snapshots - before->frontier_snapshots);
+    stats->speculative_proposal_early_skips =
+        (int)(after->proposal_early_skips - before->proposal_early_skips);
+    stats->speculative_target_ms = after->target_ms - before->target_ms;
+    stats->speculative_proposal_ms = after->proposal_ms - before->proposal_ms;
+    stats->speculative_verify_ms = after->verify_ms - before->verify_ms;
+    stats->speculative_verify_layer_encode_ms =
+        after->verify_layer_encode_ms - before->verify_layer_encode_ms;
+    stats->speculative_verify_layer_execute_ms =
+        after->verify_layer_execute_ms - before->verify_layer_execute_ms;
+    stats->speculative_verify_head_ms =
+        after->verify_head_ms - before->verify_head_ms;
+    stats->speculative_verify_read_ms =
+        after->verify_read_ms - before->verify_read_ms;
+    stats->speculative_replay_ms = after->replay_ms - before->replay_ms;
+    for (int draft = 0; draft <= 6; draft++) {
+        for (int commit = 0; commit <= 6; commit++) {
+            stats->speculative_verify_outcome_calls[draft][commit] =
+                after->verify_outcome_calls[draft][commit] -
+                before->verify_outcome_calls[draft][commit];
+            stats->speculative_verify_outcome_ms[draft][commit] =
+                after->verify_outcome_ms[draft][commit] -
+                before->verify_outcome_ms[draft][commit];
+        }
+    }
+}
+
+int deepseek_v4_ds4_generate_messages(
+    DeepSeekV4Ds4Session *session,
+    const DeepSeekV4Ds4Message *messages, size_t message_count,
+    const DeepSeekV4Ds4RequestConfig *config,
+    DeepSeekV4Ds4TokenCallback callback, void *user_data,
+    DeepSeekV4Ds4Stats *stats, char *error, size_t error_size) {
+    if (!session ||
+        !deepseek_v4_ds4_request_config_validate(config, error, error_size) ||
+        !ds4_messages_validate(messages, message_count, error, error_size))
+        return -1;
+    if (config->draft > 1 && !session->use_spec) {
+        if (error && error_size)
+            snprintf(error, error_size, "speculative draft requested without DSpark support");
+        return -1;
+    }
+    if (config->draft > 1 && config->draft != session->draft_tokens) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "request draft %d differs from resident DS4 draft %d",
+                     config->draft, session->draft_tokens);
+        return -1;
+    }
+    if (stats) memset(stats, 0, sizeof(*stats));
+
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(session->engine, &prompt);
+    for (size_t i = 0; i + 1 < message_count; i++)
+        ds4_chat_append_message(
+            session->engine, &prompt, messages[i].role, messages[i].content);
+    int anchor_tokens = prompt.len;
+    ds4_chat_append_message(
+        session->engine, &prompt, messages[message_count - 1].role,
+        messages[message_count - 1].content);
+    ds4_chat_append_assistant_prefix(
+        session->engine, &prompt, DS4_THINK_NONE);
+    if (prompt.len >= session->max_context) {
+        if (error && error_size)
+            snprintf(error, error_size, "prompt exceeds DS4 context");
+        ds4_tokens_free(&prompt);
+        return -1;
+    }
+
+    uint64_t config_key = deepseek_v4_ds4_request_config_key(
+        session->max_context, config);
+    int cached_tokens = 0;
+    double prompt_started = ds4_now_ms();
+    if (session->prefix_cache.budget_bytes > 0) {
+        DeepSeekV4PrefixCacheHit hit = {0};
+        if (deepseek_v4_prefix_cache_find_longest(
+                &session->prefix_cache, session->fingerprint, config_key,
+                prompt.v, (size_t)prompt.len, &hit)) {
+            ds4_session_snapshot snapshot = {
+                .ptr = (uint8_t *)hit.snapshot,
+                .len = hit.snapshot_bytes,
+                .cap = hit.snapshot_bytes,
+            };
+            char cache_error[256] = {0};
+            if (ds4_session_load_snapshot(
+                    session->session, &snapshot,
+                    cache_error, sizeof(cache_error)) == 0)
+                cached_tokens = hit.prefix_tokens;
+        }
+    }
+    if (cached_tokens == 0 && !deepseek_v4_ds4_reset(session)) {
+        if (error && error_size) snprintf(error, error_size, "failed to reset DS4 session");
+        ds4_tokens_free(&prompt);
+        return -1;
+    }
+
+    if (message_count > 1 && cached_tokens < anchor_tokens) {
+        int full_tokens = prompt.len;
+        prompt.len = anchor_tokens;
+        if (ds4_session_sync(session->session, &prompt, error, error_size) != 0) {
+            prompt.len = full_tokens;
+            ds4_tokens_free(&prompt);
+            return -1;
+        }
+        ds4_cache_save(session, &prompt, config_key);
+        prompt.len = full_tokens;
+    }
+    if (ds4_session_sync(session->session, &prompt, error, error_size) != 0) {
+        ds4_tokens_free(&prompt);
+        return -1;
+    }
+    if (cached_tokens < prompt.len) ds4_cache_save(session, &prompt, config_key);
+    double prompt_ms = ds4_now_ms() - prompt_started;
+
+    ds4_session_spec_stats spec_before = {0}, spec_after = {0};
+    (void)ds4_session_get_spec_stats(session->session, &spec_before);
+    int generated = 0, spec_rounds = 0, spec_tokens = 0;
+    double decode_started = ds4_now_ms();
+    while (generated < config->max_tokens) {
+        int token = config->temperature == 0.0f
+            ? ds4_session_argmax(session->session)
+            : ds4_session_sample(session->session, config->temperature, 0,
+                                 config->top_p, 0.0f, &session->rng);
+        if (token < 0) {
+            if (error && error_size) snprintf(error, error_size, "DS4 sampling failed");
+            generated = -1;
+            break;
+        }
+        int tokens[17], count;
+        if (config->draft > 1) {
+            count = ds4_session_eval_speculative_argmax(
+                session->session, token, config->max_tokens - generated,
+                ds4_token_eos(session->engine), tokens, 17, error, error_size);
+            if (count < 0) { generated = -1; break; }
+            spec_rounds++;
+            if (count > 1) spec_tokens += count - 1;
+        } else {
+            if (ds4_session_eval(session->session, token, error, error_size) != 0) {
+                generated = -1;
+                break;
+            }
+            tokens[0] = token;
+            count = 1;
+        }
+        int stop = 0;
+        for (int i = 0; i < count && generated < config->max_tokens; i++) {
+            token = tokens[i];
+            if (token == ds4_token_eos(session->engine)) { stop = 1; break; }
+            size_t piece_size = 0;
+            char *piece = ds4_token_text(session->engine, token, &piece_size);
+            int accepted = piece && (!callback || callback(
+                token, piece, piece_size, user_data));
+            free(piece);
+            if (!accepted) { generated = -1; stop = 1; break; }
+            generated++;
+        }
+        if (stop) break;
+    }
+    double decode_ms = ds4_now_ms() - decode_started;
+
+    if (stats) {
+        DeepSeekV4PrefixCacheStats cache_stats =
+            deepseek_v4_prefix_cache_stats(&session->prefix_cache);
+        stats->load_ms = session->load_ms;
+        stats->prompt_ms = prompt_ms;
+        stats->decode_ms = decode_ms;
+        stats->prompt_tokens = prompt.len - cached_tokens;
+        stats->cached_tokens = cached_tokens;
+        stats->generated_tokens = generated < 0 ? 0 : generated;
+        stats->cache_hit = cached_tokens > 0;
+        stats->cache_prefix_tokens = cached_tokens;
+        stats->cache_entries = cache_stats.entries;
+        stats->cache_bytes = cache_stats.bytes;
+        stats->speculative_rounds = spec_rounds;
+        stats->speculative_tokens = spec_tokens;
+        if (ds4_session_get_spec_stats(session->session, &spec_after))
+            ds4_stats_add_spec_delta(stats, &spec_before, &spec_after);
+    }
+    ds4_tokens_free(&prompt);
+    return generated;
+}
+
 void deepseek_v4_ds4_close(DeepSeekV4Ds4Session *session) {
     if (!session) return;
     ds4_session_free(session->session);
     ds4_tokens_free(&session->transcript);
     ds4_engine_close(session->engine);
+    deepseek_v4_prefix_cache_free(&session->prefix_cache);
+    free(session->fingerprint);
     free(session);
 }
 
