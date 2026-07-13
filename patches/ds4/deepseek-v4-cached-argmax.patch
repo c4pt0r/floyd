@@ -1,0 +1,193 @@
+diff --git a/ds4.h b/ds4.h
+index 63af74f..76f9f05 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -71,6 +71,9 @@ typedef struct {
+     uint64_t proposal_early_skips;
+     uint64_t verify_outcome_calls[7][7];
+     double verify_outcome_ms[7][7];
++    uint64_t target_cached_argmax_calls;
++    uint64_t verifier_next_argmax_calls;
++    uint64_t cached_argmax_hits;
+ } ds4_session_spec_stats;
+ 
+ typedef struct {
+diff --git a/ds4.c b/ds4.c
+index e8aeeb9..cf46806 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -22214,12 +22214,14 @@ static bool metal_graph_verify_suffix_tops(
+         uint32_t               n_tokens,
+         uint32_t               prefix1_capture_mask,
+         uint32_t               prefix2_capture_mask,
++        bool                   include_last_top,
+         int                   *row_tops,
+         float                 *row_logits,
+         ds4_session_spec_stats *stats) {
+     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
+-    const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
++    const uint32_t top_rows = include_last_top ? n_tokens :
++        (n_tokens > 1 ? n_tokens - 1 : 0);
+     if (top_rows && !row_tops) return false;
+ 
+     const double layer_started = now_sec();
+@@ -24404,6 +24406,8 @@ struct ds4_session {
+     ds4_cpu_decode_scratch cpu_scratch;
+     token_vec checkpoint;
+     float *logits;
++    int logits_argmax;
++    bool logits_argmax_valid;
+     float *mtp_logits;
+     int mtp_draft_token;
+     int dspark_proposals[6];
+@@ -27986,6 +27990,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
+         snprintf(err, errlen, "prompt exceeds context");
+         return 1;
+     }
++    s->logits_argmax_valid = false;
+     if (ds4_session_cancelled(s)) {
+         snprintf(err, errlen, "interrupted");
+         return DS4_SESSION_SYNC_INTERRUPTED;
+@@ -28248,8 +28253,20 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
+     return i;
+ }
+ 
++static bool ds4_cached_argmax_enabled(void) {
++    return getenv("DS4_METAL_DISABLE_CACHED_ARGMAX") == NULL;
++}
++
+ int ds4_session_argmax(ds4_session *s) {
+-    return sample_argmax(s->logits, DS4_N_VOCAB);
++    if (!s || !s->logits) return -1;
++    const bool cache_enabled = ds4_cached_argmax_enabled();
++    if (cache_enabled && s->logits_argmax_valid) {
++        s->spec_stats.cached_argmax_hits++;
++        return s->logits_argmax;
++    }
++    s->logits_argmax = sample_argmax(s->logits, DS4_N_VOCAB);
++    s->logits_argmax_valid = cache_enabled && s->logits_argmax >= 0;
++    return s->logits_argmax;
+ }
+ 
+ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+@@ -28345,12 +28362,14 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
++    s->logits_argmax_valid = false;
+     return 0;
+ }
+ 
+ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+                                      char *err, size_t errlen) {
+     if (!s) return 1;
++    s->logits_argmax_valid = false;
+     if (s->distributed) {
+         if (!s->checkpoint_valid) {
+             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
+@@ -28438,6 +28457,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+     }
+     if (probe_mtp && e->dspark_ready) {
+         const int input_token = sample_argmax(s->logits, DS4_N_VOCAB);
++        if (ds4_cached_argmax_enabled()) {
++            s->logits_argmax = input_token;
++            s->logits_argmax_valid = input_token >= 0;
++            s->spec_stats.target_cached_argmax_calls++;
++        }
+         int proposal_count = e->mtp_draft_tokens;
+         if (proposal_count > 6) proposal_count = 6;
+         const double proposal_started = now_sec();
+@@ -28554,6 +28578,7 @@ static int ds4_session_commit_dspark_speculative(
+     if (!s->dspark_proposals_valid || max_tokens <= n_accept ||
+         accepted_cap <= n_accept) return n_accept;
+ 
++    const bool cache_argmax = ds4_cached_argmax_enabled();
+     int draft_n = s->engine->mtp_draft_tokens;
+     if (draft_n > 6) draft_n = 6;
+     if (draft_n > s->dspark_proposal_count)
+@@ -28569,7 +28594,7 @@ static int ds4_session_commit_dspark_speculative(
+         }
+     }
+     if (draft_n <= 0 ||
+-        sample_argmax(s->logits, DS4_N_VOCAB) != s->dspark_proposals[0]) {
++        ds4_session_argmax(s) != s->dspark_proposals[0]) {
+         s->dspark_proposals_valid = false;
+         return n_accept;
+     }
+@@ -28607,11 +28632,13 @@ static int ds4_session_commit_dspark_speculative(
+                                              (uint32_t)draft_n,
+                                              prefix1_capture_mask,
+                                              prefix2_capture_mask,
++                                             cache_argmax,
+                                              row_tops,
+                                              NULL,
+                                              &s->spec_stats);
+         verify_elapsed_ms = (now_sec() - verify_started) * 1000.0;
+         s->spec_stats.verify_ms += verify_elapsed_ms;
++        if (ok && cache_argmax) s->spec_stats.verifier_next_argmax_calls++;
+     }
+ 
+     int commit = ok ? 1 : 0;
+@@ -28635,6 +28662,10 @@ static int ds4_session_commit_dspark_speculative(
+         if (ok) {
+             memcpy(s->logits, last_logits,
+                    (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
++            if (cache_argmax) {
++                s->logits_argmax = row_tops[draft_n - 1];
++                s->logits_argmax_valid = s->logits_argmax >= 0;
++            }
+             for (int i = 0; i < draft_n; i++)
+                 accepted[n_accept++] = s->dspark_proposals[i];
+             s->spec_stats.accepted_tokens += (uint64_t)draft_n;
+@@ -28682,6 +28713,10 @@ static int ds4_session_commit_dspark_speculative(
+             s->checkpoint.len = start;
+             memcpy(s->logits, last_logits,
+                    (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
++            if (cache_argmax) {
++                s->logits_argmax = row_tops[commit - 1];
++                s->logits_argmax_valid = s->logits_argmax >= 0;
++            }
+             for (int i = 0; i < commit; i++) {
+                 token_vec_push(&s->checkpoint, s->dspark_proposals[i]);
+                 accepted[n_accept++] = s->dspark_proposals[i];
+@@ -28723,6 +28758,7 @@ static int ds4_session_commit_dspark_speculative(
+         if (ok) {
+             memcpy(s->logits, last_logits,
+                    (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
++            s->logits_argmax_valid = false;
+             s->checkpoint_valid = true;
+         }
+     }
+@@ -29067,6 +29103,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                                 (uint32_t)draft_n,
+                                                 capture_prefix1 ? (4u | 128u) : 0u,
+                                                 0u,
++                                                false,
+                                                 row_tops,
+                                                 NULL,
+                                                 NULL);
+@@ -29226,6 +29263,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                                     (uint32_t)commit_drafts,
+                                                     false,
+                                                     0u,
++                                                    false,
+                                                     row_tops,
+                                                     NULL,
+                                                     NULL);
+@@ -29369,6 +29407,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+ void ds4_session_invalidate(ds4_session *s) {
+     s->checkpoint_valid = false;
+     s->checkpoint.len = 0;
++    s->logits_argmax_valid = false;
+     s->mtp_draft_valid = false;
+     s->dspark_proposals_valid = false;
+ }
+@@ -29377,6 +29416,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
+     if (pos < 0) pos = 0;
+     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+     s->checkpoint.len = pos;
++    s->logits_argmax_valid = false;
+     s->mtp_draft_valid = false;
+     s->dspark_proposals_valid = false;
+ }
