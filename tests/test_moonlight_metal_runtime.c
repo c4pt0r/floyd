@@ -244,6 +244,10 @@ int main(int argc, char **argv) {
            after.prefill_ms, after.decode_ms);
     CHECK(after.command_buffers <= (uint64_t)(2 * info.layer_count + 2));
     CHECK(after.cpu_fallbacks == 0);
+    const char *max_prefill_ms = getenv("MOONLIGHT_MAX_PREFILL_MS");
+    const char *max_decode_ms = getenv("MOONLIGHT_MAX_DECODE_MS");
+    if (max_prefill_ms) CHECK(after.prefill_ms <= strtod(max_prefill_ms, NULL));
+    if (max_decode_ms) CHECK(after.decode_ms <= strtod(max_decode_ms, NULL));
 
     free(ids64);
     free(ids);
