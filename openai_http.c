@@ -490,7 +490,7 @@ typedef struct {
 } OpenAISseSink;
 
 static volatile sig_atomic_t openai_http_stop;
-static volatile sig_atomic_t openai_http_wakeup_fd = -1;
+static int openai_http_wakeup[2] = {-1, -1};
 
 static void openai_http_drain_wakeup(int fd) {
     char buffer[64];
@@ -515,7 +515,8 @@ static int openai_http_wait_readable(int fd, int wake_fd) {
         }
         if (fds[1].revents) {
             openai_http_drain_wakeup(wake_fd);
-            return 0;
+            if (openai_http_stop) return 0;
+            continue;
         }
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
             return 1;
@@ -1156,7 +1157,7 @@ static void openai_http_signal_handler(int signal_number) {
     (void)signal_number;
     int saved_errno = errno;
     openai_http_stop = 1;
-    int fd = (int)openai_http_wakeup_fd;
+    int fd = openai_http_wakeup[1];
     if (fd >= 0) {
         const unsigned char byte = 1;
         (void)write(fd, &byte, 1);
@@ -1164,7 +1165,9 @@ static void openai_http_signal_handler(int signal_number) {
     errno = saved_errno;
 }
 
-static int openai_http_configure_pipe(int pipe_fds[2]) {
+static int openai_http_configure_pipe(void) {
+    if (openai_http_wakeup[0] >= 0) return 1;
+    int pipe_fds[2];
     if (pipe(pipe_fds) != 0) return 0;
     for (int i = 0; i < 2; i++) {
         int status_flags = fcntl(pipe_fds[i], F_GETFL);
@@ -1175,11 +1178,11 @@ static int openai_http_configure_pipe(int pipe_fds[2]) {
                   descriptor_flags | FD_CLOEXEC) != 0) {
             close(pipe_fds[0]);
             close(pipe_fds[1]);
-            pipe_fds[0] = -1;
-            pipe_fds[1] = -1;
             return 0;
         }
     }
+    openai_http_wakeup[0] = pipe_fds[0];
+    openai_http_wakeup[1] = pipe_fds[1];
     return 1;
 }
 
@@ -1194,6 +1197,12 @@ int openai_http_serve(
         openai_error(error, error_size, "invalid HTTP server configuration");
         return 0;
     }
+    if (!openai_http_configure_pipe()) {
+        openai_error(error, error_size, "could not create HTTP wakeup pipe");
+        return 0;
+    }
+    openai_http_drain_wakeup(openai_http_wakeup[0]);
+    openai_http_stop = 0;
 
     char service[16];
     snprintf(service, sizeof(service), "%d", config->port);
@@ -1230,13 +1239,6 @@ int openai_http_serve(
         return 0;
     }
 
-    int wakeup[2] = {-1, -1};
-    if (!openai_http_configure_pipe(wakeup)) {
-        close(listener);
-        openai_error(error, error_size, "could not create HTTP wakeup pipe");
-        return 0;
-    }
-
     struct sigaction action;
     struct sigaction old_int;
     struct sigaction old_term;
@@ -1245,22 +1247,13 @@ int openai_http_serve(
     sigemptyset(&action.sa_mask);
     sigaddset(&action.sa_mask, SIGINT);
     sigaddset(&action.sa_mask, SIGTERM);
-    openai_http_stop = 0;
-    openai_http_wakeup_fd = wakeup[1];
     if (sigaction(SIGINT, &action, &old_int) != 0) {
-        openai_http_wakeup_fd = -1;
-        close(wakeup[0]);
-        close(wakeup[1]);
         close(listener);
         openai_error(error, error_size, "could not install signal handlers");
         return 0;
     }
     if (sigaction(SIGTERM, &action, &old_term) != 0) {
-        openai_http_wakeup_fd = -1;
         sigaction(SIGINT, &old_int, NULL);
-        openai_http_drain_wakeup(wakeup[0]);
-        close(wakeup[0]);
-        close(wakeup[1]);
         close(listener);
         openai_error(error, error_size, "could not install signal handlers");
         return 0;
@@ -1268,7 +1261,7 @@ int openai_http_serve(
     int ok = 1;
     struct pollfd fds[2] = {
         {.fd = listener, .events = POLLIN},
-        {.fd = wakeup[0], .events = POLLIN},
+        {.fd = openai_http_wakeup[0], .events = POLLIN},
     };
     while (!openai_http_stop) {
         int polled = poll(fds, 2, -1);
@@ -1282,7 +1275,7 @@ int openai_http_serve(
             break;
         }
         if (fds[1].revents) {
-            openai_http_drain_wakeup(wakeup[0]);
+            openai_http_drain_wakeup(openai_http_wakeup[0]);
             if (openai_http_stop) break;
         }
         if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -1303,16 +1296,13 @@ int openai_http_serve(
             break;
         }
         openai_http_handle_connection_internal(
-            connection, config, handler, user_data, wakeup[0]);
+            connection, config, handler, user_data,
+            openai_http_wakeup[0]);
         close(connection);
     }
 
-    openai_http_wakeup_fd = -1;
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGTERM, &old_term, NULL);
-    openai_http_drain_wakeup(wakeup[0]);
-    close(wakeup[0]);
-    close(wakeup[1]);
     close(listener);
     return ok;
 }

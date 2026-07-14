@@ -336,19 +336,88 @@ static int wait_for_child(pid_t child, int *status) {
     return 0;
 }
 
-static void *receive_termination_signals(void *unused) {
-    (void)unused;
+typedef struct {
+    int signal_number;
+} SignalReceiver;
+
+typedef struct {
+    pid_t child;
+    int signal_number;
+    int result;
+    pthread_mutex_t *mutex;
+    pthread_cond_t *condition;
+    int *ready;
+    int *start;
+} SignalSender;
+
+static void *receive_termination_signal(void *opaque) {
+    SignalReceiver *receiver = opaque;
     sigset_t signals;
     sigemptyset(&signals);
-    sigaddset(&signals, SIGINT);
-    sigaddset(&signals, SIGTERM);
+    sigaddset(&signals, receiver->signal_number);
     pthread_sigmask(SIG_UNBLOCK, &signals, NULL);
     for (;;) pause();
     return NULL;
 }
 
+static void *send_termination_signal(void *opaque) {
+    SignalSender *sender = opaque;
+    pthread_mutex_lock(sender->mutex);
+    (*sender->ready)++;
+    pthread_cond_broadcast(sender->condition);
+    while (!*sender->start)
+        pthread_cond_wait(sender->condition, sender->mutex);
+    pthread_mutex_unlock(sender->mutex);
+    sender->result = kill(sender->child, sender->signal_number);
+    return NULL;
+}
+
+static int send_concurrent_termination(pid_t child) {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+    int ready = 0;
+    int start = 0;
+    SignalSender senders[2] = {
+        {.child = child, .signal_number = SIGINT, .result = -1,
+         .mutex = &mutex, .condition = &condition,
+         .ready = &ready, .start = &start},
+        {.child = child, .signal_number = SIGTERM, .result = -1,
+         .mutex = &mutex, .condition = &condition,
+         .ready = &ready, .start = &start},
+    };
+    pthread_t threads[2];
+    if (pthread_create(&threads[0], NULL,
+                       send_termination_signal, &senders[0]) != 0) {
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&condition);
+        return 0;
+    }
+    if (pthread_create(&threads[1], NULL,
+                       send_termination_signal, &senders[1]) != 0) {
+        pthread_mutex_lock(&mutex);
+        start = 1;
+        pthread_cond_broadcast(&condition);
+        pthread_mutex_unlock(&mutex);
+        pthread_join(threads[0], NULL);
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&condition);
+        return 0;
+    }
+    pthread_mutex_lock(&mutex);
+    while (ready != 2) pthread_cond_wait(&condition, &mutex);
+    start = 1;
+    pthread_cond_broadcast(&condition);
+    pthread_mutex_unlock(&mutex);
+    pthread_join(threads[0], NULL);
+    pthread_join(threads[1], NULL);
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&condition);
+    return senders[0].result == 0 && senders[1].result == 0;
+}
+
 static int run_serve_shutdown_case(
-    const char *partial, size_t partial_size, int termination_signal) {
+    const char *partial, size_t partial_size,
+    int termination_signal, int repeat_serve) {
     int port = reserve_loopback_port();
     if (port < 0) return 0;
     pid_t child = fork();
@@ -359,11 +428,17 @@ static int run_serve_shutdown_case(
         sigaddset(&signals, SIGINT);
         sigaddset(&signals, SIGTERM);
         if (pthread_sigmask(SIG_BLOCK, &signals, NULL) != 0) _exit(3);
-        pthread_t signal_thread;
-        if (pthread_create(
-                &signal_thread, NULL,
-                receive_termination_signals, NULL) != 0) _exit(3);
-        pthread_detach(signal_thread);
+        SignalReceiver receivers[2] = {
+            {.signal_number = SIGINT},
+            {.signal_number = SIGTERM},
+        };
+        pthread_t signal_threads[2];
+        for (int i = 0; i < 2; i++) {
+            if (pthread_create(&signal_threads[i], NULL,
+                               receive_termination_signal,
+                               &receivers[i]) != 0) _exit(3);
+            pthread_detach(signal_threads[i]);
+        }
         OpenAIHttpConfig config = {
             .host = "127.0.0.1",
             .port = port,
@@ -372,9 +447,14 @@ static int run_serve_shutdown_case(
         };
         FakeContext fake = {0};
         char error[256] = {0};
-        int ok = openai_http_serve(
-            &config, fake_generate, &fake, error, sizeof(error));
-        _exit(ok ? 0 : 2);
+        int serve_count = repeat_serve ? 2 : 1;
+        for (int i = 0; i < serve_count; i++) {
+            if (!openai_http_serve(
+                    &config, fake_generate, &fake,
+                    error, sizeof(error))) _exit(2);
+            if (repeat_serve && i == 0) usleep(20000);
+        }
+        _exit(0);
     }
 
     int first = connect_loopback(child, port);
@@ -413,11 +493,47 @@ static int run_serve_shutdown_case(
         return 0;
     }
     usleep(100000);
-    kill(child, termination_signal);
+    ok = termination_signal ? kill(child, termination_signal) == 0
+                            : send_concurrent_termination(child);
+    if (!ok) {
+        close(blocked);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 0;
+    }
+    if (repeat_serve) {
+        close(blocked);
+        blocked = -1;
+        usleep(100000);
+        int second = connect_loopback(child, port);
+        if (second < 0) {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+            return 0;
+        }
+        if (setsockopt(second, SOL_SOCKET, SO_RCVTIMEO,
+                       &response_deadline, sizeof(response_deadline)) != 0 ||
+            !socket_send_all(second, models, strlen(models))) {
+            close(second);
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+            return 0;
+        }
+        shutdown(second, SHUT_WR);
+        response = socket_read_all(second);
+        close(second);
+        ok = has_status(response, 200);
+        free(response);
+        if (!ok || kill(child, SIGTERM) != 0) {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+            return 0;
+        }
+    }
     int status = 0;
     ok = wait_for_child(child, &status) &&
          WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    close(blocked);
+    if (blocked >= 0) close(blocked);
     return ok;
 }
 
@@ -426,13 +542,15 @@ static int test_serve_wakeup_interrupts_partial_requests(void) {
         "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Len";
     CHECK(run_serve_shutdown_case(
-        partial_header, strlen(partial_header), SIGINT));
+        partial_header, strlen(partial_header), SIGINT, 0));
 
     const char *partial_body =
         "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: 100\r\n\r\n{";
     CHECK(run_serve_shutdown_case(
-        partial_body, strlen(partial_body), SIGTERM));
+        partial_body, strlen(partial_body), SIGTERM, 0));
+    CHECK(run_serve_shutdown_case(
+        partial_body, strlen(partial_body), 0, 1));
     return 0;
 }
 
