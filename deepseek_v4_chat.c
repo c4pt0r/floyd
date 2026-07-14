@@ -331,19 +331,15 @@ int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
         fprintf(stderr, "invalid DeepSeek V4 serve options\n");
         return 2;
     }
-    char model_path[4096], error[4096] = {0};
-    if (!deepseek_v4_ds4_find_model(options->model_dir, model_path,
-                                    sizeof(model_path), error, sizeof(error))) {
-        fprintf(stderr, "%s\n", error);
-        return 2;
-    }
+    const char *served_model = options->served_model_name
+        ? options->served_model_name : "-";
     if (options->stdio) {
         fprintf(stderr,
                 "DEEPSEEK_V4_SERVE transport=stdio backend=%s "
-                "prefix_cache_mb=%llu gguf=%s\n",
-                deepseek_v4_ds4_backend_name(),
+                "model=%s prefix_cache_mb=%llu auth=%s\n",
+                deepseek_v4_ds4_backend_name(), served_model,
                 (unsigned long long)(options->prefix_cache_bytes / (1024 * 1024)),
-                model_path);
+                options->api_key ? "on" : "off");
     } else {
         fprintf(stderr,
                 "DEEPSEEK_V4_SERVE transport=http backend=%s listen=%s:%d "
@@ -353,6 +349,15 @@ int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
                 (unsigned long long)(options->prefix_cache_bytes / (1024 * 1024)),
                 options->api_key ? "on" : "off");
     }
+    char model_path[4096], error[4096] = {0};
+    if (!deepseek_v4_ds4_find_model(options->model_dir, model_path,
+                                    sizeof(model_path), error, sizeof(error))) {
+        fprintf(stderr, "%s\n", error);
+        return 2;
+    }
+    if (options->stdio)
+        fprintf(stderr, "DEEPSEEK_V4_MODEL backend=%s gguf=%s\n",
+                deepseek_v4_ds4_backend_name(), model_path);
     DeepSeekV4Ds4Session *session = deepseek_v4_ds4_open_cached(
         model_path, options->max_context, options->draft > 1,
         options->prefix_cache_bytes, error, sizeof(error));

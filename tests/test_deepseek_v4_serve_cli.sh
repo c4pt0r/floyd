@@ -15,16 +15,42 @@ printf '%s\n' "$help" | grep -q -- '--ds4-support'
 model=$(mktemp -d /tmp/floyd-dsv4-serve-cli.XXXXXX)
 trap 'rm -rf "$model"' EXIT INT TERM
 printf '{"model_type":"deepseek_v4"}\n' >"$model/config.json"
+served_model=${model##*/}
 
 set +e
 http_defaults=$(env -u SNAP -u CHAT -u PROMPT -u SERVE \
-    ./floyd serve --model "$model" --prefix-cache-mb 0 2>&1)
+    ./floyd serve --model "$model///" --prefix-cache-mb 0 2>&1)
 http_status=$?
 set -e
 [ "$http_status" -eq 2 ]
+printf '%s\n' "$http_defaults" | grep -Fqx \
+    "DEEPSEEK_V4_SERVE transport=http backend=metal-ds4 listen=127.0.0.1:8080 model=$served_model prefix_cache_mb=0 auth=off"
 printf '%s\n' "$http_defaults" | grep -Eq \
     'prepared DS4 GGUF not found|requires.*METAL'
 ! printf '%s\n' "$http_defaults" | grep -q 'serve requires --stdio'
+
+set +e
+stdio_defaults=$(env -u SNAP -u CHAT -u PROMPT -u SERVE \
+    ./floyd serve --model "$model///" --stdio --prefix-cache-mb 0 2>&1)
+stdio_status=$?
+set -e
+[ "$stdio_status" -eq 2 ]
+printf '%s\n' "$stdio_defaults" | grep -Fqx \
+    "DEEPSEEK_V4_SERVE transport=stdio backend=metal-ds4 model=$served_model prefix_cache_mb=0 auth=off"
+printf '%s\n' "$stdio_defaults" | grep -Eq \
+    'prepared DS4 GGUF not found|requires.*METAL'
+
+secret='task-3-secret-must-not-be-logged'
+set +e
+auth_config=$(env -u SNAP -u CHAT -u PROMPT -u SERVE \
+    ./floyd serve --model "$model" --api-key "$secret" \
+    --prefix-cache-mb 0 2>&1)
+auth_status=$?
+set -e
+[ "$auth_status" -eq 2 ]
+printf '%s\n' "$auth_config" | grep -Fqx \
+    "DEEPSEEK_V4_SERVE transport=http backend=metal-ds4 listen=127.0.0.1:8080 model=$served_model prefix_cache_mb=0 auth=on"
+! printf '%s\n' "$auth_config" | grep -Fq "$secret"
 
 set +e
 transport_conflict=$(env -u SNAP -u CHAT -u PROMPT -u SERVE \

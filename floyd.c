@@ -330,7 +330,7 @@ static int run_deepseek_v4(CliOptions *options) {
 
 static int run_moonlight(CliOptions *options) {
     if (options->command == COMMAND_SERVE) {
-        fprintf(stderr, "floyd serve --stdio currently requires DeepSeek V4\n");
+        fprintf(stderr, "floyd serve currently requires DeepSeek V4\n");
         return 2;
     }
     if (options->draft_set && options->draft > 0)
