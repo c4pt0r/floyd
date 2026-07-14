@@ -262,6 +262,9 @@ static CliOptions parse_cli(int argc, char **argv) {
         fail_usage("--prefix-cache-mb is only valid for serve");
     if (options.command == COMMAND_SERVE && !options.host[0])
         fail_usage("--host must be non-empty");
+    if (options.command == COMMAND_SERVE && options.api_key_set &&
+        !options.api_key[0])
+        fail_usage("--api-key must be non-empty");
     if (options.command == COMMAND_SERVE && options.served_model_name_set &&
         !options.served_model_name[0])
         fail_usage("--served-model-name must be non-empty");

@@ -37,6 +37,268 @@ static char *openai_strdup(const char *value) {
     return copy;
 }
 
+#define OPENAI_JSON_MAX_DEPTH 128u
+#define OPENAI_JSON_MAX_NODES 1048576u
+
+typedef struct {
+    const unsigned char *cursor;
+    const unsigned char *end;
+    size_t nodes;
+    const char *error;
+} OpenAIStrictJson;
+
+static void openai_strict_json_skip_ws(OpenAIStrictJson *parser) {
+    while (parser->cursor < parser->end &&
+           (*parser->cursor == ' ' || *parser->cursor == '\t' ||
+            *parser->cursor == '\r' || *parser->cursor == '\n'))
+        parser->cursor++;
+}
+
+static int openai_strict_json_hex4(
+    const unsigned char *value, unsigned *codepoint) {
+    unsigned result = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned char c = value[i];
+        unsigned digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else return 0;
+        result = (result << 4) | digit;
+    }
+    *codepoint = result;
+    return 1;
+}
+
+static int openai_strict_json_utf8(
+    OpenAIStrictJson *parser, unsigned char lead) {
+    size_t size;
+    unsigned char second_min = 0x80, second_max = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) {
+        size = 2;
+    } else if (lead >= 0xe0 && lead <= 0xef) {
+        size = 3;
+        if (lead == 0xe0) second_min = 0xa0;
+        if (lead == 0xed) second_max = 0x9f;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+        size = 4;
+        if (lead == 0xf0) second_min = 0x90;
+        if (lead == 0xf4) second_max = 0x8f;
+    } else {
+        parser->error = "invalid UTF-8 lead byte in JSON string";
+        return 0;
+    }
+    if ((size_t)(parser->end - parser->cursor) < size - 1) {
+        parser->error = "incomplete UTF-8 sequence in JSON string";
+        return 0;
+    }
+    unsigned char second = *parser->cursor++;
+    if (second < second_min || second > second_max) {
+        parser->error = "invalid UTF-8 continuation in JSON string";
+        return 0;
+    }
+    for (size_t i = 2; i < size; i++) {
+        unsigned char continuation = *parser->cursor++;
+        if (continuation < 0x80 || continuation > 0xbf) {
+            parser->error = "invalid UTF-8 continuation in JSON string";
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int openai_strict_json_string(OpenAIStrictJson *parser) {
+    if (parser->cursor >= parser->end || *parser->cursor++ != '"') {
+        parser->error = "expected JSON string";
+        return 0;
+    }
+    while (parser->cursor < parser->end) {
+        unsigned char c = *parser->cursor++;
+        if (c == '"') return 1;
+        if (c < 0x20) {
+            parser->error = "unescaped control byte in JSON string";
+            return 0;
+        }
+        if (c >= 0x80) {
+            if (!openai_strict_json_utf8(parser, c)) return 0;
+            continue;
+        }
+        if (c != '\\') continue;
+        if (parser->cursor >= parser->end) {
+            parser->error = "incomplete JSON string escape";
+            return 0;
+        }
+        unsigned char escape = *parser->cursor++;
+        if (escape == '"' || escape == '\\' || escape == '/' ||
+            escape == 'b' || escape == 'f' || escape == 'n' ||
+            escape == 'r' || escape == 't') continue;
+        if (escape != 'u' || (size_t)(parser->end - parser->cursor) < 4) {
+            parser->error = "invalid JSON string escape";
+            return 0;
+        }
+        unsigned codepoint;
+        if (!openai_strict_json_hex4(parser->cursor, &codepoint)) {
+            parser->error = "invalid JSON unicode escape";
+            return 0;
+        }
+        parser->cursor += 4;
+        if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+            if ((size_t)(parser->end - parser->cursor) < 6 ||
+                parser->cursor[0] != '\\' || parser->cursor[1] != 'u') {
+                parser->error = "missing low JSON unicode surrogate";
+                return 0;
+            }
+            unsigned low;
+            if (!openai_strict_json_hex4(parser->cursor + 2, &low) ||
+                low < 0xdc00 || low > 0xdfff) {
+                parser->error = "invalid low JSON unicode surrogate";
+                return 0;
+            }
+            parser->cursor += 6;
+        } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+            parser->error = "unexpected low JSON unicode surrogate";
+            return 0;
+        }
+    }
+    parser->error = "unterminated JSON string";
+    return 0;
+}
+
+static int openai_strict_json_value(OpenAIStrictJson *parser, size_t depth);
+
+static int openai_strict_json_container(
+    OpenAIStrictJson *parser, size_t depth, int object) {
+    if (depth >= OPENAI_JSON_MAX_DEPTH) {
+        parser->error = "JSON nesting depth exceeds 128";
+        return 0;
+    }
+    unsigned char end = object ? '}' : ']';
+    parser->cursor++;
+    openai_strict_json_skip_ws(parser);
+    if (parser->cursor < parser->end && *parser->cursor == end) {
+        parser->cursor++;
+        return 1;
+    }
+    for (;;) {
+        if (object) {
+            if (!openai_strict_json_string(parser)) return 0;
+            openai_strict_json_skip_ws(parser);
+            if (parser->cursor >= parser->end || *parser->cursor++ != ':') {
+                parser->error = "expected colon after JSON object key";
+                return 0;
+            }
+        }
+        if (!openai_strict_json_value(parser, depth + 1)) return 0;
+        openai_strict_json_skip_ws(parser);
+        if (parser->cursor >= parser->end) {
+            parser->error = "unterminated JSON container";
+            return 0;
+        }
+        unsigned char delimiter = *parser->cursor++;
+        if (delimiter == end) return 1;
+        if (delimiter != ',') {
+            parser->error = "expected comma or JSON container end";
+            return 0;
+        }
+        openai_strict_json_skip_ws(parser);
+    }
+}
+
+static int openai_strict_json_number(OpenAIStrictJson *parser) {
+    const unsigned char *start = parser->cursor;
+    if (parser->cursor < parser->end && *parser->cursor == '-')
+        parser->cursor++;
+    if (parser->cursor >= parser->end) goto invalid;
+    if (*parser->cursor == '0') {
+        parser->cursor++;
+        if (parser->cursor < parser->end &&
+            *parser->cursor >= '0' && *parser->cursor <= '9') goto invalid;
+    } else if (*parser->cursor >= '1' && *parser->cursor <= '9') {
+        do parser->cursor++;
+        while (parser->cursor < parser->end &&
+               *parser->cursor >= '0' && *parser->cursor <= '9');
+    } else {
+        goto invalid;
+    }
+    if (parser->cursor < parser->end && *parser->cursor == '.') {
+        parser->cursor++;
+        if (parser->cursor >= parser->end ||
+            *parser->cursor < '0' || *parser->cursor > '9') goto invalid;
+        do parser->cursor++;
+        while (parser->cursor < parser->end &&
+               *parser->cursor >= '0' && *parser->cursor <= '9');
+    }
+    if (parser->cursor < parser->end &&
+        (*parser->cursor == 'e' || *parser->cursor == 'E')) {
+        parser->cursor++;
+        if (parser->cursor < parser->end &&
+            (*parser->cursor == '+' || *parser->cursor == '-'))
+            parser->cursor++;
+        if (parser->cursor >= parser->end ||
+            *parser->cursor < '0' || *parser->cursor > '9') goto invalid;
+        do parser->cursor++;
+        while (parser->cursor < parser->end &&
+               *parser->cursor >= '0' && *parser->cursor <= '9');
+    }
+    return parser->cursor > start;
+
+invalid:
+    parser->error = "invalid JSON number";
+    return 0;
+}
+
+static int openai_strict_json_literal(
+    OpenAIStrictJson *parser, const char *literal, size_t size) {
+    if ((size_t)(parser->end - parser->cursor) < size ||
+        memcmp(parser->cursor, literal, size) != 0) {
+        parser->error = "invalid JSON literal";
+        return 0;
+    }
+    parser->cursor += size;
+    return 1;
+}
+
+static int openai_strict_json_value(OpenAIStrictJson *parser, size_t depth) {
+    openai_strict_json_skip_ws(parser);
+    if (++parser->nodes > OPENAI_JSON_MAX_NODES) {
+        parser->error = "JSON node limit exceeds 1048576";
+        return 0;
+    }
+    if (parser->cursor >= parser->end) {
+        parser->error = "expected JSON value";
+        return 0;
+    }
+    switch (*parser->cursor) {
+        case '{': return openai_strict_json_container(parser, depth, 1);
+        case '[': return openai_strict_json_container(parser, depth, 0);
+        case '"': return openai_strict_json_string(parser);
+        case 't': return openai_strict_json_literal(parser, "true", 4);
+        case 'f': return openai_strict_json_literal(parser, "false", 5);
+        case 'n': return openai_strict_json_literal(parser, "null", 4);
+        default: return openai_strict_json_number(parser);
+    }
+}
+
+static int openai_strict_json_validate(
+    const char *body, char *error, size_t error_size) {
+    OpenAIStrictJson parser = {
+        .cursor = (const unsigned char *)body,
+        .end = (const unsigned char *)body + strlen(body),
+    };
+    int valid = openai_strict_json_value(&parser, 0);
+    if (valid) {
+        openai_strict_json_skip_ws(&parser);
+        if (parser.cursor != parser.end) {
+            parser.error = "trailing data after JSON value";
+            valid = 0;
+        }
+    }
+    if (!valid && error && error_size)
+        snprintf(error, error_size, "invalid JSON: %s",
+                 parser.error ? parser.error : "invalid value");
+    return valid;
+}
+
 static int openai_bool_field(jval *root, const char *name, int missing,
                              int *out, char *error, size_t error_size) {
     jval *value = json_get(root, name);
@@ -177,10 +439,12 @@ void openai_chat_request_free(OpenAIChatRequest *request) {
     memset(request, 0, sizeof(*request));
 }
 
-int openai_chat_request_parse(
+static int openai_chat_request_parse_detailed(
     const char *body, const char *served_model, OpenAIChatRequest *request,
-    char *error, size_t error_size) {
+    char *error, size_t error_size,
+    char *error_param, size_t error_param_size) {
     if (error && error_size) error[0] = 0;
+    if (error_param && error_param_size) error_param[0] = 0;
     if (!request) {
         openai_error(error, error_size, "request output is required");
         return 0;
@@ -193,6 +457,8 @@ int openai_chat_request_parse(
         openai_error(error, error_size, "body and served model are required");
         return 0;
     }
+
+    if (!openai_strict_json_validate(body, error, error_size)) return 0;
 
     char json_error[256] = {0};
     jval *root = json_parse_full(body, json_error, sizeof(json_error));
@@ -211,16 +477,24 @@ int openai_chat_request_parse(
     }
     if (!openai_unique_object_keys(root, error, error_size)) goto fail;
 
-    static const char *unsupported[] = {
-        "audio", "frequency_penalty", "function_call", "functions",
-        "logit_bias", "logprobs", "modalities", "parallel_tool_calls",
-        "prediction", "presence_penalty", "reasoning_effort",
-        "response_format", "seed", "stop", "tool_choice", "tools",
-        "top_logprobs",
+    static const char *allowed[] = {
+        "model", "messages", "max_tokens", "max_completion_tokens",
+        "temperature", "top_p", "stream", "stream_options", "n",
     };
-    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
-        if (!openai_reject_field(root, unsupported[i], error, error_size))
+    for (int i = 0; i < root->len; i++) {
+        int accepted = 0;
+        for (size_t j = 0; j < sizeof(allowed) / sizeof(allowed[0]); j++)
+            if (strcmp(root->keys[i], allowed[j]) == 0) {
+                accepted = 1;
+                break;
+            }
+        if (!accepted) {
+            openai_field_error(
+                error, error_size, root->keys[i], "is not supported");
+            if (error_param && error_param_size)
+                snprintf(error_param, error_param_size, "%s", root->keys[i]);
             goto fail;
+        }
     }
 
     jval *model = json_get(root, "model");
@@ -254,6 +528,15 @@ int openai_chat_request_parse(
         }
         jval *role = json_get(item, "role");
         jval *content = json_get(item, "content");
+        for (int field = 0; field < item->len; field++) {
+            if (strcmp(item->keys[field], "role") != 0 &&
+                strcmp(item->keys[field], "content") != 0) {
+                openai_field_error(
+                    error, error_size, item->keys[field],
+                    "is not supported in a message");
+                goto fail;
+            }
+        }
         if (!role || role->t != J_STR ||
             (strcmp(role->str, "system") != 0 &&
              strcmp(role->str, "user") != 0 &&
@@ -264,12 +547,6 @@ int openai_chat_request_parse(
         }
         if (!content || content->t != J_STR) {
             openai_error(error, error_size, "message content must be a string");
-            goto fail;
-        }
-        if (json_get(item, "tool_calls") || json_get(item, "function_call") ||
-            json_get(item, "name")) {
-            openai_error(error, error_size,
-                         "message tool and name fields are not supported");
             goto fail;
         }
         request->messages[i].role = openai_strdup(role->str);
@@ -309,6 +586,9 @@ int openai_chat_request_parse(
                 openai_field_error(error, error_size,
                                    stream_options->keys[i],
                                    "is not a supported stream option");
+                if (error_param && error_param_size)
+                    snprintf(error_param, error_param_size, "stream_options.%s",
+                             stream_options->keys[i]);
                 goto fail;
             }
         }
@@ -326,6 +606,13 @@ fail:
     json_free(root);
     openai_chat_request_free(request);
     return 0;
+}
+
+int openai_chat_request_parse(
+    const char *body, const char *served_model, OpenAIChatRequest *request,
+    char *error, size_t error_size) {
+    return openai_chat_request_parse_detailed(
+        body, served_model, request, error, error_size, NULL, 0);
 }
 
 static int openai_json_string_n(FILE *output, const char *value, size_t size) {
@@ -471,7 +758,6 @@ int openai_format_error_json(
 
 #define OPENAI_HTTP_HEADER_LIMIT (32u * 1024u)
 #define OPENAI_HTTP_BODY_LIMIT (8u * 1024u * 1024u)
-#define OPENAI_HTTP_ID "chatcmpl-floyd"
 
 typedef struct {
     char method[16];
@@ -482,7 +768,15 @@ typedef struct {
     int authorization_count;
     int authorization_invalid_ows;
     char *authorization;
+    int host_count;
+    int host_nonempty;
 } OpenAIHttpRequest;
+
+typedef struct {
+    int fd;
+    int wake_fd;
+    int timeout_ms;
+} OpenAIHttpConnection;
 
 typedef struct {
     char *data;
@@ -492,9 +786,16 @@ typedef struct {
 } OpenAIContentBuffer;
 
 typedef struct {
-    int fd;
+    OpenAIHttpConnection *connection;
+    OpenAIContentBuffer *buffer;
+} OpenAIAccumulationSink;
+
+typedef struct {
+    OpenAIHttpConnection *connection;
+    const char *id;
     const char *model;
     long long created;
+    int committed;
     int failed;
 } OpenAISseSink;
 
@@ -516,48 +817,70 @@ static void openai_http_drain_wakeup(int fd) {
     while (read(fd, buffer, sizeof(buffer)) > 0) {}
 }
 
-static int openai_http_wait_readable(int fd, int wake_fd) {
-    if (wake_fd < 0) return 1;
+static int64_t openai_http_now_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int openai_http_wait(
+    OpenAIHttpConnection *connection, short events, int64_t deadline) {
     struct pollfd fds[2] = {
-        {.fd = fd, .events = POLLIN},
-        {.fd = wake_fd, .events = POLLIN},
+        {.fd = connection->fd, .events = events},
+        {.fd = connection->wake_fd, .events = POLLIN},
     };
     for (;;) {
-        if (openai_http_stop) return 0;
-        int polled = poll(fds, 2, -1);
+        if (connection->wake_fd >= 0 && openai_http_stop) return 0;
+        int64_t now = openai_http_now_ms();
+        if (now < 0 || now >= deadline) return -1;
+        int64_t remaining = deadline - now;
+        int timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        int count = connection->wake_fd >= 0 ? 2 : 1;
+        int polled = poll(fds, (nfds_t)count, timeout);
         if (polled < 0) {
             if (errno == EINTR) {
-                if (openai_http_stop) return 0;
+                if (connection->wake_fd >= 0 && openai_http_stop) return 0;
                 continue;
             }
             return 0;
         }
-        if (fds[1].revents) {
-            openai_http_drain_wakeup(wake_fd);
+        if (polled == 0) return -1;
+        if (connection->wake_fd >= 0 && fds[1].revents) {
+            openai_http_drain_wakeup(connection->wake_fd);
             if (openai_http_stop) return 0;
             continue;
         }
-        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+        if (fds[0].revents & (events | POLLHUP | POLLERR | POLLNVAL))
             return 1;
     }
 }
 
-static int openai_http_send_all(int fd, const void *data, size_t size) {
+static int openai_http_send_all(
+    OpenAIHttpConnection *connection, const void *data, size_t size) {
     const char *bytes = data;
     size_t offset = 0;
+    int64_t now = openai_http_now_ms();
+    if (now < 0) return 0;
+    int64_t deadline = now + connection->timeout_ms;
     while (offset < size) {
+        now = openai_http_now_ms();
+        if (now < 0 || now >= deadline) return 0;
 #ifdef MSG_NOSIGNAL
-        ssize_t sent = send(fd, bytes + offset, size - offset, MSG_NOSIGNAL);
+        ssize_t sent = send(
+            connection->fd, bytes + offset, size - offset, MSG_NOSIGNAL);
 #else
-        ssize_t sent = send(fd, bytes + offset, size - offset, 0);
+        ssize_t sent = send(connection->fd, bytes + offset, size - offset, 0);
 #endif
         if (sent > 0) {
             offset += (size_t)sent;
             continue;
         }
         if (sent < 0 && errno == EINTR) {
-            if (openai_http_stop) return 0;
+            if (connection->wake_fd >= 0 && openai_http_stop) return 0;
             continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (openai_http_wait(connection, POLLOUT, deadline) == 1) continue;
         }
         return 0;
     }
@@ -571,6 +894,7 @@ static const char *openai_http_reason(int status) {
         case 401: return "Unauthorized";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
@@ -579,7 +903,8 @@ static const char *openai_http_reason(int status) {
 }
 
 static int openai_http_send_response(
-    int fd, int status, const char *content_type, const char *extra_headers,
+    OpenAIHttpConnection *connection, int status,
+    const char *content_type, const char *extra_headers,
     const char *body, size_t body_size) {
     char headers[1024];
     int header_size = snprintf(
@@ -591,22 +916,22 @@ static int openai_http_send_response(
         status, openai_http_reason(status), content_type, body_size,
         extra_headers ? extra_headers : "");
     if (header_size < 0 || (size_t)header_size >= sizeof(headers)) return 0;
-    return openai_http_send_all(fd, headers, (size_t)header_size) &&
-           openai_http_send_all(fd, body, body_size);
+    return openai_http_send_all(connection, headers, (size_t)header_size) &&
+           openai_http_send_all(connection, body, body_size);
 }
 
 static int openai_http_send_error(
-    int fd, int status, const char *message, const char *code,
-    const char *extra_headers) {
+    OpenAIHttpConnection *connection, int status, const char *message,
+    const char *param, const char *code, const char *extra_headers) {
     char *json = NULL;
     size_t json_size = 0;
     const char *type = status == 401 ? "authentication_error" :
                        status == 500 ? "server_error" :
                                        "invalid_request_error";
     if (!openai_format_error_json(
-            message, type, NULL, code, &json, &json_size)) return 0;
+            message, type, param, code, &json, &json_size)) return 0;
     int ok = openai_http_send_response(
-        fd, status, "application/json", extra_headers, json, json_size);
+        connection, status, "application/json", extra_headers, json, json_size);
     free(json);
     return ok;
 }
@@ -621,10 +946,13 @@ static size_t openai_http_header_end(const char *data, size_t size) {
 }
 
 static int openai_http_read_head(
-    int fd, int wake_fd, char *data,
+    OpenAIHttpConnection *connection, char *data,
     size_t *data_size, size_t *header_size) {
     *data_size = 0;
     *header_size = 0;
+    int64_t now = openai_http_now_ms();
+    if (now < 0) return 0;
+    int64_t deadline = now + connection->timeout_ms;
     for (;;) {
         size_t end = openai_http_header_end(data, *data_size);
         if (end) {
@@ -633,19 +961,24 @@ static int openai_http_read_head(
             return 1;
         }
         if (*data_size > OPENAI_HTTP_HEADER_LIMIT) return 431;
-        if (!openai_http_wait_readable(fd, wake_fd)) return 0;
+        int ready = openai_http_wait(connection, POLLIN, deadline);
+        if (ready < 0) return 408;
+        if (!ready) return 0;
         size_t remaining = OPENAI_HTTP_HEADER_LIMIT + 1 - *data_size;
-        ssize_t received = recv(fd, data + *data_size, remaining, 0);
+        ssize_t received = recv(
+            connection->fd, data + *data_size, remaining, 0);
         if (received > 0) {
             *data_size += (size_t)received;
             continue;
         }
         if (received < 0 && errno == EINTR) {
-            if (wake_fd >= 0 && openai_http_stop) return 0;
+            if (connection->wake_fd >= 0 && openai_http_stop) return 0;
             continue;
         }
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
         if (received == 0)
-            return wake_fd >= 0 && openai_http_stop ? 0 : 400;
+            return connection->wake_fd >= 0 && openai_http_stop ? 0 : 400;
         return 0;
     }
 }
@@ -724,6 +1057,9 @@ static int openai_http_parse_head(
                 (raw_value[0] == ' ' &&
                  (raw_value[1] == ' ' || raw_value[1] == '\t'));
             request->authorization = value;
+        } else if (strcasecmp(line, "Host") == 0) {
+            request->host_count++;
+            request->host_nonempty = value[0] != 0;
         }
         line = line_end + 2;
     }
@@ -760,14 +1096,20 @@ static int openai_http_authorized(
     size_t prefix_size = sizeof(prefix) - 1;
     size_t key_size = strlen(config->api_key);
     size_t authorization_size = strlen(request->authorization);
-    return authorization_size == prefix_size + key_size &&
-           memcmp(request->authorization, prefix, prefix_size) == 0 &&
-           memcmp(request->authorization + prefix_size,
-                  config->api_key, key_size) == 0;
+    if (authorization_size != prefix_size + key_size ||
+        memcmp(request->authorization, prefix, prefix_size) != 0)
+        return 0;
+    const unsigned char *provided = (const unsigned char *)
+        request->authorization + prefix_size;
+    const unsigned char *expected = (const unsigned char *)config->api_key;
+    unsigned char difference = 0;
+    for (size_t i = 0; i < key_size; i++)
+        difference |= provided[i] ^ expected[i];
+    return difference == 0;
 }
 
 static int openai_http_read_body(
-    int fd, int wake_fd,
+    OpenAIHttpConnection *connection,
     const char *head, size_t data_size, size_t header_size,
     size_t body_size, char **body) {
     *body = malloc(body_size + 1);
@@ -776,29 +1118,40 @@ static int openai_http_read_body(
     if (buffered > body_size) buffered = body_size;
     if (buffered) memcpy(*body, head + header_size, buffered);
     size_t offset = buffered;
+    int64_t now = openai_http_now_ms();
+    if (now < 0) {
+        free(*body);
+        *body = NULL;
+        return -2;
+    }
+    int64_t deadline = now + connection->timeout_ms;
     while (offset < body_size) {
-        if (!openai_http_wait_readable(fd, wake_fd)) {
+        int ready = openai_http_wait(connection, POLLIN, deadline);
+        if (ready <= 0) {
             free(*body);
             *body = NULL;
-            return -2;
+            return ready < 0 ? -3 : -2;
         }
-        ssize_t received = recv(fd, *body + offset, body_size - offset, 0);
+        ssize_t received = recv(
+            connection->fd, *body + offset, body_size - offset, 0);
         if (received > 0) {
             offset += (size_t)received;
             continue;
         }
         if (received < 0 && errno == EINTR) {
-            if (wake_fd >= 0 && openai_http_stop) {
+            if (connection->wake_fd >= 0 && openai_http_stop) {
                 free(*body);
                 *body = NULL;
                 return -2;
             }
             continue;
         }
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
         if (received == 0) {
             free(*body);
             *body = NULL;
-            return wake_fd >= 0 && openai_http_stop ? -2 : 0;
+            return connection->wake_fd >= 0 && openai_http_stop ? -2 : 0;
         }
         free(*body);
         *body = NULL;
@@ -842,7 +1195,17 @@ static int openai_content_buffer_append(
 static int openai_content_sink(
     int token, const char *piece, size_t piece_size, void *user_data) {
     (void)token;
-    return openai_content_buffer_append(user_data, piece, piece_size);
+    OpenAIAccumulationSink *sink = user_data;
+    struct pollfd peer = {
+        .fd = sink->connection->fd,
+        .events = POLLIN,
+    };
+    int status;
+    do status = poll(&peer, 1, 0);
+    while (status < 0 && errno == EINTR);
+    if (status > 0 && (peer.revents & (POLLHUP | POLLERR | POLLNVAL)))
+        return 0;
+    return openai_content_buffer_append(sink->buffer, piece, piece_size);
 }
 
 static int openai_utf8_expected_size(unsigned char lead) {
@@ -957,23 +1320,26 @@ static FILE *openai_sse_event_stream(char **event, size_t *event_size) {
 }
 
 static int openai_sse_send_event(
-    int fd, char *event, size_t event_size, int formatted) {
+    OpenAIHttpConnection *connection,
+    char *event, size_t event_size, int formatted) {
     int ok = formatted &&
-             openai_http_send_all(fd, "data: ", 6) &&
-             openai_http_send_all(fd, event, event_size) &&
-             openai_http_send_all(fd, "\n\n", 2);
+             openai_http_send_all(connection, "data: ", 6) &&
+             openai_http_send_all(connection, event, event_size) &&
+             openai_http_send_all(connection, "\n\n", 2);
     free(event);
     return ok;
 }
 
 static int openai_sse_send_role(
-    int fd, const char *model, long long created) {
+    OpenAIHttpConnection *connection, const char *id,
+    const char *model, long long created) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
     if (!output) return 0;
-    int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
-                          "\",\"object\":\"chat.completion.chunk\","
+    int formatted = fputs("{\"id\":", output) != EOF &&
+                    openai_json_string(output, id) &&
+                    fputs(",\"object\":\"chat.completion.chunk\","
                           "\"created\":", output) != EOF &&
                     fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
@@ -981,18 +1347,21 @@ static int openai_sse_send_role(
                           "\"role\":\"assistant\"},"
                           "\"finish_reason\":null}]}", output) != EOF;
     if (fclose(output) != 0) formatted = 0;
-    return openai_sse_send_event(fd, event, event_size, formatted);
+    return openai_sse_send_event(
+        connection, event, event_size, formatted);
 }
 
 static int openai_sse_send_content(
-    int fd, const char *model, long long created,
+    OpenAIHttpConnection *connection, const char *id,
+    const char *model, long long created,
     const char *piece, size_t piece_size) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
     if (!output) return 0;
-    int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
-                          "\",\"object\":\"chat.completion.chunk\","
+    int formatted = fputs("{\"id\":", output) != EOF &&
+                    openai_json_string(output, id) &&
+                    fputs(",\"object\":\"chat.completion.chunk\","
                           "\"created\":", output) != EOF &&
                     fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
@@ -1001,16 +1370,30 @@ static int openai_sse_send_content(
                     openai_json_string_n(output, piece, piece_size) &&
                     fputs("},\"finish_reason\":null}]}", output) != EOF;
     if (fclose(output) != 0) formatted = 0;
-    return openai_sse_send_event(fd, event, event_size, formatted);
+    return openai_sse_send_event(
+        connection, event, event_size, formatted);
 }
+
+static int openai_http_send_sse_headers(
+    OpenAIHttpConnection *connection);
 
 static int openai_sse_token_sink(
     int token, const char *piece, size_t piece_size, void *user_data) {
     (void)token;
     OpenAISseSink *sink = user_data;
     if (sink->failed || (!piece && piece_size)) return 0;
+    if (!sink->committed) {
+        if (!openai_http_send_sse_headers(sink->connection) ||
+            !openai_sse_send_role(
+                sink->connection, sink->id, sink->model, sink->created)) {
+            sink->failed = 1;
+            return 0;
+        }
+        sink->committed = 1;
+    }
     if (!openai_sse_send_content(
-            sink->fd, sink->model, sink->created, piece, piece_size)) {
+            sink->connection, sink->id, sink->model, sink->created,
+            piece, piece_size)) {
         sink->failed = 1;
         return 0;
     }
@@ -1018,15 +1401,17 @@ static int openai_sse_token_sink(
 }
 
 static int openai_sse_send_terminal(
-    int fd, const char *model, long long created,
+    OpenAIHttpConnection *connection, const char *id,
+    const char *model, long long created,
     const OpenAIGenerationResult *result) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
     if (!output) return 0;
     const char *reason = result->finish_reason ? result->finish_reason : "stop";
-    int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
-                          "\",\"object\":\"chat.completion.chunk\","
+    int formatted = fputs("{\"id\":", output) != EOF &&
+                    openai_json_string(output, id) &&
+                    fputs(",\"object\":\"chat.completion.chunk\","
                           "\"created\":", output) != EOF &&
                     fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
@@ -1035,11 +1420,13 @@ static int openai_sse_send_terminal(
                     openai_json_string(output, reason) &&
                     fputs("}]}", output) != EOF;
     if (fclose(output) != 0) formatted = 0;
-    return openai_sse_send_event(fd, event, event_size, formatted);
+    return openai_sse_send_event(
+        connection, event, event_size, formatted);
 }
 
 static int openai_sse_send_usage(
-    int fd, const char *model, long long created,
+    OpenAIHttpConnection *connection, const char *id,
+    const char *model, long long created,
     const OpenAIGenerationResult *result) {
     char *event;
     size_t event_size;
@@ -1047,8 +1434,9 @@ static int openai_sse_send_usage(
     if (!output) return 0;
     long long total_tokens =
         (long long)result->prompt_tokens + result->completion_tokens;
-    int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
-                          "\",\"object\":\"chat.completion.chunk\","
+    int formatted = fputs("{\"id\":", output) != EOF &&
+                    openai_json_string(output, id) &&
+                    fputs(",\"object\":\"chat.completion.chunk\","
                           "\"created\":", output) != EOF &&
                     fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
@@ -1069,110 +1457,189 @@ static int openai_sse_send_usage(
                             (unsigned long long)result->cache_entries,
                             (unsigned long long)result->cache_bytes) >= 0;
     if (fclose(output) != 0) formatted = 0;
-    return openai_sse_send_event(fd, event, event_size, formatted);
+    return openai_sse_send_event(
+        connection, event, event_size, formatted);
 }
 
-static int openai_http_send_sse_headers(int fd) {
+static int openai_http_send_sse_headers(
+    OpenAIHttpConnection *connection) {
     static const char headers[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n"
         "X-Accel-Buffering: no\r\n\r\n";
-    return openai_http_send_all(fd, headers, sizeof(headers) - 1);
+    return openai_http_send_all(connection, headers, sizeof(headers) - 1);
+}
+
+static int openai_http_make_completion_id(char *id, size_t id_size) {
+    static uint64_t counter;
+    struct timespec now;
+    if (!id || id_size == 0 || clock_gettime(CLOCK_REALTIME, &now) != 0)
+        return 0;
+    uint64_t sequence = __sync_add_and_fetch(&counter, 1);
+    int size = snprintf(
+        id, id_size, "chatcmpl-%llx-%llx-%llx",
+        (unsigned long long)now.tv_sec,
+        (unsigned long long)now.tv_nsec,
+        (unsigned long long)sequence);
+    return size > 0 && (size_t)size < id_size;
+}
+
+static int openai_sse_send_error(
+    OpenAIHttpConnection *connection, int client_error,
+    const char *message) {
+    char *json = NULL;
+    size_t json_size = 0;
+    const char *safe_message = client_error && message && message[0]
+        ? message : "generation failed";
+    const char *type = client_error
+        ? "invalid_request_error" : "server_error";
+    if (!openai_format_error_json(
+            safe_message, type, NULL, "generation_failed",
+            &json, &json_size)) return 0;
+    return openai_sse_send_event(connection, json, json_size, 1);
 }
 
 static int openai_http_run_completion(
-    int fd, const OpenAIHttpConfig *config, OpenAIGenerateHandler handler,
+    OpenAIHttpConnection *connection, const OpenAIHttpConfig *config,
+    OpenAIGenerateHandler handler,
     void *user_data, char *body) {
     OpenAIChatRequest request = {0};
     char request_error[256] = {0};
-    if (!openai_chat_request_parse(
+    char request_param[128] = {0};
+    if (!openai_chat_request_parse_detailed(
             body, config->model_name, &request,
-            request_error, sizeof(request_error))) {
+            request_error, sizeof(request_error),
+            request_param, sizeof(request_param))) {
         return openai_http_send_error(
-            fd, 400, request_error[0] ? request_error : "invalid request",
+            connection, 400,
+            request_error[0] ? request_error : "invalid request",
+            request_param[0] ? request_param : NULL,
             "invalid_request", NULL);
     }
     if (!handler) {
         openai_chat_request_free(&request);
         return openai_http_send_error(
-            fd, 500, "generation handler is unavailable", "server_error", NULL);
+            connection, 500, "generation handler is unavailable",
+            NULL, "server_error", NULL);
     }
 
     OpenAIGenerationResult result = {0};
     char generation_error[256] = {0};
+    char id[96];
+    if (!openai_http_make_completion_id(id, sizeof(id))) {
+        openai_chat_request_free(&request);
+        return openai_http_send_error(
+            connection, 500, "could not create completion ID",
+            NULL, "server_error", NULL);
+    }
     if (request.stream) {
         long long created = openai_created_now();
-        int ok = openai_http_send_sse_headers(fd) &&
-                 openai_sse_send_role(fd, request.model, created);
         OpenAISseSink sink = {
-            .fd = fd,
+            .connection = connection,
+            .id = id,
             .model = request.model,
             .created = created,
-            .failed = !ok,
         };
         OpenAIUtf8Sink utf8 = {
             .sink = openai_sse_token_sink,
             .sink_data = &sink,
         };
-        int generated = ok && handler(
+        int generated = handler(
             user_data, &request, openai_utf8_token_sink, &utf8,
             &result, generation_error, sizeof(generation_error));
-        int finalized = generated && openai_utf8_finish(&utf8);
+        int finalized = generated == OPENAI_GENERATE_OK &&
+                        openai_utf8_finish(&utf8);
         openai_utf8_free(&utf8);
-        if (generated && finalized && !sink.failed)
+        if (sink.failed) {
+            openai_chat_request_free(&request);
+            return 0;
+        }
+        if (generated != OPENAI_GENERATE_OK || !finalized) {
+            int client_error = generated == OPENAI_GENERATE_CLIENT_ERROR;
+            int ok;
+            if (!sink.committed) {
+                ok = openai_http_send_error(
+                    connection, client_error ? 400 : 500,
+                    client_error && generation_error[0]
+                        ? generation_error : "generation failed",
+                    NULL, "generation_failed", NULL);
+            } else {
+                ok = openai_sse_send_error(
+                    connection, client_error, generation_error) &&
+                     openai_http_send_all(
+                         connection, "data: [DONE]\n\n", 14);
+            }
+            openai_chat_request_free(&request);
+            return ok;
+        }
+        int ok = 1;
+        if (!sink.committed) {
+            ok = openai_http_send_sse_headers(connection) &&
+                 openai_sse_send_role(
+                     connection, id, request.model, created);
+            sink.committed = ok;
+        }
+        if (ok)
             ok = openai_sse_send_terminal(
-                fd, request.model, created, &result);
-        else
-            ok = 0;
+                connection, id, request.model, created, &result);
         if (ok && request.include_usage)
             ok = openai_sse_send_usage(
-                fd, request.model, created, &result);
-        if (ok) ok = openai_http_send_all(fd, "data: [DONE]\n\n", 14);
+                connection, id, request.model, created, &result);
+        if (ok) ok = openai_http_send_all(
+            connection, "data: [DONE]\n\n", 14);
         openai_chat_request_free(&request);
         return ok;
     }
 
     OpenAIContentBuffer content = {0};
+    OpenAIAccumulationSink accumulation = {
+        .connection = connection,
+        .buffer = &content,
+    };
     OpenAIUtf8Sink utf8 = {
         .sink = openai_content_sink,
-        .sink_data = &content,
+        .sink_data = &accumulation,
     };
     int generated = handler(
         user_data, &request, openai_utf8_token_sink, &utf8,
         &result, generation_error, sizeof(generation_error));
-    int finalized = generated && openai_utf8_finish(&utf8);
+    int finalized = generated == OPENAI_GENERATE_OK &&
+                    openai_utf8_finish(&utf8);
     openai_utf8_free(&utf8);
-    if (!generated || !finalized || content.failed) {
+    if (generated != OPENAI_GENERATE_OK || !finalized || content.failed) {
         free(content.data);
         openai_chat_request_free(&request);
+        int client_error = generated == OPENAI_GENERATE_CLIENT_ERROR;
         return openai_http_send_error(
-            fd, 500,
-            generation_error[0] ? generation_error : "generation failed",
-            "generation_failed", NULL);
+            connection, client_error ? 400 : 500,
+            client_error && generation_error[0]
+                ? generation_error : "generation failed",
+            NULL, "generation_failed", NULL);
     }
     if (!content.data) {
         content.data = openai_strdup("");
         if (!content.data) {
             openai_chat_request_free(&request);
             return openai_http_send_error(
-                fd, 500, "out of memory formatting response",
-                "server_error", NULL);
+                connection, 500, "out of memory formatting response",
+                NULL, "server_error", NULL);
         }
     }
     char *json = NULL;
     size_t json_size = 0;
     int formatted = openai_format_completion_json(
-        OPENAI_HTTP_ID, request.model, content.data, content.size,
+        id, request.model, content.data, content.size,
         &result, &json, &json_size);
     free(content.data);
     openai_chat_request_free(&request);
     if (!formatted)
         return openai_http_send_error(
-            fd, 500, "could not format response", "server_error", NULL);
+            connection, 500, "could not format response",
+            NULL, "server_error", NULL);
     int ok = openai_http_send_response(
-        fd, 200, "application/json", NULL, json, json_size);
+        connection, 200, "application/json", NULL, json, json_size);
     free(json);
     return ok;
 }
@@ -1180,54 +1647,79 @@ static int openai_http_run_completion(
 static int openai_http_handle_connection_internal(
     int fd, const OpenAIHttpConfig *config,
     OpenAIGenerateHandler handler, void *user_data, int wake_fd) {
-    if (fd < 0 || !config || !config->model_name || !config->model_name[0])
+    if (fd < 0 || !config || !config->model_name || !config->model_name[0] ||
+        config->io_timeout_ms < 0 ||
+        (config->api_key && !config->api_key[0]))
         return 0;
 #ifdef SO_NOSIGPIPE
     int enabled = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
 #endif
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return 0;
+    OpenAIHttpConnection connection = {
+        .fd = fd,
+        .wake_fd = wake_fd,
+        .timeout_ms = config->io_timeout_ms > 0
+            ? config->io_timeout_ms : 30000,
+    };
 
     char head[OPENAI_HTTP_HEADER_LIMIT + 1];
     size_t data_size = 0;
     size_t header_size = 0;
     int read_status = openai_http_read_head(
-        fd, wake_fd, head, &data_size, &header_size);
+        &connection, head, &data_size, &header_size);
     if (read_status == 431)
         return openai_http_send_error(
-            fd, 431, "request headers exceed 32 KiB",
-            "headers_too_large", NULL);
+            &connection, 431, "request headers exceed 32 KiB",
+            NULL, "headers_too_large", NULL);
+    if (read_status == 408)
+        return openai_http_send_error(
+            &connection, 408, "request headers timed out",
+            NULL, "request_timeout", NULL);
     if (read_status == 400)
         return openai_http_send_error(
-            fd, 400, "incomplete HTTP headers", "invalid_http", NULL);
+            &connection, 400, "incomplete HTTP headers",
+            NULL, "invalid_http", NULL);
     if (read_status != 1) return 0;
 
     OpenAIHttpRequest request = {0};
     int parsed = openai_http_parse_head(head, header_size, &request);
     if (parsed < 0)
         return openai_http_send_error(
-            fd, 500, "out of memory parsing headers", "server_error", NULL);
+            &connection, 500, "out of memory parsing headers",
+            NULL, "server_error", NULL);
     if (!parsed)
         return openai_http_send_error(
-            fd, 400, "malformed HTTP request", "invalid_http", NULL);
+            &connection, 400, "malformed HTTP request",
+            NULL, "invalid_http", NULL);
 
     int ok = 0;
+    if (request.host_count != 1 || !request.host_nonempty) {
+        ok = openai_http_send_error(
+            &connection, 400,
+            "exactly one non-empty Host header is required",
+            "Host", "invalid_host", NULL);
+        goto done;
+    }
     if (request.has_transfer_encoding) {
         ok = openai_http_send_error(
-            fd, 400, "Transfer-Encoding is not supported",
-            "unsupported_transfer_encoding", NULL);
+            &connection, 400, "Transfer-Encoding is not supported",
+            "Transfer-Encoding", "unsupported_transfer_encoding", NULL);
         goto done;
     }
     if (request.has_content_length &&
         request.content_length > OPENAI_HTTP_BODY_LIMIT) {
         ok = openai_http_send_error(
-            fd, 413, "request body exceeds 8 MiB", "body_too_large", NULL);
+            &connection, 413, "request body exceeds 8 MiB",
+            NULL, "body_too_large", NULL);
         goto done;
     }
     if (strncmp(request.path, "/v1", 3) == 0 &&
         (request.path[3] == 0 || request.path[3] == '/') &&
         !openai_http_authorized(config, &request)) {
         ok = openai_http_send_error(
-            fd, 401, "invalid API key", "invalid_api_key",
+            &connection, 401, "invalid API key", NULL, "invalid_api_key",
             "WWW-Authenticate: Bearer\r\n");
         goto done;
     }
@@ -1235,7 +1727,8 @@ static int openai_http_handle_connection_internal(
     if (strcmp(request.path, "/v1/models") == 0) {
         if (strcmp(request.method, "GET") != 0) {
             ok = openai_http_send_error(
-                fd, 405, "method not allowed", "method_not_allowed",
+                &connection, 405, "method not allowed",
+                NULL, "method_not_allowed",
                 "Allow: GET\r\n");
             goto done;
         }
@@ -1243,11 +1736,12 @@ static int openai_http_handle_connection_internal(
         size_t json_size = 0;
         if (!openai_format_models_json(config->model_name, &json, &json_size)) {
             ok = openai_http_send_error(
-                fd, 500, "could not format response", "server_error", NULL);
+                &connection, 500, "could not format response",
+                NULL, "server_error", NULL);
             goto done;
         }
         ok = openai_http_send_response(
-            fd, 200, "application/json", NULL, json, json_size);
+            &connection, 200, "application/json", NULL, json, json_size);
         free(json);
         goto done;
     }
@@ -1255,48 +1749,54 @@ static int openai_http_handle_connection_internal(
     if (strcmp(request.path, "/v1/chat/completions") == 0) {
         if (strcmp(request.method, "POST") != 0) {
             ok = openai_http_send_error(
-                fd, 405, "method not allowed", "method_not_allowed",
+                &connection, 405, "method not allowed",
+                NULL, "method_not_allowed",
                 "Allow: POST\r\n");
             goto done;
         }
         if (!request.has_content_length) {
             ok = openai_http_send_error(
-                fd, 400, "Content-Length is required",
-                "missing_content_length", NULL);
+                &connection, 400, "Content-Length is required",
+                "Content-Length", "missing_content_length", NULL);
             goto done;
         }
         char *body = NULL;
         int body_status = openai_http_read_body(
-            fd, wake_fd, head, data_size, header_size,
+            &connection, head, data_size, header_size,
             request.content_length, &body);
         if (body_status == 0) {
             ok = openai_http_send_error(
-                fd, 400, "request body is shorter than Content-Length",
-                "incomplete_body", NULL);
+                &connection, 400,
+                "request body is shorter than Content-Length",
+                NULL, "incomplete_body", NULL);
             goto done;
         }
         if (body_status < 0) {
             if (body_status == -1)
                 ok = openai_http_send_error(
-                    fd, 500, "out of memory reading request body",
-                    "server_error", NULL);
+                    &connection, 500, "out of memory reading request body",
+                    NULL, "server_error", NULL);
+            else if (body_status == -3)
+                ok = openai_http_send_error(
+                    &connection, 408, "request body timed out",
+                    NULL, "request_timeout", NULL);
             goto done;
         }
         if (memchr(body, 0, request.content_length)) {
             free(body);
             ok = openai_http_send_error(
-                fd, 400, "request body contains a NUL byte",
-                "invalid_json", NULL);
+                &connection, 400, "request body contains a NUL byte",
+                NULL, "invalid_json", NULL);
             goto done;
         }
         ok = openai_http_run_completion(
-            fd, config, handler, user_data, body);
+            &connection, config, handler, user_data, body);
         free(body);
         goto done;
     }
 
     ok = openai_http_send_error(
-        fd, 404, "route not found", "not_found", NULL);
+        &connection, 404, "route not found", NULL, "not_found", NULL);
 
 done:
     openai_http_request_free(&request);
@@ -1350,7 +1850,9 @@ int openai_http_serve(
     if (error && error_size) error[0] = 0;
     if (!config || !config->host || !config->host[0] ||
         config->port < 1 || config->port > 65535 ||
-        !config->model_name || !config->model_name[0] || !handler) {
+        !config->model_name || !config->model_name[0] || !handler ||
+        config->io_timeout_ms < 0 ||
+        (config->api_key && !config->api_key[0])) {
         openai_error(error, error_size, "invalid HTTP server configuration");
         return 0;
     }

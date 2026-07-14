@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../openai_http.h"
@@ -45,7 +46,14 @@ typedef struct {
     OpenAIGenerateHandler handler;
     void *user_data;
     int result;
+    double elapsed_ms;
 } ServerThread;
+
+typedef struct {
+    char *piece;
+    size_t piece_size;
+    int calls;
+} LargeOutputContext;
 
 static int fake_generate(void *ctx, const OpenAIChatRequest *request,
                          OpenAITokenSink sink, void *sink_data,
@@ -123,10 +131,91 @@ static int disconnect_generate(void *ctx, const OpenAIChatRequest *request,
     return 0;
 }
 
+static int pretoken_client_error_generate(
+    void *ctx, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    FakeContext *fake = ctx;
+    (void)request;
+    (void)sink;
+    (void)sink_data;
+    (void)result;
+    fake->calls++;
+    snprintf(error, error_size, "prompt exceeds model context");
+    return OPENAI_GENERATE_CLIENT_ERROR;
+}
+
+static int posttoken_internal_error_generate(
+    void *ctx, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    FakeContext *fake = ctx;
+    (void)request;
+    (void)result;
+    fake->calls++;
+    CHECK(sink(1, "partial", 7, sink_data));
+    snprintf(error, error_size, "failed to read /sensitive/model/path");
+    return OPENAI_GENERATE_INTERNAL_ERROR;
+}
+
+static int zero_token_generate(
+    void *ctx, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    FakeContext *fake = ctx;
+    (void)request;
+    (void)sink;
+    (void)sink_data;
+    (void)error;
+    (void)error_size;
+    fake->calls++;
+    result->prompt_tokens = 1;
+    result->finish_reason = "stop";
+    return 1;
+}
+
+static int delayed_generate(
+    void *ctx, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    FakeContext *fake = ctx;
+    (void)request;
+    (void)error;
+    (void)error_size;
+    fake->calls++;
+    usleep(80000);
+    CHECK(sink(1, "ok", 2, sink_data));
+    result->prompt_tokens = 1;
+    result->completion_tokens = 1;
+    result->finish_reason = "stop";
+    return 1;
+}
+
+static int large_output_generate(
+    void *ctx, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    LargeOutputContext *large = ctx;
+    (void)request;
+    (void)result;
+    (void)error;
+    (void)error_size;
+    large->calls++;
+    return sink(1, large->piece, large->piece_size, sink_data) ? 1 : 0;
+}
+
+static double monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+}
+
 static void *serve_connection(void *opaque) {
     ServerThread *thread = opaque;
+    double started = monotonic_ms();
     thread->result = openai_http_handle_connection(
         thread->fd, thread->config, thread->handler, thread->user_data);
+    thread->elapsed_ms = monotonic_ms() - started;
     close(thread->fd);
     return NULL;
 }
@@ -218,7 +307,6 @@ static char *exchange(const OpenAIHttpConfig *config,
         pthread_join(worker, NULL);
         return NULL;
     }
-    shutdown(pair[0], SHUT_WR);
     char *response = socket_read_all(pair[0]);
     close(pair[0]);
     pthread_join(worker, NULL);
@@ -329,6 +417,37 @@ static int test_models_and_authentication(void) {
         &open, fake_generate, &fake, invalid, strlen(invalid), NULL);
     CHECK(has_status(response, 200));
     free(response);
+
+    OpenAIHttpConfig empty = keyed;
+    empty.api_key = "";
+    response = exchange(
+        &empty, fake_generate, &fake, valid, strlen(valid), NULL);
+    CHECK(response != NULL && response[0] == 0);
+    free(response);
+    return 0;
+}
+
+static int test_host_header_requirements(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+    };
+    FakeContext fake = {0};
+    const char *requests[] = {
+        "GET /v1/models HTTP/1.1\r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\nHost: \r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\nHost:\t\r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        char *response = exchange(
+            &config, fake_generate, &fake,
+            requests[i], strlen(requests[i]), NULL);
+        CHECK(has_status(response, 400));
+        CHECK(strstr(response, "Host") != NULL);
+        free(response);
+    }
     return 0;
 }
 
@@ -644,6 +763,249 @@ static int test_stream_disconnect_stops_sink(void) {
     return 0;
 }
 
+static int test_non_stream_disconnect_stops_sink(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+    };
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    char request[512];
+    int request_size = snprintf(
+        request, sizeof(request),
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+    CHECK(request_size > 0 && (size_t)request_size < sizeof(request));
+
+    int pair[2] = {-1, -1};
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    CHECK(socket_send_all(pair[0], request, (size_t)request_size));
+    shutdown(pair[0], SHUT_WR);
+    DisconnectContext disconnect = {
+        .client_fd = pair[0],
+        .sink_result = 1,
+    };
+    int handled = openai_http_handle_connection(
+        pair[1], &config, disconnect_generate, &disconnect);
+    close(pair[1]);
+    if (disconnect.client_fd >= 0) close(disconnect.client_fd);
+    CHECK(handled == 0);
+    CHECK(disconnect.calls == 1);
+    CHECK(disconnect.sink_result == 0);
+    return 0;
+}
+
+static int test_generation_error_responses(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+    };
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true}";
+    FakeContext fake = {0};
+    char *response = post_request_handler(
+        &config, pretoken_client_error_generate, &fake, body);
+    CHECK(has_status(response, 400));
+    CHECK(strstr(response, "Content-Type: application/json") != NULL);
+    CHECK(strstr(response, "prompt exceeds model context") != NULL);
+    CHECK(strstr(response, "text/event-stream") == NULL);
+    free(response);
+
+    response = post_request_handler(
+        &config, posttoken_internal_error_generate, &fake, body);
+    CHECK(has_status(response, 200));
+    CHECK(strstr(response, "Content-Type: text/event-stream") != NULL);
+    char *partial = strstr(response, "\"content\":\"partial\"");
+    char *error = strstr(response, "data: {\"error\":");
+    char *done = strstr(response, "data: [DONE]\n\n");
+    CHECK(partial && error && done && partial < error && error < done);
+    CHECK(strstr(response, "/sensitive/model/path") == NULL);
+    free(response);
+
+    response = post_request_handler(&config, zero_token_generate, &fake, body);
+    CHECK(has_status(response, 200));
+    CHECK(strstr(response, "\"role\":\"assistant\"") != NULL);
+    CHECK(strstr(response, "\"finish_reason\":\"stop\"") != NULL);
+    CHECK(strstr(response, "data: [DONE]\n\n") != NULL);
+    free(response);
+    CHECK(fake.calls == 3);
+    return 0;
+}
+
+static int extract_completion_id(
+    const char *response, char *id, size_t id_size) {
+    const char *start = strstr(response, "\"id\":\"chatcmpl-");
+    if (!start) return 0;
+    start += strlen("\"id\":\"");
+    const char *end = strchr(start, '"');
+    if (!end || end == start || (size_t)(end - start) >= id_size) return 0;
+    memcpy(id, start, (size_t)(end - start));
+    id[end - start] = 0;
+    return 1;
+}
+
+static int test_unique_completion_ids(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+    };
+    FakeContext fake = {0};
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    char *first = post_request_handler(&config, fake_generate, &fake, body);
+    char *second = post_request_handler(&config, fake_generate, &fake, body);
+    char first_id[128], second_id[128];
+    CHECK(extract_completion_id(first, first_id, sizeof(first_id)));
+    CHECK(extract_completion_id(second, second_id, sizeof(second_id)));
+    CHECK(strcmp(first_id, second_id) != 0);
+    free(first);
+    free(second);
+
+    body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true}";
+    char *stream = post_request_handler(&config, fake_generate, &fake, body);
+    char stream_id[128], marker[160];
+    CHECK(extract_completion_id(stream, stream_id, sizeof(stream_id)));
+    int marker_size = snprintf(
+        marker, sizeof(marker), "\"id\":\"%s\"", stream_id);
+    CHECK(marker_size > 0 && (size_t)marker_size < sizeof(marker));
+    int occurrences = 0;
+    for (char *found = stream; (found = strstr(found, marker)) != NULL;
+         found += strlen(marker)) occurrences++;
+    CHECK(occurrences == 4);
+    free(stream);
+    return 0;
+}
+
+static char *run_partial_timeout(
+    const char *request, size_t request_size, int timeout_ms) {
+    int pair[2] = {-1, -1};
+    pthread_t worker;
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+        .io_timeout_ms = timeout_ms,
+    };
+    FakeContext fake = {0};
+    ServerThread thread = {
+        .fd = -1,
+        .config = &config,
+        .handler = fake_generate,
+        .user_data = &fake,
+    };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) return NULL;
+    struct timeval receive_timeout = {.tv_sec = 0, .tv_usec = 500000};
+    setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO,
+               &receive_timeout, sizeof(receive_timeout));
+    thread.fd = pair[1];
+    if (pthread_create(&worker, NULL, serve_connection, &thread) != 0) {
+        close(pair[0]);
+        close(pair[1]);
+        return NULL;
+    }
+    if (!socket_send_all(pair[0], request, request_size)) {
+        close(pair[0]);
+        pthread_join(worker, NULL);
+        return NULL;
+    }
+    char *response = socket_read_all(pair[0]);
+    close(pair[0]);
+    pthread_join(worker, NULL);
+    return response;
+}
+
+static int test_io_read_deadlines(void) {
+    const char *slow_header =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Len";
+    char *response = run_partial_timeout(
+        slow_header, strlen(slow_header), 30);
+    CHECK(has_status(response, 408));
+    free(response);
+
+    const char *slow_body =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: 100\r\n\r\n{";
+    response = run_partial_timeout(slow_body, strlen(slow_body), 30);
+    CHECK(has_status(response, 408));
+    free(response);
+    return 0;
+}
+
+static int test_io_write_deadline(void) {
+    int pair[2] = {-1, -1};
+    pthread_t worker;
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    int send_buffer = 4096;
+    setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+        .io_timeout_ms = 30,
+    };
+    LargeOutputContext large = {
+        .piece_size = 4u * 1024u * 1024u,
+    };
+    large.piece = malloc(large.piece_size);
+    CHECK(large.piece != NULL);
+    memset(large.piece, 'x', large.piece_size);
+    ServerThread thread = {
+        .fd = pair[1],
+        .config = &config,
+        .handler = large_output_generate,
+        .user_data = &large,
+    };
+    CHECK(pthread_create(&worker, NULL, serve_connection, &thread) == 0);
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true}";
+    char request[512];
+    int request_size = snprintf(
+        request, sizeof(request),
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+    CHECK(request_size > 0 && (size_t)request_size < sizeof(request));
+    CHECK(socket_send_all(pair[0], request, (size_t)request_size));
+    shutdown(pair[0], SHUT_WR);
+    usleep(200000);
+    close(pair[0]);
+    pthread_join(worker, NULL);
+    free(large.piece);
+    CHECK(large.calls == 1);
+    CHECK(thread.result == 0);
+    CHECK(thread.elapsed_ms >= 20.0 && thread.elapsed_ms < 150.0);
+    return 0;
+}
+
+static int test_generation_is_not_io_timed(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .model_name = "test-model",
+        .io_timeout_ms = 20,
+    };
+    FakeContext fake = {0};
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    char *response = post_request_handler(
+        &config, delayed_generate, &fake, body);
+    CHECK(has_status(response, 200));
+    CHECK(strstr(response, "\"content\":\"ok\"") != NULL);
+    CHECK(fake.calls == 1);
+    free(response);
+    return 0;
+}
+
 static int test_non_streaming_completion(void) {
     OpenAIHttpConfig config = {
         .host = "127.0.0.1",
@@ -802,6 +1164,14 @@ static int test_routes_and_methods(void) {
     CHECK(has_status(response, 405));
     CHECK(strstr(response, "Allow: GET") != NULL);
     free(response);
+
+    const char *extra_body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}],\"verbosity\":\"low\"}";
+    response = post_request(&config, &fake, extra_body);
+    CHECK(has_status(response, 400));
+    CHECK(strstr(response, "\"param\":\"verbosity\"") != NULL);
+    free(response);
     CHECK(fake.calls == 0);
     return 0;
 }
@@ -866,7 +1236,8 @@ static int test_size_limits(void) {
         .model_name = "test-model",
     };
     FakeContext fake = {0};
-    const char *prefix = "GET /v1/models HTTP/1.1\r\nX-Fill: ";
+    const char *prefix =
+        "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nX-Fill: ";
     const char *suffix = "\r\n\r\n";
     size_t prefix_size = strlen(prefix);
     size_t suffix_size = strlen(suffix);
@@ -943,14 +1314,21 @@ static int test_size_limits(void) {
 
 int main(void) {
     CHECK(test_models_and_authentication() == 0);
+    CHECK(test_host_header_requirements() == 0);
     CHECK(test_non_streaming_completion() == 0);
     CHECK(test_streaming_completion() == 0);
     CHECK(test_token_byte_normalization() == 0);
     CHECK(test_finish_reasons() == 0);
     CHECK(test_stream_disconnect_stops_sink() == 0);
+    CHECK(test_non_stream_disconnect_stops_sink() == 0);
+    CHECK(test_generation_error_responses() == 0);
+    CHECK(test_unique_completion_ids() == 0);
     CHECK(test_routes_and_methods() == 0);
     CHECK(test_http_framing_rejections() == 0);
     CHECK(test_size_limits() == 0);
+    CHECK(test_io_read_deadlines() == 0);
+    CHECK(test_io_write_deadline() == 0);
+    CHECK(test_generation_is_not_io_timed() == 0);
     CHECK(test_serve_wakeup_interrupts_partial_requests() == 0);
     puts("OpenAI HTTP socket tests: ok");
     return 0;

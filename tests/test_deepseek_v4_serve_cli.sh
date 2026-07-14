@@ -53,6 +53,14 @@ printf '%s\n' "$auth_config" | grep -Fqx \
 ! printf '%s\n' "$auth_config" | grep -Fq "$secret"
 
 set +e
+empty_auth=$(env -u SNAP -u CHAT -u PROMPT -u SERVE \
+    ./floyd serve --model "$model" --api-key '' 2>&1)
+empty_auth_status=$?
+set -e
+[ "$empty_auth_status" -eq 2 ]
+printf '%s\n' "$empty_auth" | grep -q -- '--api-key must be non-empty'
+
+set +e
 transport_conflict=$(env -u SNAP -u CHAT -u PROMPT -u SERVE \
     ./floyd serve --model "$model" --stdio --host 127.0.0.1 2>&1)
 transport_status=$?

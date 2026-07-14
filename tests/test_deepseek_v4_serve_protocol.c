@@ -152,6 +152,13 @@ static int test_response_and_stdio(void) {
 }
 
 int main(void) {
+    CHECK(deepseek_v4_openai_effective_draft(3, 0.0f) == 3);
+    CHECK(deepseek_v4_openai_effective_draft(3, 0.5f) == 1);
+    CHECK(deepseek_v4_openai_effective_draft(0, 0.5f) == 1);
+    CHECK(deepseek_v4_openai_is_client_error(
+        "prompt exceeds DS4 context"));
+    CHECK(!deepseek_v4_openai_is_client_error(
+        "failed to read /sensitive/model/path"));
     CHECK(test_prompt_request() == 0);
     CHECK(test_messages_request() == 0);
     CHECK(test_invalid_requests() == 0);

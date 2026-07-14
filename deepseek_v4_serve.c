@@ -276,3 +276,17 @@ int deepseek_v4_serve_stdio(
     free(line);
     return status;
 }
+#include <math.h>
+int deepseek_v4_openai_effective_draft(
+    int default_draft, float temperature) {
+    return isfinite(temperature) && temperature > 0.0f ? 1 : default_draft;
+}
+
+int deepseek_v4_openai_is_client_error(const char *error) {
+    return error &&
+        (!strcmp(error, "prompt exceeds DS4 context") ||
+         !strcmp(error, "messages must not be empty") ||
+         !strcmp(error, "messages contain an unsupported role") ||
+         !strcmp(error, "system message must be first") ||
+         !strcmp(error, "last message must have role user"));
+}

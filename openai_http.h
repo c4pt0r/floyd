@@ -31,6 +31,12 @@ typedef struct {
     const char *finish_reason;
 } OpenAIGenerationResult;
 
+typedef enum {
+    OPENAI_GENERATE_INTERNAL_ERROR = 0,
+    OPENAI_GENERATE_OK = 1,
+    OPENAI_GENERATE_CLIENT_ERROR = 2,
+} OpenAIGenerateStatus;
+
 typedef int (*OpenAITokenSink)(int token, const char *piece,
                                size_t piece_size, void *user_data);
 typedef int (*OpenAIGenerateHandler)(
@@ -43,6 +49,7 @@ typedef struct {
     int port;
     const char *api_key;
     const char *model_name;
+    int io_timeout_ms;
 } OpenAIHttpConfig;
 
 int openai_chat_request_parse(

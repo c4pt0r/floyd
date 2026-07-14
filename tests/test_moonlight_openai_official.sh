@@ -14,6 +14,8 @@ PY
 models=$(mktemp -t floyd-moonlight-openai-models.XXXXXX)
 completion=$(mktemp -t floyd-moonlight-openai-completion.XXXXXX)
 stream=$(mktemp -t floyd-moonlight-openai-stream.XXXXXX)
+oversized=$(mktemp -t floyd-moonlight-openai-oversized.XXXXXX)
+oversized_request=$(mktemp -t floyd-moonlight-openai-request.XXXXXX)
 diagnostics=$(mktemp -t floyd-moonlight-openai-stderr.XXXXXX)
 server_pid=
 
@@ -22,7 +24,8 @@ cleanup() {
         kill -TERM "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
     fi
-    rm -f "$models" "$completion" "$stream" "$diagnostics"
+    rm -f "$models" "$completion" "$stream" "$oversized" \
+        "$oversized_request" "$diagnostics"
 }
 trap cleanup EXIT INT TERM
 
@@ -60,8 +63,23 @@ curl --silent --show-error --fail --no-buffer \
     -H 'Content-Type: application/json' \
     --data '{"model":"moonlight-test","messages":[{"role":"system","content":"Answer briefly."},{"role":"user","content":"Say beta."}],"max_tokens":1,"temperature":0,"stream":true,"stream_options":{"include_usage":true}}' \
     "http://127.0.0.1:$port/v1/chat/completions" >"$stream"
+python3 - <<'PY' >"$oversized_request"
+import json
+print(json.dumps({
+    "model": "moonlight-test",
+    "messages": [{"role": "user", "content": "x" * 10000}],
+    "max_tokens": 1,
+    "temperature": 0,
+    "stream": True,
+}))
+PY
+oversized_status=$(curl --silent --show-error --output "$oversized" \
+    --write-out '%{http_code}' -H 'Content-Type: application/json' \
+    --data-binary "@$oversized_request" \
+    "http://127.0.0.1:$port/v1/chat/completions")
+[ "$oversized_status" = 400 ]
 
-python3 - "$models" "$completion" "$stream" <<'PY'
+python3 - "$models" "$completion" "$stream" "$oversized" <<'PY'
 import json
 import sys
 
@@ -93,6 +111,9 @@ events = [
 ]
 assert events[-1] == "[DONE]"
 chunks = [json.loads(event) for event in events[:-1]]
+oversized = json.load(open(sys.argv[4], encoding="utf-8"))
+assert oversized["error"]["type"] == "invalid_request_error"
+assert "too long" in oversized["error"]["message"]
 assert chunks[0]["object"] == "chat.completion.chunk"
 assert chunks[0]["model"] == "moonlight-test"
 assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"

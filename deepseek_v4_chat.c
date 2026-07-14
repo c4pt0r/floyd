@@ -306,18 +306,23 @@ static int serve_openai_request(
         request->message_count, sizeof(*messages));
     if (!messages) {
         snprintf(error, error_size, "out of memory preparing messages");
-        return 0;
+        return OPENAI_GENERATE_INTERNAL_ERROR;
     }
     for (size_t index = 0; index < request->message_count; ++index) {
         messages[index].role = request->messages[index].role;
         messages[index].content = request->messages[index].content;
     }
+    int draft = deepseek_v4_openai_effective_draft(
+        context->options->draft, request->temperature);
     int generated = serve_generate(
         context, messages, request->message_count, request->max_tokens,
-        request->temperature, request->top_p, context->options->draft,
+        request->temperature, request->top_p, draft,
         sink, sink_data, result, error, error_size);
     free(messages);
-    return generated;
+    if (generated) return OPENAI_GENERATE_OK;
+    if (deepseek_v4_openai_is_client_error(error))
+        return OPENAI_GENERATE_CLIENT_ERROR;
+    return OPENAI_GENERATE_INTERNAL_ERROR;
 }
 
 int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
@@ -327,7 +332,8 @@ int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
         (!options->stdio &&
          (!options->host || !options->host[0] || options->port < 1 ||
           options->port > 65535 || !options->served_model_name ||
-          !options->served_model_name[0]))) {
+          !options->served_model_name[0] ||
+          (options->api_key && !options->api_key[0])))) {
         fprintf(stderr, "invalid DeepSeek V4 serve options\n");
         return 2;
     }

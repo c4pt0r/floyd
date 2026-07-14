@@ -50,5 +50,8 @@ int deepseek_v4_serve_write_response(
     FILE *output, const DeepSeekV4ServeResponse *response);
 int deepseek_v4_serve_stdio(
     FILE *input, FILE *output, DeepSeekV4ServeHandler handler, void *user_data);
+int deepseek_v4_openai_effective_draft(
+    int default_draft, float temperature);
+int deepseek_v4_openai_is_client_error(const char *error);
 
 #endif

@@ -388,7 +388,7 @@ static int serve_openai_request(
     if (!append_messages(
             chat, request->messages, request->message_count, max_new_tokens)) {
         snprintf(error, error_size, "Moonlight messages are too long");
-        return 0;
+        return OPENAI_GENERATE_CLIENT_ERROR;
     }
 
     MoonlightStats before = moonlight_session_stats(chat->session);
@@ -397,7 +397,7 @@ static int serve_openai_request(
         chat, context->eos, max_new_tokens,
         request->temperature, request->top_p, sink, sink_data, &stopped_eos,
         error, error_size);
-    if (generated < 0) return 0;
+    if (generated < 0) return OPENAI_GENERATE_INTERNAL_ERROR;
     MoonlightStats after = moonlight_session_stats(chat->session);
 
     result->prompt_tokens = (int)(after.prefill_tokens - before.prefill_tokens);
@@ -409,7 +409,7 @@ static int serve_openai_request(
     result->cache_bytes = 0;
     result->finish_reason = generated >= max_new_tokens && !stopped_eos
         ? "length" : "stop";
-    return 1;
+    return OPENAI_GENERATE_OK;
 }
 
 int moonlight_serve_run(const MoonlightServeOptions *options) {
@@ -418,7 +418,8 @@ int moonlight_serve_run(const MoonlightServeOptions *options) {
         options->max_new_tokens >= options->max_context ||
         !options->host || !options->host[0] || options->port < 1 ||
         options->port > 65535 || !options->served_model_name ||
-        !options->served_model_name[0]) {
+        !options->served_model_name[0] ||
+        (options->api_key && !options->api_key[0])) {
         fprintf(stderr, "invalid Moonlight serve options\n");
         return 2;
     }
