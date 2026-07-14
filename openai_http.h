@@ -38,6 +38,13 @@ typedef int (*OpenAIGenerateHandler)(
     OpenAITokenSink sink, void *sink_data,
     OpenAIGenerationResult *result, char *error, size_t error_size);
 
+typedef struct {
+    const char *host;
+    int port;
+    const char *api_key;
+    const char *model_name;
+} OpenAIHttpConfig;
+
 int openai_chat_request_parse(
     const char *body, const char *served_model, OpenAIChatRequest *request,
     char *error, size_t error_size);
@@ -51,5 +58,13 @@ int openai_format_completion_json(
 int openai_format_error_json(
     const char *message, const char *type, const char *param, const char *code,
     char **json, size_t *json_size);
+
+int openai_http_handle_connection(
+    int fd, const OpenAIHttpConfig *config,
+    OpenAIGenerateHandler handler, void *user_data);
+int openai_http_serve(
+    const OpenAIHttpConfig *config,
+    OpenAIGenerateHandler handler, void *user_data,
+    char *error, size_t error_size);
 
 #endif
