@@ -53,7 +53,7 @@ void openai_chat_request_free(OpenAIChatRequest *request);
 int openai_format_models_json(
     const char *model, char **json, size_t *json_size);
 int openai_format_completion_json(
-    const char *id, const char *model, const char *content,
+    const char *id, const char *model, const char *content, size_t content_size,
     const OpenAIGenerationResult *result, char **json, size_t *json_size);
 int openai_format_error_json(
     const char *message, const char *type, const char *param, const char *code,

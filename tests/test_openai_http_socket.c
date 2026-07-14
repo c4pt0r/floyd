@@ -35,6 +35,11 @@ typedef struct {
 } DisconnectContext;
 
 typedef struct {
+    const char *finish_reason;
+    int calls;
+} FinishContext;
+
+typedef struct {
     int fd;
     const OpenAIHttpConfig *config;
     OpenAIGenerateHandler handler;
@@ -58,6 +63,44 @@ static int fake_generate(void *ctx, const OpenAIChatRequest *request,
     result->cached_tokens = 2;
     result->completion_tokens = 2;
     result->finish_reason = "stop";
+    return 1;
+}
+
+static int utf8_generate(void *ctx, const OpenAIChatRequest *request,
+                         OpenAITokenSink sink, void *sink_data,
+                         OpenAIGenerationResult *result,
+                         char *error, size_t error_size) {
+    FakeContext *fake = ctx;
+    static const char embedded_nul[] = {'A', '\0', 'B'};
+    (void)error;
+    (void)error_size;
+    CHECK(request != NULL);
+    fake->calls++;
+    CHECK(sink(1, "\xe2", 1, sink_data));
+    CHECK(sink(2, "\x82", 1, sink_data));
+    CHECK(sink(3, "\xac", 1, sink_data));
+    CHECK(sink(4, embedded_nul, sizeof(embedded_nul), sink_data));
+    CHECK(sink(5, "\xff", 1, sink_data));
+    CHECK(sink(6, "\xf0\x9f", 2, sink_data));
+    result->prompt_tokens = 3;
+    result->completion_tokens = 6;
+    result->finish_reason = "stop";
+    return 1;
+}
+
+static int finish_generate(void *ctx, const OpenAIChatRequest *request,
+                           OpenAITokenSink sink, void *sink_data,
+                           OpenAIGenerationResult *result,
+                           char *error, size_t error_size) {
+    FinishContext *finish = ctx;
+    (void)request;
+    (void)error;
+    (void)error_size;
+    finish->calls++;
+    CHECK(sink(1, "x", 1, sink_data));
+    result->prompt_tokens = 1;
+    result->completion_tokens = 1;
+    result->finish_reason = finish->finish_reason;
     return 1;
 }
 
@@ -183,8 +226,9 @@ static char *exchange(const OpenAIHttpConfig *config,
     return response;
 }
 
-static char *post_request(const OpenAIHttpConfig *config, FakeContext *fake,
-                          const char *body) {
+static char *post_request_handler(
+    const OpenAIHttpConfig *config, OpenAIGenerateHandler handler,
+    void *user_data, const char *body) {
     size_t capacity = strlen(body) + 256;
     char *request = malloc(capacity);
     if (!request) return NULL;
@@ -201,9 +245,14 @@ static char *post_request(const OpenAIHttpConfig *config, FakeContext *fake,
         return NULL;
     }
     char *response = exchange(
-        config, fake_generate, fake, request, (size_t)size, NULL);
+        config, handler, user_data, request, (size_t)size, NULL);
     free(request);
     return response;
+}
+
+static char *post_request(const OpenAIHttpConfig *config, FakeContext *fake,
+                          const char *body) {
+    return post_request_handler(config, fake_generate, fake, body);
 }
 
 static int has_status(const char *response, int status) {
@@ -651,6 +700,84 @@ static int test_streaming_completion(void) {
     return 0;
 }
 
+static int test_token_byte_normalization(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .api_key = "secret",
+        .model_name = "test-model",
+    };
+    FakeContext fake = {0};
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    char *response = post_request_handler(
+        &config, utf8_generate, &fake, body);
+    CHECK(has_status(response, 200));
+    CHECK(strstr(response,
+                 "\"content\":\"" "\xe2\x82\xac"
+                 "A\\u0000B" "\xef\xbf\xbd\xef\xbf\xbd" "\"") != NULL);
+    CHECK(strstr(response, "\"completion_tokens\":6") != NULL);
+    free(response);
+
+    body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}],"
+        "\"stream\":true,\"stream_options\":{\"include_usage\":true}}";
+    response = post_request_handler(&config, utf8_generate, &fake, body);
+    CHECK(has_status(response, 200));
+    char *euro = strstr(
+        response, "\"content\":\"" "\xe2\x82\xac" "\"");
+    char *nul = strstr(response, "\"content\":\"A\\u0000B\"");
+    static const char replacement_event[] =
+        "\"content\":\"" "\xef\xbf\xbd" "\"";
+    char *replacement = strstr(response, replacement_event);
+    char *final_replacement = replacement
+        ? strstr(replacement + 1, replacement_event) : NULL;
+    char *terminal = strstr(response, "\"finish_reason\":\"stop\"");
+    char *usage = strstr(response, "\"choices\":[],\"usage\"");
+    char *done = strstr(response, "data: [DONE]\n\n");
+    CHECK(euro && nul && replacement && final_replacement &&
+          terminal && usage && done);
+    CHECK(euro < nul && nul < replacement &&
+          replacement < final_replacement && final_replacement < terminal &&
+          terminal < usage && usage < done);
+    CHECK(strstr(usage, "\"completion_tokens\":6") != NULL);
+    CHECK(fake.calls == 2);
+    free(response);
+    return 0;
+}
+
+static int test_finish_reasons(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .api_key = "secret",
+        .model_name = "test-model",
+    };
+    const char *body =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    const char *reasons[] = {"stop", "length"};
+    for (size_t index = 0; index < 2; ++index) {
+        FinishContext finish = {
+            .finish_reason = reasons[index],
+        };
+        char *response = post_request_handler(
+            &config, finish_generate, &finish, body);
+        CHECK(has_status(response, 200));
+        char expected[64];
+        int size = snprintf(
+            expected, sizeof(expected),
+            "\"finish_reason\":\"%s\"", reasons[index]);
+        CHECK(size > 0 && (size_t)size < sizeof(expected));
+        CHECK(strstr(response, expected) != NULL);
+        CHECK(finish.calls == 1);
+        free(response);
+    }
+    return 0;
+}
+
 static int test_routes_and_methods(void) {
     OpenAIHttpConfig config = {
         .host = "127.0.0.1",
@@ -818,6 +945,8 @@ int main(void) {
     CHECK(test_models_and_authentication() == 0);
     CHECK(test_non_streaming_completion() == 0);
     CHECK(test_streaming_completion() == 0);
+    CHECK(test_token_byte_normalization() == 0);
+    CHECK(test_finish_reasons() == 0);
     CHECK(test_stream_disconnect_stops_sink() == 0);
     CHECK(test_routes_and_methods() == 0);
     CHECK(test_http_framing_rejections() == 0);

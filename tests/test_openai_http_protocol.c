@@ -214,7 +214,8 @@ static int test_json_formatters(void) {
 
     json = NULL;
     CHECK(openai_format_completion_json(
-        "chatcmpl-test", "model\"one", "line 1\n\"hello\"", &result,
+        "chatcmpl-test", "model\"one", "line 1\n\"hello\"",
+        strlen("line 1\n\"hello\""), &result,
         &json, &json_size));
     CHECK(json_size == strlen(json));
     CHECK(strstr(json, "\"object\":\"chat.completion\"") != NULL);
@@ -227,6 +228,14 @@ static int test_json_formatters(void) {
     CHECK(strstr(json, "\"total_tokens\":14") != NULL);
     CHECK(strstr(json,
                  "\"prompt_tokens_details\":{\"cached_tokens\":7}") != NULL);
+    free(json);
+
+    json = NULL;
+    static const char nul_content[] = {'A', '\0', 'B'};
+    CHECK(openai_format_completion_json(
+        "chatcmpl-test", "model-one", nul_content, sizeof(nul_content),
+        &result, &json, &json_size));
+    CHECK(strstr(json, "\"content\":\"A\\u0000B\"") != NULL);
     free(json);
 
     json = NULL;

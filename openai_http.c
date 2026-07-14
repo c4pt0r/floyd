@@ -392,9 +392,10 @@ int openai_format_models_json(
 }
 
 int openai_format_completion_json(
-    const char *id, const char *model, const char *content,
+    const char *id, const char *model, const char *content, size_t content_size,
     const OpenAIGenerationResult *result, char **json, size_t *json_size) {
-    if (!id || !model || !content || !result || !json || !json_size) return 0;
+    if (!id || !model || (!content && content_size) ||
+        !result || !json || !json_size) return 0;
     FILE *output = openai_json_stream(json, json_size);
     if (!output) return 0;
     const char *finish_reason = result->finish_reason ? result->finish_reason : "stop";
@@ -407,7 +408,7 @@ int openai_format_completion_json(
              openai_json_string(output, model) &&
              fputs(",\"choices\":[{\"index\":0,\"message\":{"
                    "\"role\":\"assistant\",\"content\":", output) != EOF &&
-             openai_json_string(output, content) &&
+             openai_json_string_n(output, content, content_size) &&
              fputs("},\"finish_reason\":", output) != EOF &&
              openai_json_string(output, finish_reason) &&
              fprintf(output,
@@ -488,6 +489,16 @@ typedef struct {
     const char *model;
     int failed;
 } OpenAISseSink;
+
+typedef struct {
+    OpenAITokenSink sink;
+    void *sink_data;
+    unsigned char pending[4];
+    size_t pending_size;
+    OpenAIContentBuffer output;
+    int last_token;
+    int failed;
+} OpenAIUtf8Sink;
 
 static volatile sig_atomic_t openai_http_stop;
 static int openai_http_wakeup[2] = {-1, -1};
@@ -789,10 +800,8 @@ static int openai_http_read_body(
     return 1;
 }
 
-static int openai_content_sink(
-    int token, const char *piece, size_t piece_size, void *user_data) {
-    (void)token;
-    OpenAIContentBuffer *buffer = user_data;
+static int openai_content_buffer_append(
+    OpenAIContentBuffer *buffer, const char *piece, size_t piece_size) {
     if ((!piece && piece_size) || buffer->failed) return 0;
     if (piece_size > SIZE_MAX - buffer->size - 1) {
         buffer->failed = 1;
@@ -820,6 +829,117 @@ static int openai_content_sink(
     buffer->size += piece_size;
     buffer->data[buffer->size] = 0;
     return 1;
+}
+
+static int openai_content_sink(
+    int token, const char *piece, size_t piece_size, void *user_data) {
+    (void)token;
+    return openai_content_buffer_append(user_data, piece, piece_size);
+}
+
+static int openai_utf8_expected_size(unsigned char lead) {
+    if (lead <= 0x7f) return 1;
+    if (lead >= 0xc2 && lead <= 0xdf) return 2;
+    if (lead >= 0xe0 && lead <= 0xef) return 3;
+    if (lead >= 0xf0 && lead <= 0xf4) return 4;
+    return 0;
+}
+
+static int openai_utf8_continuation_valid(
+    const unsigned char *pending, size_t index, unsigned char byte) {
+    if (byte < 0x80 || byte > 0xbf) return 0;
+    if (index != 1) return 1;
+    unsigned char lead = pending[0];
+    if (lead == 0xe0 && byte < 0xa0) return 0;
+    if (lead == 0xed && byte > 0x9f) return 0;
+    if (lead == 0xf0 && byte < 0x90) return 0;
+    if (lead == 0xf4 && byte > 0x8f) return 0;
+    return 1;
+}
+
+static int openai_utf8_append_replacement(OpenAIUtf8Sink *sink) {
+    static const char replacement[] = "\xef\xbf\xbd";
+    return openai_content_buffer_append(
+        &sink->output, replacement, sizeof(replacement) - 1);
+}
+
+static int openai_utf8_emit(OpenAIUtf8Sink *sink, int token) {
+    if (!sink->output.size) return 1;
+    int ok = sink->sink(
+        token, sink->output.data, sink->output.size, sink->sink_data);
+    sink->output.size = 0;
+    if (sink->output.data) sink->output.data[0] = 0;
+    if (!ok) sink->failed = 1;
+    return ok;
+}
+
+static int openai_utf8_token_sink(
+    int token, const char *piece, size_t piece_size, void *user_data) {
+    OpenAIUtf8Sink *sink = user_data;
+    if (!sink || !sink->sink) return 0;
+    if (sink->failed || sink->output.failed) return 0;
+    if (!piece && piece_size) {
+        sink->failed = 1;
+        return 0;
+    }
+    sink->last_token = token;
+    const unsigned char *bytes = (const unsigned char *)piece;
+    size_t index = 0;
+    while (index < piece_size) {
+        unsigned char byte = bytes[index++];
+        if (!sink->pending_size) {
+            int expected = openai_utf8_expected_size(byte);
+            if (expected == 1) {
+                char value = (char)byte;
+                if (!openai_content_buffer_append(&sink->output, &value, 1))
+                    goto fail;
+            } else if (expected > 1) {
+                sink->pending[sink->pending_size++] = byte;
+            } else if (!openai_utf8_append_replacement(sink)) {
+                goto fail;
+            }
+            continue;
+        }
+
+        if (!openai_utf8_continuation_valid(
+                sink->pending, sink->pending_size, byte)) {
+            if (!openai_utf8_append_replacement(sink)) goto fail;
+            sink->pending_size = 0;
+            index--;
+            continue;
+        }
+        sink->pending[sink->pending_size++] = byte;
+        int expected = openai_utf8_expected_size(sink->pending[0]);
+        if (sink->pending_size == (size_t)expected) {
+            if (!openai_content_buffer_append(
+                    &sink->output, (const char *)sink->pending,
+                    sink->pending_size)) goto fail;
+            sink->pending_size = 0;
+        }
+    }
+    return openai_utf8_emit(sink, token);
+
+fail:
+    sink->failed = 1;
+    return 0;
+}
+
+static int openai_utf8_finish(OpenAIUtf8Sink *sink) {
+    if (!sink || sink->failed || sink->output.failed) return 0;
+    if (sink->pending_size) {
+        if (!openai_utf8_append_replacement(sink)) {
+            sink->failed = 1;
+            return 0;
+        }
+        sink->pending_size = 0;
+    }
+    return openai_utf8_emit(sink, sink->last_token);
+}
+
+static void openai_utf8_free(OpenAIUtf8Sink *sink) {
+    if (!sink) return;
+    free(sink->output.data);
+    sink->output.data = NULL;
 }
 
 static FILE *openai_sse_event_stream(char **event, size_t *event_size) {
@@ -969,10 +1089,16 @@ static int openai_http_run_completion(
         int ok = openai_http_send_sse_headers(fd) &&
                  openai_sse_send_role(fd, request.model);
         OpenAISseSink sink = {.fd = fd, .model = request.model, .failed = !ok};
+        OpenAIUtf8Sink utf8 = {
+            .sink = openai_sse_token_sink,
+            .sink_data = &sink,
+        };
         int generated = ok && handler(
-            user_data, &request, openai_sse_token_sink, &sink,
+            user_data, &request, openai_utf8_token_sink, &utf8,
             &result, generation_error, sizeof(generation_error));
-        if (generated && !sink.failed)
+        int finalized = generated && openai_utf8_finish(&utf8);
+        openai_utf8_free(&utf8);
+        if (generated && finalized && !sink.failed)
             ok = openai_sse_send_terminal(fd, request.model, &result);
         else
             ok = 0;
@@ -984,10 +1110,16 @@ static int openai_http_run_completion(
     }
 
     OpenAIContentBuffer content = {0};
+    OpenAIUtf8Sink utf8 = {
+        .sink = openai_content_sink,
+        .sink_data = &content,
+    };
     int generated = handler(
-        user_data, &request, openai_content_sink, &content,
+        user_data, &request, openai_utf8_token_sink, &utf8,
         &result, generation_error, sizeof(generation_error));
-    if (!generated || content.failed) {
+    int finalized = generated && openai_utf8_finish(&utf8);
+    openai_utf8_free(&utf8);
+    if (!generated || !finalized || content.failed) {
         free(content.data);
         openai_chat_request_free(&request);
         return openai_http_send_error(
@@ -1007,7 +1139,7 @@ static int openai_http_run_completion(
     char *json = NULL;
     size_t json_size = 0;
     int formatted = openai_format_completion_json(
-        OPENAI_HTTP_ID, request.model, content.data,
+        OPENAI_HTTP_ID, request.model, content.data, content.size,
         &result, &json, &json_size);
     free(content.data);
     openai_chat_request_free(&request);
