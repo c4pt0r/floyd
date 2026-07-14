@@ -2,9 +2,11 @@
 #include "openai_http.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -488,34 +490,36 @@ typedef struct {
 } OpenAISseSink;
 
 static volatile sig_atomic_t openai_http_stop;
-static volatile sig_atomic_t openai_http_listen_fd = -1;
-static volatile sig_atomic_t openai_http_active_fd = -1;
+static volatile sig_atomic_t openai_http_wakeup_fd = -1;
 
-static int openai_http_block_termination(sigset_t *previous) {
-    sigset_t signals;
-    sigemptyset(&signals);
-    sigaddset(&signals, SIGINT);
-    sigaddset(&signals, SIGTERM);
-    return sigprocmask(SIG_BLOCK, &signals, previous) == 0;
+static void openai_http_drain_wakeup(int fd) {
+    char buffer[64];
+    while (read(fd, buffer, sizeof(buffer)) > 0) {}
 }
 
-static int openai_http_track_active(int fd) {
-    sigset_t previous;
-    if (!openai_http_block_termination(&previous)) return 0;
-    int tracked = !openai_http_stop;
-    if (tracked) openai_http_active_fd = fd;
-    sigprocmask(SIG_SETMASK, &previous, NULL);
-    return tracked;
-}
-
-static int openai_http_take_fd(
-    volatile sig_atomic_t *tracked_fd, int expected) {
-    sigset_t previous;
-    if (!openai_http_block_termination(&previous)) return 0;
-    int owned = (int)*tracked_fd == expected;
-    if (owned) *tracked_fd = -1;
-    sigprocmask(SIG_SETMASK, &previous, NULL);
-    return owned;
+static int openai_http_wait_readable(int fd, int wake_fd) {
+    if (wake_fd < 0) return 1;
+    struct pollfd fds[2] = {
+        {.fd = fd, .events = POLLIN},
+        {.fd = wake_fd, .events = POLLIN},
+    };
+    for (;;) {
+        if (openai_http_stop) return 0;
+        int polled = poll(fds, 2, -1);
+        if (polled < 0) {
+            if (errno == EINTR) {
+                if (openai_http_stop) return 0;
+                continue;
+            }
+            return 0;
+        }
+        if (fds[1].revents) {
+            openai_http_drain_wakeup(wake_fd);
+            return 0;
+        }
+        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+            return 1;
+    }
 }
 
 static int openai_http_send_all(int fd, const void *data, size_t size) {
@@ -597,7 +601,8 @@ static size_t openai_http_header_end(const char *data, size_t size) {
 }
 
 static int openai_http_read_head(
-    int fd, char *data, size_t *data_size, size_t *header_size) {
+    int fd, int wake_fd, char *data,
+    size_t *data_size, size_t *header_size) {
     *data_size = 0;
     *header_size = 0;
     for (;;) {
@@ -608,6 +613,7 @@ static int openai_http_read_head(
             return 1;
         }
         if (*data_size > OPENAI_HTTP_HEADER_LIMIT) return 431;
+        if (!openai_http_wait_readable(fd, wake_fd)) return 0;
         size_t remaining = OPENAI_HTTP_HEADER_LIMIT + 1 - *data_size;
         ssize_t received = recv(fd, data + *data_size, remaining, 0);
         if (received > 0) {
@@ -615,10 +621,11 @@ static int openai_http_read_head(
             continue;
         }
         if (received < 0 && errno == EINTR) {
-            if (openai_http_stop) return 0;
+            if (wake_fd >= 0 && openai_http_stop) return 0;
             continue;
         }
-        if (received == 0) return openai_http_stop ? 0 : 400;
+        if (received == 0)
+            return wake_fd >= 0 && openai_http_stop ? 0 : 400;
         return 0;
     }
 }
@@ -740,7 +747,8 @@ static int openai_http_authorized(
 }
 
 static int openai_http_read_body(
-    int fd, const char *head, size_t data_size, size_t header_size,
+    int fd, int wake_fd,
+    const char *head, size_t data_size, size_t header_size,
     size_t body_size, char **body) {
     *body = malloc(body_size + 1);
     if (!*body) return -1;
@@ -749,13 +757,18 @@ static int openai_http_read_body(
     if (buffered) memcpy(*body, head + header_size, buffered);
     size_t offset = buffered;
     while (offset < body_size) {
+        if (!openai_http_wait_readable(fd, wake_fd)) {
+            free(*body);
+            *body = NULL;
+            return -2;
+        }
         ssize_t received = recv(fd, *body + offset, body_size - offset, 0);
         if (received > 0) {
             offset += (size_t)received;
             continue;
         }
         if (received < 0 && errno == EINTR) {
-            if (openai_http_stop) {
+            if (wake_fd >= 0 && openai_http_stop) {
                 free(*body);
                 *body = NULL;
                 return -2;
@@ -765,7 +778,7 @@ static int openai_http_read_body(
         if (received == 0) {
             free(*body);
             *body = NULL;
-            return openai_http_stop ? -2 : 0;
+            return wake_fd >= 0 && openai_http_stop ? -2 : 0;
         }
         free(*body);
         *body = NULL;
@@ -1006,9 +1019,9 @@ static int openai_http_run_completion(
     return ok;
 }
 
-int openai_http_handle_connection(
+static int openai_http_handle_connection_internal(
     int fd, const OpenAIHttpConfig *config,
-    OpenAIGenerateHandler handler, void *user_data) {
+    OpenAIGenerateHandler handler, void *user_data, int wake_fd) {
     if (fd < 0 || !config || !config->model_name || !config->model_name[0])
         return 0;
 #ifdef SO_NOSIGPIPE
@@ -1020,7 +1033,7 @@ int openai_http_handle_connection(
     size_t data_size = 0;
     size_t header_size = 0;
     int read_status = openai_http_read_head(
-        fd, head, &data_size, &header_size);
+        fd, wake_fd, head, &data_size, &header_size);
     if (read_status == 431)
         return openai_http_send_error(
             fd, 431, "request headers exceed 32 KiB",
@@ -1096,7 +1109,8 @@ int openai_http_handle_connection(
         }
         char *body = NULL;
         int body_status = openai_http_read_body(
-            fd, head, data_size, header_size, request.content_length, &body);
+            fd, wake_fd, head, data_size, header_size,
+            request.content_length, &body);
         if (body_status == 0) {
             ok = openai_http_send_error(
                 fd, 400, "request body is shorter than Content-Length",
@@ -1131,15 +1145,42 @@ done:
     return ok;
 }
 
+int openai_http_handle_connection(
+    int fd, const OpenAIHttpConfig *config,
+    OpenAIGenerateHandler handler, void *user_data) {
+    return openai_http_handle_connection_internal(
+        fd, config, handler, user_data, -1);
+}
+
 static void openai_http_signal_handler(int signal_number) {
     (void)signal_number;
+    int saved_errno = errno;
     openai_http_stop = 1;
-    int fd = (int)openai_http_active_fd;
-    openai_http_active_fd = -1;
-    if (fd >= 0) close(fd);
-    fd = (int)openai_http_listen_fd;
-    openai_http_listen_fd = -1;
-    if (fd >= 0) close(fd);
+    int fd = (int)openai_http_wakeup_fd;
+    if (fd >= 0) {
+        const unsigned char byte = 1;
+        (void)write(fd, &byte, 1);
+    }
+    errno = saved_errno;
+}
+
+static int openai_http_configure_pipe(int pipe_fds[2]) {
+    if (pipe(pipe_fds) != 0) return 0;
+    for (int i = 0; i < 2; i++) {
+        int status_flags = fcntl(pipe_fds[i], F_GETFL);
+        int descriptor_flags = fcntl(pipe_fds[i], F_GETFD);
+        if (status_flags < 0 || descriptor_flags < 0 ||
+            fcntl(pipe_fds[i], F_SETFL, status_flags | O_NONBLOCK) != 0 ||
+            fcntl(pipe_fds[i], F_SETFD,
+                  descriptor_flags | FD_CLOEXEC) != 0) {
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            pipe_fds[0] = -1;
+            pipe_fds[1] = -1;
+            return 0;
+        }
+    }
+    return 1;
 }
 
 int openai_http_serve(
@@ -1189,6 +1230,13 @@ int openai_http_serve(
         return 0;
     }
 
+    int wakeup[2] = {-1, -1};
+    if (!openai_http_configure_pipe(wakeup)) {
+        close(listener);
+        openai_error(error, error_size, "could not create HTTP wakeup pipe");
+        return 0;
+    }
+
     struct sigaction action;
     struct sigaction old_int;
     struct sigaction old_term;
@@ -1198,24 +1246,51 @@ int openai_http_serve(
     sigaddset(&action.sa_mask, SIGINT);
     sigaddset(&action.sa_mask, SIGTERM);
     openai_http_stop = 0;
-    openai_http_listen_fd = listener;
-    openai_http_active_fd = -1;
+    openai_http_wakeup_fd = wakeup[1];
     if (sigaction(SIGINT, &action, &old_int) != 0) {
-        openai_http_listen_fd = -1;
+        openai_http_wakeup_fd = -1;
+        close(wakeup[0]);
+        close(wakeup[1]);
         close(listener);
         openai_error(error, error_size, "could not install signal handlers");
         return 0;
     }
     if (sigaction(SIGTERM, &action, &old_term) != 0) {
-        int owned = openai_http_take_fd(
-            &openai_http_listen_fd, listener);
+        openai_http_wakeup_fd = -1;
         sigaction(SIGINT, &old_int, NULL);
-        if (owned) close(listener);
+        openai_http_drain_wakeup(wakeup[0]);
+        close(wakeup[0]);
+        close(wakeup[1]);
+        close(listener);
         openai_error(error, error_size, "could not install signal handlers");
         return 0;
     }
     int ok = 1;
+    struct pollfd fds[2] = {
+        {.fd = listener, .events = POLLIN},
+        {.fd = wakeup[0], .events = POLLIN},
+    };
     while (!openai_http_stop) {
+        int polled = poll(fds, 2, -1);
+        if (polled < 0) {
+            if (errno == EINTR) {
+                if (openai_http_stop) break;
+                continue;
+            }
+            openai_error(error, error_size, "could not poll HTTP listener");
+            ok = 0;
+            break;
+        }
+        if (fds[1].revents) {
+            openai_http_drain_wakeup(wakeup[0]);
+            if (openai_http_stop) break;
+        }
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            openai_error(error, error_size, "HTTP listen socket failed");
+            ok = 0;
+            break;
+        }
+        if (!(fds[0].revents & POLLIN)) continue;
         int connection = accept(listener, NULL, NULL);
         if (connection < 0) {
             if (errno == EINTR) {
@@ -1227,18 +1302,17 @@ int openai_http_serve(
             ok = 0;
             break;
         }
-        if (!openai_http_track_active(connection)) {
-            close(connection);
-            break;
-        }
-        openai_http_handle_connection(
-            connection, config, handler, user_data);
-        if (openai_http_take_fd(&openai_http_active_fd, connection))
-            close(connection);
+        openai_http_handle_connection_internal(
+            connection, config, handler, user_data, wakeup[0]);
+        close(connection);
     }
 
-    if (openai_http_take_fd(&openai_http_listen_fd, listener)) close(listener);
+    openai_http_wakeup_fd = -1;
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGTERM, &old_term, NULL);
+    openai_http_drain_wakeup(wakeup[0]);
+    close(wakeup[0]);
+    close(wakeup[1]);
+    close(listener);
     return ok;
 }

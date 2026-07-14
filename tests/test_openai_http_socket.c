@@ -336,6 +336,17 @@ static int wait_for_child(pid_t child, int *status) {
     return 0;
 }
 
+static void *receive_termination_signals(void *unused) {
+    (void)unused;
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    pthread_sigmask(SIG_UNBLOCK, &signals, NULL);
+    for (;;) pause();
+    return NULL;
+}
+
 static int run_serve_shutdown_case(
     const char *partial, size_t partial_size, int termination_signal) {
     int port = reserve_loopback_port();
@@ -343,6 +354,16 @@ static int run_serve_shutdown_case(
     pid_t child = fork();
     if (child < 0) return 0;
     if (child == 0) {
+        sigset_t signals;
+        sigemptyset(&signals);
+        sigaddset(&signals, SIGINT);
+        sigaddset(&signals, SIGTERM);
+        if (pthread_sigmask(SIG_BLOCK, &signals, NULL) != 0) _exit(3);
+        pthread_t signal_thread;
+        if (pthread_create(
+                &signal_thread, NULL,
+                receive_termination_signals, NULL) != 0) _exit(3);
+        pthread_detach(signal_thread);
         OpenAIHttpConfig config = {
             .host = "127.0.0.1",
             .port = port,
@@ -400,7 +421,7 @@ static int run_serve_shutdown_case(
     return ok;
 }
 
-static int test_serve_shutdown_interrupts_partial_requests(void) {
+static int test_serve_wakeup_interrupts_partial_requests(void) {
     const char *partial_header =
         "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Len";
@@ -683,7 +704,7 @@ int main(void) {
     CHECK(test_routes_and_methods() == 0);
     CHECK(test_http_framing_rejections() == 0);
     CHECK(test_size_limits() == 0);
-    CHECK(test_serve_shutdown_interrupts_partial_requests() == 0);
+    CHECK(test_serve_wakeup_interrupts_partial_requests() == 0);
     puts("OpenAI HTTP socket tests: ok");
     return 0;
 }
