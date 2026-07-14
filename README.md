@@ -19,7 +19,7 @@ server.
 brew install libomp cmake ninja xxd
 python3 -m venv .venv
 .venv/bin/pip install -U torch transformers safetensors numpy tiktoken \
-  blobfile "huggingface_hub[cli]"
+  blobfile openai "huggingface_hub[cli]"
 make
 ```
 
@@ -90,6 +90,77 @@ Standard prepared filenames are discovered automatically:
 Use `--ds4-model FILE` and `--ds4-support FILE` only when the prepared files
 are outside the standard directory. `--draft` applies to DeepSeek V4; Moonlight
 has no speculative head and rejects a nonzero value.
+
+## OpenAI-Compatible HTTP Server
+
+`serve` keeps one model resident and implements `GET /v1/models` and
+`POST /v1/chat/completions`. This starts an unauthenticated local Moonlight
+server on the default `127.0.0.1:8080` address:
+
+```bash
+./floyd serve --model models/moonlight_i8 \
+  --served-model-name moonlight --ctx 4096 --ngen 512
+```
+
+To accept connections beyond the local machine, require an API key. Never bind
+to `0.0.0.0` without `--api-key`:
+
+```bash
+export FLOYD_API_KEY='replace-with-a-secret'
+./floyd serve --model models/moonlight_i8 \
+  --host 0.0.0.0 --port 8080 --api-key "$FLOYD_API_KEY" \
+  --served-model-name moonlight --ctx 4096 --ngen 512
+```
+
+Send a non-streaming request with curl:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $FLOYD_API_KEY" \
+  -d '{"model":"moonlight","messages":[{"role":"user","content":"Reply OK"}],"max_tokens":32,"temperature":0}'
+```
+
+The official OpenAI Python SDK works by changing its base URL. Streaming usage
+is returned when `stream_options.include_usage` is enabled:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key=os.environ["FLOYD_API_KEY"],
+)
+reply = client.chat.completions.create(
+    model="moonlight",
+    messages=[{"role": "user", "content": "Reply OK"}],
+    max_tokens=32,
+    temperature=0,
+)
+print(reply.choices[0].message.content)
+
+stream = client.chat.completions.create(
+    model="moonlight",
+    messages=[{"role": "user", "content": "Reply OK"}],
+    max_tokens=32,
+    temperature=0,
+    stream=True,
+    stream_options={"include_usage": True},
+)
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+    if chunk.usage:
+        print(f"\nusage: {chunk.usage}")
+```
+
+DeepSeek V4 uses the same byte-budgeted prefix snapshot LRU in HTTP and stdio
+mode; set `--prefix-cache-mb 256` and inspect
+`usage.prompt_tokens_details.cached_tokens` for reuse. Independent Moonlight
+HTTP requests reset the session, so cross-request `cached_tokens` is always
+zero. Model weights stay resident, while `--ctx` controls KV and scratch
+allocation; lower `--ctx` and the DS4 prefix-cache budget when memory is tight.
 
 ## Agent Stdio Server
 
