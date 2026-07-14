@@ -336,7 +336,8 @@ static int wait_for_child(pid_t child, int *status) {
     return 0;
 }
 
-static int run_serve_shutdown_case(const char *partial, size_t partial_size) {
+static int run_serve_shutdown_case(
+    const char *partial, size_t partial_size, int termination_signal) {
     int port = reserve_loopback_port();
     if (port < 0) return 0;
     pid_t child = fork();
@@ -357,6 +358,14 @@ static int run_serve_shutdown_case(const char *partial, size_t partial_size) {
 
     int first = connect_loopback(child, port);
     if (first < 0) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 0;
+    }
+    struct timeval response_deadline = {.tv_sec = 2, .tv_usec = 0};
+    if (setsockopt(first, SOL_SOCKET, SO_RCVTIMEO,
+                   &response_deadline, sizeof(response_deadline)) != 0) {
+        close(first);
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
         return 0;
@@ -383,7 +392,7 @@ static int run_serve_shutdown_case(const char *partial, size_t partial_size) {
         return 0;
     }
     usleep(100000);
-    kill(child, SIGTERM);
+    kill(child, termination_signal);
     int status = 0;
     ok = wait_for_child(child, &status) &&
          WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -396,12 +405,13 @@ static int test_serve_shutdown_interrupts_partial_requests(void) {
         "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Len";
     CHECK(run_serve_shutdown_case(
-        partial_header, strlen(partial_header)));
+        partial_header, strlen(partial_header), SIGINT));
 
     const char *partial_body =
         "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: 100\r\n\r\n{";
-    CHECK(run_serve_shutdown_case(partial_body, strlen(partial_body)));
+    CHECK(run_serve_shutdown_case(
+        partial_body, strlen(partial_body), SIGTERM));
     return 0;
 }
 

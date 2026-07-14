@@ -491,6 +491,33 @@ static volatile sig_atomic_t openai_http_stop;
 static volatile sig_atomic_t openai_http_listen_fd = -1;
 static volatile sig_atomic_t openai_http_active_fd = -1;
 
+static int openai_http_block_termination(sigset_t *previous) {
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    return sigprocmask(SIG_BLOCK, &signals, previous) == 0;
+}
+
+static int openai_http_track_active(int fd) {
+    sigset_t previous;
+    if (!openai_http_block_termination(&previous)) return 0;
+    int tracked = !openai_http_stop;
+    if (tracked) openai_http_active_fd = fd;
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return tracked;
+}
+
+static int openai_http_take_fd(
+    volatile sig_atomic_t *tracked_fd, int expected) {
+    sigset_t previous;
+    if (!openai_http_block_termination(&previous)) return 0;
+    int owned = (int)*tracked_fd == expected;
+    if (owned) *tracked_fd = -1;
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return owned;
+}
+
 static int openai_http_send_all(int fd, const void *data, size_t size) {
     const char *bytes = data;
     size_t offset = 0;
@@ -591,7 +618,7 @@ static int openai_http_read_head(
             if (openai_http_stop) return 0;
             continue;
         }
-        if (received == 0) return 400;
+        if (received == 0) return openai_http_stop ? 0 : 400;
         return 0;
     }
 }
@@ -738,7 +765,7 @@ static int openai_http_read_body(
         if (received == 0) {
             free(*body);
             *body = NULL;
-            return 0;
+            return openai_http_stop ? -2 : 0;
         }
         free(*body);
         *body = NULL;
@@ -1107,11 +1134,12 @@ done:
 static void openai_http_signal_handler(int signal_number) {
     (void)signal_number;
     openai_http_stop = 1;
-    int fd = (int)openai_http_listen_fd;
+    int fd = (int)openai_http_active_fd;
+    openai_http_active_fd = -1;
+    if (fd >= 0) close(fd);
+    fd = (int)openai_http_listen_fd;
     openai_http_listen_fd = -1;
     if (fd >= 0) close(fd);
-    fd = (int)openai_http_active_fd;
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
 }
 
 int openai_http_serve(
@@ -1167,6 +1195,8 @@ int openai_http_serve(
     memset(&action, 0, sizeof(action));
     action.sa_handler = openai_http_signal_handler;
     sigemptyset(&action.sa_mask);
+    sigaddset(&action.sa_mask, SIGINT);
+    sigaddset(&action.sa_mask, SIGTERM);
     openai_http_stop = 0;
     openai_http_listen_fd = listener;
     openai_http_active_fd = -1;
@@ -1177,10 +1207,10 @@ int openai_http_serve(
         return 0;
     }
     if (sigaction(SIGTERM, &action, &old_term) != 0) {
+        int owned = openai_http_take_fd(
+            &openai_http_listen_fd, listener);
         sigaction(SIGINT, &old_int, NULL);
-        int active_listener = (int)openai_http_listen_fd;
-        openai_http_listen_fd = -1;
-        if (active_listener >= 0) close(active_listener);
+        if (owned) close(listener);
         openai_error(error, error_size, "could not install signal handlers");
         return 0;
     }
@@ -1197,23 +1227,17 @@ int openai_http_serve(
             ok = 0;
             break;
         }
-        openai_http_active_fd = connection;
-        if (openai_http_stop) {
-            openai_http_active_fd = -1;
-            shutdown(connection, SHUT_RDWR);
+        if (!openai_http_track_active(connection)) {
             close(connection);
             break;
         }
         openai_http_handle_connection(
             connection, config, handler, user_data);
-        openai_http_active_fd = -1;
-        close(connection);
+        if (openai_http_take_fd(&openai_http_active_fd, connection))
+            close(connection);
     }
 
-    openai_http_active_fd = -1;
-    int active_listener = (int)openai_http_listen_fd;
-    openai_http_listen_fd = -1;
-    if (active_listener >= 0) close(active_listener);
+    if (openai_http_take_fd(&openai_http_listen_fd, listener)) close(listener);
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGTERM, &old_term, NULL);
     return ok;
