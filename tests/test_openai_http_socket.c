@@ -1,10 +1,14 @@
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../openai_http.h"
@@ -245,12 +249,159 @@ static int test_models_and_authentication(void) {
     CHECK(has_status(response, 401));
     free(response);
 
+    const char *invalid_values[] = {
+        "bearer secret",
+        "BEARER secret",
+        "Bearer  secret",
+        "Bearer secret ",
+        " Bearer secret",
+        "\tBearer secret",
+        "Bearer secret-suffix",
+        "prefix-Bearer secret",
+    };
+    for (size_t i = 0;
+         i < sizeof(invalid_values) / sizeof(invalid_values[0]); i++) {
+        char request[256];
+        int request_size = snprintf(
+            request, sizeof(request),
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n"
+            "Authorization: %s\r\n\r\n", invalid_values[i]);
+        CHECK(request_size > 0 && (size_t)request_size < sizeof(request));
+        response = exchange(
+            &keyed, fake_generate, &fake,
+            request, (size_t)request_size, NULL);
+        CHECK(has_status(response, 401));
+        free(response);
+    }
+
     OpenAIHttpConfig open = keyed;
     open.api_key = NULL;
     response = exchange(
         &open, fake_generate, &fake, invalid, strlen(invalid), NULL);
     CHECK(has_status(response, 200));
     free(response);
+    return 0;
+}
+
+static int reserve_loopback_port(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t address_size = sizeof(address);
+    if (getsockname(fd, (struct sockaddr *)&address, &address_size) != 0) {
+        close(fd);
+        return -1;
+    }
+    int port = ntohs(address.sin_port);
+    close(fd);
+    return port;
+}
+
+static int connect_loopback(pid_t child, int port) {
+    for (int attempt = 0; attempt < 200; attempt++) {
+        int status = 0;
+        if (waitpid(child, &status, WNOHANG) == child) return -1;
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons((uint16_t)port);
+        if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0)
+            return fd;
+        close(fd);
+        usleep(10000);
+    }
+    return -1;
+}
+
+static int wait_for_child(pid_t child, int *status) {
+    for (int attempt = 0; attempt < 200; attempt++) {
+        pid_t waited = waitpid(child, status, WNOHANG);
+        if (waited == child) return 1;
+        if (waited < 0) return 0;
+        usleep(10000);
+    }
+    kill(child, SIGKILL);
+    waitpid(child, status, 0);
+    return 0;
+}
+
+static int run_serve_shutdown_case(const char *partial, size_t partial_size) {
+    int port = reserve_loopback_port();
+    if (port < 0) return 0;
+    pid_t child = fork();
+    if (child < 0) return 0;
+    if (child == 0) {
+        OpenAIHttpConfig config = {
+            .host = "127.0.0.1",
+            .port = port,
+            .api_key = NULL,
+            .model_name = "test-model",
+        };
+        FakeContext fake = {0};
+        char error[256] = {0};
+        int ok = openai_http_serve(
+            &config, fake_generate, &fake, error, sizeof(error));
+        _exit(ok ? 0 : 2);
+    }
+
+    int first = connect_loopback(child, port);
+    if (first < 0) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 0;
+    }
+    const char *models =
+        "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    int ok = socket_send_all(first, models, strlen(models));
+    shutdown(first, SHUT_WR);
+    char *response = ok ? socket_read_all(first) : NULL;
+    close(first);
+    ok = has_status(response, 200);
+    free(response);
+    if (!ok) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 0;
+    }
+
+    int blocked = connect_loopback(child, port);
+    if (blocked < 0 || !socket_send_all(blocked, partial, partial_size)) {
+        if (blocked >= 0) close(blocked);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 0;
+    }
+    usleep(100000);
+    kill(child, SIGTERM);
+    int status = 0;
+    ok = wait_for_child(child, &status) &&
+         WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    close(blocked);
+    return ok;
+}
+
+static int test_serve_shutdown_interrupts_partial_requests(void) {
+    const char *partial_header =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Len";
+    CHECK(run_serve_shutdown_case(
+        partial_header, strlen(partial_header)));
+
+    const char *partial_body =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: 100\r\n\r\n{";
+    CHECK(run_serve_shutdown_case(partial_body, strlen(partial_body)));
     return 0;
 }
 
@@ -466,18 +617,51 @@ static int test_size_limits(void) {
     CHECK(has_status(response, 431));
     free(response);
 
-    char body_limit[256];
-    int body_limit_size = snprintf(
-        body_limit, sizeof(body_limit),
+    static const char body_prefix[] =
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Hi\"}]}";
+    char body_header[256];
+    int body_header_size = snprintf(
+        body_header, sizeof(body_header),
         "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
-        "Content-Length: %zu\r\n\r\n", (size_t)BODY_LIMIT + 1);
-    CHECK(body_limit_size > 0 && (size_t)body_limit_size < sizeof(body_limit));
+        "Content-Length: %zu\r\n\r\n", (size_t)BODY_LIMIT);
+    CHECK(body_header_size > 0 &&
+          (size_t)body_header_size < sizeof(body_header));
+    char *body = malloc(BODY_LIMIT);
+    CHECK(body != NULL);
+    memcpy(body, body_prefix, sizeof(body_prefix) - 1);
+    memset(body + sizeof(body_prefix) - 1, ' ',
+           BODY_LIMIT - (sizeof(body_prefix) - 1));
+    size_t at_body_limit_size = (size_t)body_header_size + BODY_LIMIT;
+    char *at_body_limit = malloc(at_body_limit_size);
+    if (!at_body_limit) {
+        free(body);
+        CHECK(at_body_limit != NULL);
+    }
+    memcpy(at_body_limit, body_header, (size_t)body_header_size);
+    memcpy(at_body_limit + body_header_size, body, BODY_LIMIT);
+    free(body);
     response = exchange(
         &config, fake_generate, &fake,
-        body_limit, (size_t)body_limit_size, NULL);
+        at_body_limit, at_body_limit_size, NULL);
+    free(at_body_limit);
+    CHECK(has_status(response, 200));
+    free(response);
+    CHECK(fake.calls == 1);
+
+    char over_body_limit[256];
+    int over_body_limit_size = snprintf(
+        over_body_limit, sizeof(over_body_limit),
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: %zu\r\n\r\n", (size_t)BODY_LIMIT + 1);
+    CHECK(over_body_limit_size > 0 &&
+          (size_t)over_body_limit_size < sizeof(over_body_limit));
+    response = exchange(
+        &config, fake_generate, &fake,
+        over_body_limit, (size_t)over_body_limit_size, NULL);
     CHECK(has_status(response, 413));
     free(response);
-    CHECK(fake.calls == 0);
+    CHECK(fake.calls == 1);
     return 0;
 }
 
@@ -489,6 +673,7 @@ int main(void) {
     CHECK(test_routes_and_methods() == 0);
     CHECK(test_http_framing_rejections() == 0);
     CHECK(test_size_limits() == 0);
+    CHECK(test_serve_shutdown_interrupts_partial_requests() == 0);
     puts("OpenAI HTTP socket tests: ok");
     return 0;
 }
