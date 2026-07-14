@@ -30,6 +30,8 @@ def main():
     assert len(models.data) == 1
     assert models.data[0].id == model
     assert models.data[0].object == "model"
+    assert_integer(models.data[0].created, 0)
+    assert isinstance(models.data[0].owned_by, str) and models.data[0].owned_by
 
     reply = client.chat.completions.create(
         model=model,
@@ -62,6 +64,8 @@ def main():
     assert chunks
     stream_id = chunks[0].id
     assert isinstance(stream_id, str) and stream_id
+    stream_created = chunks[0].created
+    assert_integer(stream_created, 1)
 
     role_chunks = 0
     content_chunks = 0
@@ -70,7 +74,7 @@ def main():
     for index, chunk in enumerate(chunks):
         assert chunk.id == stream_id
         assert chunk.object == "chat.completion.chunk"
-        assert_integer(chunk.created, 1)
+        assert chunk.created == stream_created
         assert chunk.model == model
 
         if chunk.usage is not None:
