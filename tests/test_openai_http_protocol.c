@@ -71,6 +71,10 @@ static int test_defaults_and_model_match(void) {
         "{\"model\":\"moonlight-extra\",\"messages\":["
         "{\"role\":\"user\",\"content\":\"hello\"}]}",
         "moonlight"));
+    CHECK(parse_invalid(
+        "{\"model\":\"moonlight\\u0000-extra\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"hello\"}]}",
+        "moonlight"));
     return 0;
 }
 
@@ -115,10 +119,76 @@ static int test_invalid_requests(void) {
         "{\"model\":\"test-model\",\"messages\":["
             "{\"role\":\"user\",\"content\":\"x\"}],"
             "\"stream_options\":{\"include_usage\":true}}",
+        "{\"model\":\"test-model\",\"messages\":["
+            "{\"role\":\"user\",\"content\":\"hello\\u0000tail\"}]}",
+        "{\"model\":\"test-model\",\"messages\":["
+            "{\"role\":\"user\\u0000tool\",\"content\":\"x\"}]}",
     };
 
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
         CHECK(parse_invalid(invalid[i], model));
+    return 0;
+}
+
+static char *build_large_request(size_t field_count, int duplicate) {
+    if (field_count > (SIZE_MAX - 512) / 32) return NULL;
+    size_t capacity = field_count * 32 + 512;
+    char *body = malloc(capacity);
+    if (!body) return NULL;
+    size_t offset = 0;
+    int written = snprintf(body, capacity, "{");
+    if (written < 0 || (size_t)written >= capacity) goto fail;
+    offset = (size_t)written;
+    for (size_t i = 0; i < field_count; i++) {
+        written = snprintf(body + offset, capacity - offset,
+                           "\"extra_%06zu\":0,", i);
+        if (written < 0 || (size_t)written >= capacity - offset) goto fail;
+        offset += (size_t)written;
+    }
+    if (duplicate) {
+        written = snprintf(body + offset, capacity - offset,
+                           "\"extra_%06d\":1,", 0);
+        if (written < 0 || (size_t)written >= capacity - offset) goto fail;
+        offset += (size_t)written;
+    }
+    written = snprintf(
+        body + offset, capacity - offset,
+        "\"model\":\"large-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"hello\"}]}");
+    if (written < 0 || (size_t)written >= capacity - offset) goto fail;
+    return body;
+
+fail:
+    free(body);
+    return NULL;
+}
+
+static int test_large_object_duplicate_detection(void) {
+    OpenAIChatRequest request = {0};
+    char error[256] = {0};
+    char *body = build_large_request(8192, 0);
+    CHECK(body != NULL);
+    CHECK(openai_chat_request_parse(
+        body, "large-model", &request, error, sizeof(error)));
+    openai_chat_request_free(&request);
+    free(body);
+
+    body = build_large_request(8192, 1);
+    CHECK(body != NULL);
+    CHECK(parse_invalid(body, "large-model"));
+    free(body);
+    return 0;
+}
+
+static int test_literal_nul_escape_text(void) {
+    OpenAIChatRequest request = {0};
+    char error[256] = {0};
+    CHECK(openai_chat_request_parse(
+        "{\"model\":\"test-model\",\"messages\":["
+        "{\"role\":\"user\",\"content\":\"literal \\\\u0000 text\"}]}",
+        "test-model", &request, error, sizeof(error)));
+    CHECK(strcmp(request.messages[0].content, "literal \\u0000 text") == 0);
+    openai_chat_request_free(&request);
     return 0;
 }
 
@@ -176,6 +246,8 @@ int main(void) {
     CHECK(test_valid_request() == 0);
     CHECK(test_defaults_and_model_match() == 0);
     CHECK(test_invalid_requests() == 0);
+    CHECK(test_large_object_duplicate_detection() == 0);
+    CHECK(test_literal_nul_escape_text() == 0);
     CHECK(test_json_formatters() == 0);
     puts("OpenAI HTTP protocol tests: ok");
     return 0;

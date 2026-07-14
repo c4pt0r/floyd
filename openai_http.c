@@ -100,18 +100,59 @@ static int openai_reject_field(jval *root, const char *name,
     return 0;
 }
 
+static int openai_body_has_decoded_nul(const char *body) {
+    int in_string = 0;
+    for (const char *p = body; *p; p++) {
+        if (!in_string) {
+            if (*p == '"') in_string = 1;
+            continue;
+        }
+        if (*p == '"') {
+            in_string = 0;
+            continue;
+        }
+        if (*p != '\\') continue;
+        p++;
+        if (!*p) break;
+        if (*p == 'u' && p[1] == '0' && p[2] == '0' &&
+            p[3] == '0' && p[4] == '0') return 1;
+    }
+    return 0;
+}
+
+static int openai_compare_keys(const void *left, const void *right) {
+    const char *const *left_key = left;
+    const char *const *right_key = right;
+    return strcmp(*left_key, *right_key);
+}
+
 static int openai_unique_object_keys(jval *object,
                                      char *error, size_t error_size) {
-    if (!object || object->t != J_OBJ) return 1;
-    for (int i = 0; i < object->len; i++) {
-        for (int j = i + 1; j < object->len; j++) {
-            if (strcmp(object->keys[i], object->keys[j]) == 0) {
-                openai_field_error(error, error_size, object->keys[i],
-                                   "must not be repeated");
-                return 0;
-            }
+    if (!object || object->t != J_OBJ || object->len < 2) return 1;
+    char *local_keys[32];
+    char **keys = local_keys;
+    size_t count = (size_t)object->len;
+    if (count > sizeof(local_keys) / sizeof(local_keys[0])) {
+        if (count > SIZE_MAX / sizeof(*keys)) {
+            openai_error(error, error_size, "object has too many keys");
+            return 0;
+        }
+        keys = malloc(count * sizeof(*keys));
+        if (!keys) {
+            openai_error(error, error_size,
+                         "out of memory validating object keys");
+            return 0;
         }
     }
+    memcpy(keys, object->keys, count * sizeof(*keys));
+    qsort(keys, count, sizeof(*keys), openai_compare_keys);
+    for (size_t i = 1; i < count; i++) {
+        if (strcmp(keys[i - 1], keys[i]) != 0) continue;
+        openai_field_error(error, error_size, keys[i], "must not be repeated");
+        if (keys != local_keys) free(keys);
+        return 0;
+    }
+    if (keys != local_keys) free(keys);
     return 1;
 }
 
@@ -148,6 +189,11 @@ int openai_chat_request_parse(
     if (!root) {
         openai_error(error, error_size, json_error);
         return 0;
+    }
+    if (openai_body_has_decoded_nul(body)) {
+        openai_error(error, error_size,
+                     "JSON strings must not contain escaped U+0000");
+        goto fail;
     }
     if (root->t != J_OBJ) {
         openai_error(error, error_size, "request must be a JSON object");
