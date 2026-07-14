@@ -11,7 +11,18 @@ typedef struct {
     float top_p;
 } MoonlightChatOptions;
 
+typedef struct {
+    const char *model_dir;
+    int max_context;
+    int max_new_tokens;
+    const char *host;
+    int port;
+    const char *api_key;
+    const char *served_model_name;
+} MoonlightServeOptions;
+
 int moonlight_metal_model_dir(const char *model_dir);
 int moonlight_chat_run(const MoonlightChatOptions *options);
+int moonlight_serve_run(const MoonlightServeOptions *options);
 
 #endif

@@ -329,7 +329,7 @@ static int run_deepseek_v4(CliOptions *options) {
 }
 
 static int run_moonlight(CliOptions *options) {
-    if (options->command == COMMAND_SERVE) {
+    if (options->command == COMMAND_SERVE && options->stdio) {
         fprintf(stderr, "floyd serve currently requires DeepSeek V4\n");
         return 2;
     }
@@ -340,6 +340,18 @@ static int run_moonlight(CliOptions *options) {
     if (!options->context_set) options->max_context = 4096;
     if (!options->new_tokens_set)
         options->max_new_tokens = options->command == COMMAND_RUN ? 256 : 512;
+    if (options->command == COMMAND_SERVE) {
+        MoonlightServeOptions serve = {
+            .model_dir = options->model_dir,
+            .max_context = options->max_context,
+            .max_new_tokens = options->max_new_tokens,
+            .host = options->host,
+            .port = options->port,
+            .api_key = options->api_key,
+            .served_model_name = options->served_model_name,
+        };
+        return moonlight_serve_run(&serve);
+    }
     MoonlightChatOptions chat = {
         .model_dir = options->model_dir,
         .prompt = options->command == COMMAND_RUN ? options->prompt : NULL,

@@ -11,6 +11,7 @@
 #include "tok_moon.h"
 #include "moonlight_chat.h"
 #include "moonlight_metal.h"
+#include "openai_http.h"
 
 typedef struct {
     float probability;
@@ -92,9 +93,9 @@ static double random_unit(MoonlightChat *chat) {
     return (double)(chat->rng >> 11) * (1.0 / 9007199254740992.0);
 }
 
-static int choose_token(MoonlightChat *chat) {
+static int choose_token(MoonlightChat *chat, float temperature, float top_p) {
     int vocabulary = chat->info.vocab_size;
-    if (chat->options.temperature <= 0.0f) {
+    if (temperature <= 0.0f) {
         int best = 0;
         for (int token = 1; token < vocabulary; ++token)
             if (chat->logits[token] > chat->logits[best]) best = token;
@@ -106,7 +107,7 @@ static int choose_token(MoonlightChat *chat) {
     double total = 0.0;
     for (int token = 0; token < vocabulary; ++token) {
         float probability = expf((chat->logits[token] - maximum) /
-                                 chat->options.temperature);
+                                 temperature);
         chat->candidates[token].probability = probability;
         chat->candidates[token].token = token;
         total += probability;
@@ -119,7 +120,7 @@ static int choose_token(MoonlightChat *chat) {
     int count = 0;
     do {
         kept += chat->candidates[count++].probability;
-    } while (count < vocabulary && kept < chat->options.top_p);
+    } while (count < vocabulary && kept < top_p);
     double sample = random_unit(chat) * kept;
     double cumulative = 0.0;
     for (int index = 0; index < count; ++index) {
@@ -169,28 +170,53 @@ static void print_perf(MoonlightChat *chat, MoonlightStats before,
             (unsigned long long)after.cpu_fallbacks);
 }
 
-static int generate(MoonlightChat *chat, int eos, char *error,
-                    size_t error_size) {
-    MoonlightStats before = moonlight_session_stats(chat->session);
+static int generate(MoonlightChat *chat, int eos, int max_new_tokens,
+                    float temperature, float top_p,
+                    OpenAITokenSink sink, void *sink_data, int *stopped_eos,
+                    char *error, size_t error_size) {
+    if (stopped_eos) *stopped_eos = 0;
     if (!forward_pending(chat, error, error_size)) return -1;
     int generated = 0;
-    for (; generated < chat->options.max_new_tokens; ++generated) {
-        int token = choose_token(chat);
+    for (; generated < max_new_tokens; ++generated) {
+        int token = choose_token(chat, temperature, top_p);
         if (chat->history_length >= chat->options.max_context) {
             snprintf(error, error_size, "Moonlight context is full");
             return -1;
         }
         chat->history[chat->history_length++] = token;
-        if (token == eos) break;
+        if (token == eos) {
+            if (stopped_eos) *stopped_eos = 1;
+            break;
+        }
         char piece[512];
         int size = mtok_decode(&chat->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
-        if (size > 0) fwrite(piece, 1, (size_t)size, stdout);
-        fflush(stdout);
+        if (!sink(token, piece, (size_t)size, sink_data)) {
+            snprintf(error, error_size, "Moonlight token sink stopped generation");
+            return -1;
+        }
         if (!moonlight_session_decode(chat->session, token, chat->logits,
                                       error, error_size)) return -1;
     }
-    print_perf(chat, before, generated);
+    return generated;
+}
+
+static int stdout_sink(int token, const char *piece, size_t piece_size,
+                       void *user_data) {
+    (void)token;
+    FILE *output = user_data;
+    if (piece_size && fwrite(piece, 1, piece_size, output) != piece_size)
+        return 0;
+    return fflush(output) == 0;
+}
+
+static int generate_stdout(MoonlightChat *chat, int eos, char *error,
+                           size_t error_size) {
+    MoonlightStats before = moonlight_session_stats(chat->session);
+    int generated = generate(
+        chat, eos, chat->options.max_new_tokens, chat->options.temperature,
+        chat->options.top_p, stdout_sink, stdout, NULL, error, error_size);
+    if (generated >= 0) print_perf(chat, before, generated);
     return generated;
 }
 
@@ -205,6 +231,22 @@ static int append_turn(MoonlightChat *chat, const char *prompt) {
                            chat->history, length, limit);
     length = mtok_tmpl_genprompt(&chat->tokenizer, chat->history,
                                  length, limit);
+    if (length < 0) return 0;
+    chat->history_length = length;
+    return 1;
+}
+
+static int append_messages(MoonlightChat *chat, const OpenAIMessage *messages,
+                           size_t message_count, int max_new_tokens) {
+    int length = 0;
+    int limit = chat->options.max_context - max_new_tokens - 1;
+    if (limit <= 0) return 0;
+    for (size_t index = 0; index < message_count; ++index)
+        length = mtok_tmpl_msg(
+            &chat->tokenizer, messages[index].role, messages[index].content,
+            chat->history, length, limit);
+    length = mtok_tmpl_genprompt(
+        &chat->tokenizer, chat->history, length, limit);
     if (length < 0) return 0;
     chat->history_length = length;
     return 1;
@@ -282,7 +324,7 @@ int moonlight_chat_run(const MoonlightChatOptions *options) {
         if (!append_turn(&chat, one_shot))
             snprintf(error, sizeof(error), "Moonlight prompt is too long");
         else
-            generated = generate(&chat, eos, error, sizeof(error));
+            generated = generate_stdout(&chat, eos, error, sizeof(error));
         if (generated < 0) fprintf(stderr, "%s\n", error);
         putchar('\n');
         int status = generated < 0;
@@ -314,7 +356,7 @@ int moonlight_chat_run(const MoonlightChatOptions *options) {
         }
         fputs("\xe2\x97\x86 ", stdout);
         fflush(stdout);
-        if (generate(&chat, eos, error, sizeof(error)) < 0) {
+        if (generate_stdout(&chat, eos, error, sizeof(error)) < 0) {
             fprintf(stderr, "%s\n", error);
             status = 1;
             break;
@@ -324,4 +366,101 @@ int moonlight_chat_run(const MoonlightChatOptions *options) {
     free(line);
     close_chat(&chat);
     return status;
+}
+
+typedef struct {
+    MoonlightChat chat;
+    const MoonlightServeOptions *options;
+    int eos;
+} MoonlightServeContext;
+
+static int serve_openai_request(
+    void *user_data, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    MoonlightServeContext *context = user_data;
+    MoonlightChat *chat = &context->chat;
+    int max_new_tokens = request->max_tokens > 0
+        ? request->max_tokens : context->options->max_new_tokens;
+
+    moonlight_session_reset(chat->session);
+    chat->history_length = 0;
+    if (!append_messages(
+            chat, request->messages, request->message_count, max_new_tokens)) {
+        snprintf(error, error_size, "Moonlight messages are too long");
+        return 0;
+    }
+
+    MoonlightStats before = moonlight_session_stats(chat->session);
+    int stopped_eos = 0;
+    int generated = generate(
+        chat, context->eos, max_new_tokens,
+        request->temperature, request->top_p, sink, sink_data, &stopped_eos,
+        error, error_size);
+    if (generated < 0) return 0;
+    MoonlightStats after = moonlight_session_stats(chat->session);
+
+    result->prompt_tokens = (int)(after.prefill_tokens - before.prefill_tokens);
+    result->cached_tokens = 0;
+    result->completion_tokens = generated;
+    result->prompt_ms = after.prefill_ms - before.prefill_ms;
+    result->decode_ms = after.decode_ms - before.decode_ms;
+    result->cache_entries = 0;
+    result->cache_bytes = 0;
+    result->finish_reason = generated >= max_new_tokens && !stopped_eos
+        ? "length" : "stop";
+    return 1;
+}
+
+int moonlight_serve_run(const MoonlightServeOptions *options) {
+    if (!options || !options->model_dir || options->max_context <= 0 ||
+        options->max_new_tokens <= 0 ||
+        options->max_new_tokens >= options->max_context ||
+        !options->host || !options->host[0] || options->port < 1 ||
+        options->port > 65535 || !options->served_model_name ||
+        !options->served_model_name[0]) {
+        fprintf(stderr, "invalid Moonlight serve options\n");
+        return 2;
+    }
+
+    MoonlightChatOptions chat_options = {
+        .model_dir = options->model_dir,
+        .system_prompt = "",
+        .max_context = options->max_context,
+        .max_new_tokens = options->max_new_tokens,
+        .temperature = 0.0f,
+        .top_p = 1.0f,
+    };
+    MoonlightServeContext context = {
+        .options = options,
+    };
+    char error[1024] = {0};
+    if (!open_chat(&context.chat, &chat_options, error, sizeof(error))) {
+        fprintf(stderr, "%s\n", error);
+        close_chat(&context.chat);
+        return 1;
+    }
+    context.eos = mtok_special(&context.chat.tokenizer, "<|im_end|>");
+    if (context.eos < 0) {
+        fprintf(stderr, "Moonlight tokenizer has no <|im_end|> token\n");
+        close_chat(&context.chat);
+        return 1;
+    }
+
+    fprintf(stderr,
+            "MOONLIGHT_SERVE transport=http backend=metal-moonlight "
+            "listen=%s:%d model=%s auth=%s\n",
+            options->host, options->port, options->served_model_name,
+            options->api_key ? "on" : "off");
+    OpenAIHttpConfig config = {
+        .host = options->host,
+        .port = options->port,
+        .api_key = options->api_key,
+        .model_name = options->served_model_name,
+    };
+    int served = openai_http_serve(
+        &config, serve_openai_request, &context, error, sizeof(error));
+    if (!served && error[0]) fprintf(stderr, "%s\n", error);
+    close_chat(&context.chat);
+    return served ? 0 : 1;
 }
