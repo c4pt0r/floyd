@@ -35,6 +35,15 @@ typedef struct {
     int system_set;
     int prefix_cache_set;
     int stdio;
+    const char *host;
+    int port;
+    const char *api_key;
+    const char *served_model_name;
+    char *default_served_model_name;
+    int host_set;
+    int port_set;
+    int api_key_set;
+    int served_model_name_set;
     int trace;
 } CliOptions;
 
@@ -43,11 +52,11 @@ static void usage(FILE *stream) {
         "floyd - Metal inference for Moonlight and DeepSeek V4 DS4\n"
         "usage: floyd [chat] --model DIR [flags]\n"
         "       floyd run --model DIR --prompt TEXT [flags]\n"
-        "       floyd serve --stdio --model DIR [flags]\n\n"
+        "       floyd serve --model DIR [flags]\n\n"
         "commands:\n"
         "  chat   interactive conversation (default)\n"
         "  run    one-shot generation\n"
-        "  serve  persistent DeepSeek V4 JSONL service over stdio\n"
+        "  serve  persistent OpenAI HTTP or JSONL service\n"
         "  help   show this text\n\n"
         "common flags:\n"
         "  --model DIR        model checkpoint directory\n"
@@ -65,6 +74,10 @@ static void usage(FILE *stream) {
         "  --prompt TEXT      prompt to generate from\n\n"
         "serve flags:\n"
         "  --stdio            read and write one JSON object per line\n"
+        "  --host HOST        HTTP listen host (default: 127.0.0.1)\n"
+        "  --port N           HTTP listen port (default: 8080)\n"
+        "  --api-key KEY      require an Authorization Bearer token\n"
+        "  --served-model-name NAME  model ID advertised over HTTP\n"
         "  --prefix-cache-mb N  prefix snapshot budget; 0 disables cache\n",
         stream);
 }
@@ -125,6 +138,20 @@ static uint64_t parse_megabytes(const char *text) {
     return (uint64_t)value;
 }
 
+static char *model_basename(const char *path) {
+    const char *end = path + strlen(path);
+    while (end > path && end[-1] == '/') end--;
+    const char *start = end;
+    while (start > path && start[-1] != '/') start--;
+    if (start == end) return NULL;
+    size_t size = (size_t)(end - start);
+    char *name = malloc(size + 1);
+    if (!name) return NULL;
+    memcpy(name, start, size);
+    name[size] = 0;
+    return name;
+}
+
 static CliOptions parse_cli(int argc, char **argv) {
     CliOptions options = {
         .command = COMMAND_CHAT,
@@ -132,6 +159,8 @@ static CliOptions parse_cli(int argc, char **argv) {
         .temperature = 0.7f,
         .top_p = 0.90f,
         .prefix_cache_mb = 256,
+        .host = "127.0.0.1",
+        .port = 8080,
     };
     if (argc < 2) fail_usage("missing --model");
 
@@ -192,6 +221,19 @@ static CliOptions parse_cli(int argc, char **argv) {
             options.trace = 1;
         } else if (!strcmp(option, "--stdio")) {
             options.stdio = 1;
+        } else if (!strcmp(option, "--host")) {
+            options.host = next_value(argc, argv, &index, option);
+            options.host_set = 1;
+        } else if (!strcmp(option, "--port")) {
+            const char *value = next_value(argc, argv, &index, option);
+            options.port = parse_integer(value, 1, 65535, option);
+            options.port_set = 1;
+        } else if (!strcmp(option, "--api-key")) {
+            options.api_key = next_value(argc, argv, &index, option);
+            options.api_key_set = 1;
+        } else if (!strcmp(option, "--served-model-name")) {
+            options.served_model_name = next_value(argc, argv, &index, option);
+            options.served_model_name_set = 1;
         } else if (!strcmp(option, "--prefix-cache-mb")) {
             const char *value = next_value(argc, argv, &index, option);
             options.prefix_cache_mb = parse_megabytes(value);
@@ -208,12 +250,27 @@ static CliOptions parse_cli(int argc, char **argv) {
         fail_usage("run requires --prompt");
     if (options.command != COMMAND_RUN && options.prompt)
         fail_usage("--prompt is only valid for run");
-    if (options.command == COMMAND_SERVE && !options.stdio)
-        fail_usage("serve requires --stdio");
     if (options.command != COMMAND_SERVE && options.stdio)
         fail_usage("--stdio is only valid for serve");
+    int http_flags_set = options.host_set || options.port_set ||
+                         options.api_key_set || options.served_model_name_set;
+    if (options.command != COMMAND_SERVE && http_flags_set)
+        fail_usage("HTTP flags are only valid for serve");
+    if (options.stdio && http_flags_set)
+        fail_usage("HTTP flags cannot be used with --stdio");
     if (options.command != COMMAND_SERVE && options.prefix_cache_set)
         fail_usage("--prefix-cache-mb is only valid for serve");
+    if (options.command == COMMAND_SERVE && !options.host[0])
+        fail_usage("--host must be non-empty");
+    if (options.command == COMMAND_SERVE && options.served_model_name_set &&
+        !options.served_model_name[0])
+        fail_usage("--served-model-name must be non-empty");
+    if (options.command == COMMAND_SERVE && !options.served_model_name) {
+        options.default_served_model_name = model_basename(options.model_dir);
+        if (!options.default_served_model_name)
+            fail_usage("could not derive served model name from --model");
+        options.served_model_name = options.default_served_model_name;
+    }
     return options;
 }
 
@@ -253,6 +310,11 @@ static int run_deepseek_v4(CliOptions *options) {
             .max_new_tokens = options->max_new_tokens,
             .draft = options->draft,
             .prefix_cache_bytes = options->prefix_cache_mb * UINT64_C(1024) * 1024,
+            .stdio = options->stdio,
+            .host = options->host,
+            .port = options->port,
+            .api_key = options->api_key,
+            .served_model_name = options->served_model_name,
         };
         return deepseek_v4_serve_run(&serve);
     }
@@ -293,10 +355,15 @@ static int run_moonlight(CliOptions *options) {
 
 int main(int argc, char **argv) {
     CliOptions options = parse_cli(argc, argv);
+    int status;
     if (deepseek_v4_model_dir(options.model_dir))
-        return run_deepseek_v4(&options);
-    if (moonlight_metal_model_dir(options.model_dir))
-        return run_moonlight(&options);
-    fprintf(stderr, "unsupported model directory: %s\n", options.model_dir);
-    return 2;
+        status = run_deepseek_v4(&options);
+    else if (moonlight_metal_model_dir(options.model_dir))
+        status = run_moonlight(&options);
+    else {
+        fprintf(stderr, "unsupported model directory: %s\n", options.model_dir);
+        status = 2;
+    }
+    free(options.default_served_model_name);
+    return status;
 }

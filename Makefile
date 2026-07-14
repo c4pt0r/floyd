@@ -35,6 +35,7 @@ DEEPSEEK_V4_DS4_OBJ =
 FLOYD_OBJ = floyd.o
 DEEPSEEK_V4_CHAT_OBJ = deepseek_v4_chat.o
 DEEPSEEK_V4_SERVE_OBJ = deepseek_v4_serve.o deepseek_v4_prefix_cache.o
+OPENAI_HTTP_OBJ = openai_http.o
 FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
@@ -98,11 +99,11 @@ TEST_BINS = tests/test_json tests/test_st tests/test_moe_route tests/test_moe_ex
 
 all: floyd
 
-DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_ds4.h deepseek_v4_serve.h json.h
+DEEPSEEK_V4_CHAT_DEPS = deepseek_v4_chat.h deepseek_v4_ds4.h deepseek_v4_serve.h openai_http.h json.h
 
-floyd: $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(MOONLIGHT_METAL_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
+floyd: $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) $(OPENAI_HTTP_OBJ) $(MOONLIGHT_METAL_OBJ) $(DEEPSEEK_V4_DS4_OBJ) $(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS))
 	$(FLOYD_LINK) $(FLOYD_OBJ) $(DEEPSEEK_V4_CHAT_OBJ) $(DEEPSEEK_V4_SERVE_OBJ) \
-		$(MOONLIGHT_METAL_OBJ) $(DEEPSEEK_V4_DS4_OBJ) \
+		$(OPENAI_HTTP_OBJ) $(MOONLIGHT_METAL_OBJ) $(DEEPSEEK_V4_DS4_OBJ) \
 		$(if $(DEEPSEEK_V4_DS4_OBJ),$(DS4_CORE_OBJS)) \
 		-o floyd $(LDFLAGS)
 
@@ -190,6 +191,9 @@ backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 	clang -O2 -fobjc-arc -c backend_metal.m -o $@
 
 deepseek_v4_serve.o: deepseek_v4_serve.c deepseek_v4_serve.h json.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+openai_http.o: openai_http.c openai_http.h json.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 deepseek_v4_prefix_cache.o: deepseek_v4_prefix_cache.c deepseek_v4_prefix_cache.h
@@ -421,6 +425,10 @@ test-deepseek-v4-serve-cli: floyd
 test-deepseek-v4-serve-official: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
 	sh tests/test_deepseek_v4_serve_official.sh "$(DSPARK)"
+
+test-deepseek-v4-openai-official: floyd
+	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)
+	DSPARK="$(DSPARK)" sh tests/test_deepseek_v4_openai_official.sh
 
 test-deepseek-v4-ds4-40tps: floyd
 	@test -n "$(DSPARK)" || (echo "set DSPARK=/path/to/DeepSeek-V4-Flash-DSpark"; exit 2)

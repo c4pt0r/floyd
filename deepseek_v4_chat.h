@@ -17,6 +17,11 @@ typedef struct {
     int max_new_tokens;
     int draft;
     uint64_t prefix_cache_bytes;
+    int stdio;
+    const char *host;
+    int port;
+    const char *api_key;
+    const char *served_model_name;
 } DeepSeekV4ServeOptions;
 
 int deepseek_v4_model_dir(const char *model_dir);

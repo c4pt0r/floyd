@@ -7,6 +7,7 @@
 #include "deepseek_v4_ds4.h"
 #include "deepseek_v4_serve.h"
 #include "json.h"
+#include "openai_http.h"
 
 int deepseek_v4_model_dir(const char *model_dir) {
     if (!model_dir) return 0;
@@ -187,8 +188,8 @@ typedef struct {
     size_t output_capacity;
 } ServeContext;
 
-static int serve_emit(int token, const char *piece, size_t piece_size,
-                      void *user_data) {
+static int serve_buffer_emit(int token, const char *piece, size_t piece_size,
+                             void *user_data) {
     ServeContext *context = user_data;
     (void)token;
     if (piece_size > SIZE_MAX - context->output_size - 1) return 0;
@@ -210,6 +211,36 @@ static int serve_emit(int token, const char *piece, size_t piece_size,
     memcpy(context->output + context->output_size, piece, piece_size);
     context->output_size += piece_size;
     context->output[context->output_size] = 0;
+    return 1;
+}
+
+static int serve_generate(
+    ServeContext *context,
+    const DeepSeekV4Ds4Message *messages, size_t message_count,
+    int max_tokens, float temperature, float top_p, int draft,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    DeepSeekV4Ds4RequestConfig config = {
+        .max_tokens = max_tokens > 0
+            ? max_tokens : context->options->max_new_tokens,
+        .temperature = temperature,
+        .top_p = top_p,
+        .draft = draft,
+    };
+    DeepSeekV4Ds4Stats stats;
+    int generated = deepseek_v4_ds4_generate_messages(
+        context->session, messages, message_count, &config,
+        sink, sink_data, &stats, error, error_size);
+    if (generated < 0) return 0;
+
+    result->prompt_tokens = stats.prompt_tokens + stats.cached_tokens;
+    result->cached_tokens = stats.cached_tokens;
+    result->completion_tokens = stats.generated_tokens;
+    result->prompt_ms = stats.prompt_ms;
+    result->decode_ms = stats.decode_ms;
+    result->cache_entries = stats.cache_entries;
+    result->cache_bytes = stats.cache_bytes;
+    result->finish_reason = generated >= config.max_tokens ? "length" : "stop";
     return 1;
 }
 
@@ -245,37 +276,58 @@ static int serve_request(void *user_data,
 
     int draft = request->draft >= 0 ? request->draft : context->options->draft;
     if (request->draft < 0 && request->temperature > 0.0f) draft = 1;
-    DeepSeekV4Ds4RequestConfig config = {
-        .max_tokens = request->max_tokens > 0
-            ? request->max_tokens : context->options->max_new_tokens,
-        .temperature = request->temperature,
-        .top_p = request->top_p,
-        .draft = draft,
-    };
-    DeepSeekV4Ds4Stats stats;
-    int generated = deepseek_v4_ds4_generate_messages(
-        context->session, messages, message_count, &config,
-        serve_emit, context, &stats, error, error_size);
+    OpenAIGenerationResult result = {0};
+    int generated = serve_generate(
+        context, messages, message_count, request->max_tokens,
+        request->temperature, request->top_p, draft,
+        serve_buffer_emit, context, &result, error, error_size);
     free(messages);
-    if (generated < 0) return 0;
+    if (!generated) return 0;
 
     response->text = context->output ? context->output : "";
-    response->prompt_tokens = stats.prompt_tokens + stats.cached_tokens;
-    response->cached_tokens = stats.cached_tokens;
-    response->completion_tokens = stats.generated_tokens;
-    response->prompt_ms = stats.prompt_ms;
-    response->decode_ms = stats.decode_ms;
-    response->cache_hit = stats.cache_hit;
-    response->cache_prefix_tokens = stats.cache_prefix_tokens;
-    response->cache_entries = stats.cache_entries;
-    response->cache_bytes = stats.cache_bytes;
+    response->prompt_tokens = result.prompt_tokens;
+    response->cached_tokens = result.cached_tokens;
+    response->completion_tokens = result.completion_tokens;
+    response->prompt_ms = result.prompt_ms;
+    response->decode_ms = result.decode_ms;
+    response->cache_hit = result.cached_tokens > 0;
+    response->cache_prefix_tokens = result.cached_tokens;
+    response->cache_entries = result.cache_entries;
+    response->cache_bytes = result.cache_bytes;
     return 1;
+}
+
+static int serve_openai_request(
+    void *user_data, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    ServeContext *context = user_data;
+    DeepSeekV4Ds4Message *messages = calloc(
+        request->message_count, sizeof(*messages));
+    if (!messages) {
+        snprintf(error, error_size, "out of memory preparing messages");
+        return 0;
+    }
+    for (size_t index = 0; index < request->message_count; ++index) {
+        messages[index].role = request->messages[index].role;
+        messages[index].content = request->messages[index].content;
+    }
+    int generated = serve_generate(
+        context, messages, request->message_count, request->max_tokens,
+        request->temperature, request->top_p, context->options->draft,
+        sink, sink_data, result, error, error_size);
+    free(messages);
+    return generated;
 }
 
 int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
     if (!options || !options->model_dir || options->max_context <= 0 ||
         options->max_new_tokens <= 0 || options->draft < 0 ||
-        options->draft > 16) {
+        options->draft > 16 ||
+        (!options->stdio &&
+         (!options->host || !options->host[0] || options->port < 1 ||
+          options->port > 65535 || !options->served_model_name ||
+          !options->served_model_name[0]))) {
         fprintf(stderr, "invalid DeepSeek V4 serve options\n");
         return 2;
     }
@@ -285,12 +337,22 @@ int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
         fprintf(stderr, "%s\n", error);
         return 2;
     }
-    fprintf(stderr,
-            "DEEPSEEK_V4_SERVE transport=stdio backend=%s "
-            "prefix_cache_mb=%llu gguf=%s\n",
-            deepseek_v4_ds4_backend_name(),
-            (unsigned long long)(options->prefix_cache_bytes / (1024 * 1024)),
-            model_path);
+    if (options->stdio) {
+        fprintf(stderr,
+                "DEEPSEEK_V4_SERVE transport=stdio backend=%s "
+                "prefix_cache_mb=%llu gguf=%s\n",
+                deepseek_v4_ds4_backend_name(),
+                (unsigned long long)(options->prefix_cache_bytes / (1024 * 1024)),
+                model_path);
+    } else {
+        fprintf(stderr,
+                "DEEPSEEK_V4_SERVE transport=http backend=%s listen=%s:%d "
+                "model=%s prefix_cache_mb=%llu auth=%s\n",
+                deepseek_v4_ds4_backend_name(), options->host, options->port,
+                options->served_model_name,
+                (unsigned long long)(options->prefix_cache_bytes / (1024 * 1024)),
+                options->api_key ? "on" : "off");
+    }
     DeepSeekV4Ds4Session *session = deepseek_v4_ds4_open_cached(
         model_path, options->max_context, options->draft > 1,
         options->prefix_cache_bytes, error, sizeof(error));
@@ -302,8 +364,22 @@ int deepseek_v4_serve_run(const DeepSeekV4ServeOptions *options) {
         .session = session,
         .options = options,
     };
-    int status = deepseek_v4_serve_stdio(
-        stdin, stdout, serve_request, &context);
+    int status;
+    if (options->stdio) {
+        status = deepseek_v4_serve_stdio(
+            stdin, stdout, serve_request, &context);
+    } else {
+        OpenAIHttpConfig config = {
+            .host = options->host,
+            .port = options->port,
+            .api_key = options->api_key,
+            .model_name = options->served_model_name,
+        };
+        int served = openai_http_serve(
+            &config, serve_openai_request, &context, error, sizeof(error));
+        if (!served && error[0]) fprintf(stderr, "%s\n", error);
+        status = served ? 0 : 1;
+    }
     free(context.output);
     deepseek_v4_ds4_close(session);
     return status;
