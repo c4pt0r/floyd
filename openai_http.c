@@ -14,6 +14,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "json.h"
@@ -372,6 +373,11 @@ static int openai_json_finish(FILE *output, char **json) {
     return 0;
 }
 
+static long long openai_created_now(void) {
+    time_t created = time(NULL);
+    return created == (time_t)-1 || created <= 0 ? 1 : (long long)created;
+}
+
 int openai_format_models_json(
     const char *model, char **json, size_t *json_size) {
     if (!model || !json || !json_size) return 0;
@@ -401,10 +407,11 @@ int openai_format_completion_json(
     const char *finish_reason = result->finish_reason ? result->finish_reason : "stop";
     long long total_tokens =
         (long long)result->prompt_tokens + result->completion_tokens;
+    long long created = openai_created_now();
     int ok = fputs("{\"id\":", output) != EOF &&
              openai_json_string(output, id) &&
-             fputs(",\"object\":\"chat.completion\",\"created\":0,\"model\":",
-                   output) != EOF &&
+             fputs(",\"object\":\"chat.completion\",\"created\":", output) != EOF &&
+             fprintf(output, "%lld,\"model\":", created) >= 0 &&
              openai_json_string(output, model) &&
              fputs(",\"choices\":[{\"index\":0,\"message\":{"
                    "\"role\":\"assistant\",\"content\":", output) != EOF &&
@@ -487,6 +494,7 @@ typedef struct {
 typedef struct {
     int fd;
     const char *model;
+    long long created;
     int failed;
 } OpenAISseSink;
 
@@ -958,14 +966,16 @@ static int openai_sse_send_event(
     return ok;
 }
 
-static int openai_sse_send_role(int fd, const char *model) {
+static int openai_sse_send_role(
+    int fd, const char *model, long long created) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
     if (!output) return 0;
     int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
                           "\",\"object\":\"chat.completion.chunk\","
-                          "\"created\":0,\"model\":", output) != EOF &&
+                          "\"created\":", output) != EOF &&
+                    fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
                     fputs(",\"choices\":[{\"index\":0,\"delta\":{"
                           "\"role\":\"assistant\"},"
@@ -975,14 +985,16 @@ static int openai_sse_send_role(int fd, const char *model) {
 }
 
 static int openai_sse_send_content(
-    int fd, const char *model, const char *piece, size_t piece_size) {
+    int fd, const char *model, long long created,
+    const char *piece, size_t piece_size) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
     if (!output) return 0;
     int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
                           "\",\"object\":\"chat.completion.chunk\","
-                          "\"created\":0,\"model\":", output) != EOF &&
+                          "\"created\":", output) != EOF &&
+                    fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
                     fputs(",\"choices\":[{\"index\":0,\"delta\":{"
                           "\"content\":", output) != EOF &&
@@ -997,7 +1009,8 @@ static int openai_sse_token_sink(
     (void)token;
     OpenAISseSink *sink = user_data;
     if (sink->failed || (!piece && piece_size)) return 0;
-    if (!openai_sse_send_content(sink->fd, sink->model, piece, piece_size)) {
+    if (!openai_sse_send_content(
+            sink->fd, sink->model, sink->created, piece, piece_size)) {
         sink->failed = 1;
         return 0;
     }
@@ -1005,7 +1018,8 @@ static int openai_sse_token_sink(
 }
 
 static int openai_sse_send_terminal(
-    int fd, const char *model, const OpenAIGenerationResult *result) {
+    int fd, const char *model, long long created,
+    const OpenAIGenerationResult *result) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
@@ -1013,7 +1027,8 @@ static int openai_sse_send_terminal(
     const char *reason = result->finish_reason ? result->finish_reason : "stop";
     int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
                           "\",\"object\":\"chat.completion.chunk\","
-                          "\"created\":0,\"model\":", output) != EOF &&
+                          "\"created\":", output) != EOF &&
+                    fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
                     fputs(",\"choices\":[{\"index\":0,\"delta\":{},"
                           "\"finish_reason\":", output) != EOF &&
@@ -1024,7 +1039,8 @@ static int openai_sse_send_terminal(
 }
 
 static int openai_sse_send_usage(
-    int fd, const char *model, const OpenAIGenerationResult *result) {
+    int fd, const char *model, long long created,
+    const OpenAIGenerationResult *result) {
     char *event;
     size_t event_size;
     FILE *output = openai_sse_event_stream(&event, &event_size);
@@ -1033,7 +1049,8 @@ static int openai_sse_send_usage(
         (long long)result->prompt_tokens + result->completion_tokens;
     int formatted = fputs("{\"id\":\"" OPENAI_HTTP_ID
                           "\",\"object\":\"chat.completion.chunk\","
-                          "\"created\":0,\"model\":", output) != EOF &&
+                          "\"created\":", output) != EOF &&
+                    fprintf(output, "%lld,\"model\":", created) >= 0 &&
                     openai_json_string(output, model) &&
                     fprintf(output,
                             ",\"choices\":[],\"usage\":{"
@@ -1086,9 +1103,15 @@ static int openai_http_run_completion(
     OpenAIGenerationResult result = {0};
     char generation_error[256] = {0};
     if (request.stream) {
+        long long created = openai_created_now();
         int ok = openai_http_send_sse_headers(fd) &&
-                 openai_sse_send_role(fd, request.model);
-        OpenAISseSink sink = {.fd = fd, .model = request.model, .failed = !ok};
+                 openai_sse_send_role(fd, request.model, created);
+        OpenAISseSink sink = {
+            .fd = fd,
+            .model = request.model,
+            .created = created,
+            .failed = !ok,
+        };
         OpenAIUtf8Sink utf8 = {
             .sink = openai_sse_token_sink,
             .sink_data = &sink,
@@ -1099,11 +1122,13 @@ static int openai_http_run_completion(
         int finalized = generated && openai_utf8_finish(&utf8);
         openai_utf8_free(&utf8);
         if (generated && finalized && !sink.failed)
-            ok = openai_sse_send_terminal(fd, request.model, &result);
+            ok = openai_sse_send_terminal(
+                fd, request.model, created, &result);
         else
             ok = 0;
         if (ok && request.include_usage)
-            ok = openai_sse_send_usage(fd, request.model, &result);
+            ok = openai_sse_send_usage(
+                fd, request.model, created, &result);
         if (ok) ok = openai_http_send_all(fd, "data: [DONE]\n\n", 14);
         openai_chat_request_free(&request);
         return ok;

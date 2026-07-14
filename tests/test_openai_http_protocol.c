@@ -219,6 +219,7 @@ static int test_json_formatters(void) {
         &json, &json_size));
     CHECK(json_size == strlen(json));
     CHECK(strstr(json, "\"object\":\"chat.completion\"") != NULL);
+    CHECK(strstr(json, "\"created\":0") == NULL);
     CHECK(strstr(json, "\"choices\":[{\"index\":0,\"message\":{"
                        "\"role\":\"assistant\"") != NULL);
     CHECK(strstr(json, "line 1\\n\\\"hello\\\"") != NULL);

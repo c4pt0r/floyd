@@ -155,8 +155,8 @@ for chunk in stream:
         print(f"\nusage: {chunk.usage}")
 ```
 
-DeepSeek V4 uses the same byte-budgeted prefix snapshot LRU in HTTP and stdio
-mode; set `--prefix-cache-mb 256` and inspect
+DeepSeek V4 HTTP requests use the byte-budgeted prefix snapshot LRU. Set
+`--prefix-cache-mb 256` and inspect
 `usage.prompt_tokens_details.cached_tokens` for reuse. Independent Moonlight
 HTTP requests reset the session, so cross-request `cached_tokens` is always
 zero. Model weights stay resident, while `--ctx` controls KV and scratch
@@ -180,9 +180,9 @@ Diagnostics use stderr, leaving stdout valid JSONL.
 {"id":"b","messages":[{"role":"user","content":"Summarize the tests."}],"max_tokens":128}
 ```
 
-The prefix LRU is byte-budgeted. Reduce `--prefix-cache-mb` and `--ctx` on
-memory-constrained systems; `--prefix-cache-mb 0` disables snapshots without
-disabling inference.
+JSONL responses report prefix reuse at `usage.cached_tokens`. The prefix LRU is
+byte-budgeted. Reduce `--prefix-cache-mb` and `--ctx` on memory-constrained
+systems; `--prefix-cache-mb 0` disables snapshots without disabling inference.
 
 ## CLI
 
