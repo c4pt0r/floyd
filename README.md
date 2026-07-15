@@ -93,9 +93,9 @@ has no speculative head and rejects a nonzero value.
 
 ## OpenAI-Compatible HTTP Server
 
-`serve` keeps one model resident and implements `GET /v1/models` and
-`POST /v1/chat/completions`. This starts an unauthenticated local Moonlight
-server on the default `127.0.0.1:8080` address:
+`serve` keeps one model resident and implements `GET /v1/models`,
+`POST /v1/chat/completions`, and `POST /v1/responses` for local agents. This
+starts an unauthenticated local Moonlight server on `127.0.0.1:8080`:
 
 ```bash
 ./floyd serve --model models/moonlight_i8 \
@@ -161,6 +161,33 @@ DeepSeek V4 HTTP requests use the byte-budgeted prefix snapshot LRU. Set
 HTTP requests reset the session, so cross-request `cached_tokens` is always
 zero. Model weights stay resident, while `--ctx` controls KV and scratch
 allocation; lower `--ctx` and the DS4 prefix-cache budget when memory is tight.
+
+### Pie with DeepSeek V4
+
+Start Floyd with enough context for Pie's system prompt and tool schemas:
+
+```bash
+./floyd serve \
+  --model models/DeepSeek-V4-Flash-DSpark \
+  --served-model-name deepseek-v4-flash \
+  --ctx 16384 --ngen 512 --draft 3 --prefix-cache-mb 256
+```
+
+In another terminal, point the Pie checkout under `$HOME` at Floyd:
+
+```bash
+export DS4_API_KEY=dsv4-local
+"$HOME/pie/output/debug/pie" \
+  --provider ds4 --model deepseek-v4-flash \
+  --base-url http://127.0.0.1:8080/v1
+```
+
+`DS4_API_KEY` is required by Pie's provider configuration; the value is local
+when Floyd runs without `--api-key`. Pie's default agent prompt and 25 tools use
+about 9K tokens, so `--ctx 8192` is too small. Use `--ctx 32768` for larger
+instructions, or reduce the enabled tools when memory is constrained. The
+Responses endpoint translates DS4 tool calls and reports cached input tokens,
+so repeated agent prefixes reuse the in-process LRU.
 
 ## Agent Stdio Server
 
