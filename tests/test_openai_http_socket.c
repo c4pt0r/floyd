@@ -55,6 +55,11 @@ typedef struct {
     int calls;
 } LargeOutputContext;
 
+typedef struct {
+    int calls;
+    int emit_tool_call;
+} PieResponsesContext;
+
 static int fake_generate(void *ctx, const OpenAIChatRequest *request,
                          OpenAITokenSink sink, void *sink_data,
                          OpenAIGenerationResult *result,
@@ -204,6 +209,42 @@ static int large_output_generate(
     return sink(1, large->piece, large->piece_size, sink_data) ? 1 : 0;
 }
 
+static int pie_responses_generate(
+    void *ctx, const OpenAIChatRequest *request,
+    OpenAITokenSink sink, void *sink_data,
+    OpenAIGenerationResult *result, char *error, size_t error_size) {
+    PieResponsesContext *pie = ctx;
+    (void)error;
+    (void)error_size;
+    CHECK(request != NULL);
+    CHECK(strcmp(request->model, "deepseek-v4-flash") == 0);
+    CHECK(request->message_count == 2);
+    CHECK(strcmp(request->messages[0].role, "system") == 0);
+    CHECK(strstr(request->messages[0].content, "## Tools") != NULL);
+    CHECK(strstr(request->messages[0].content, "You are Pie.") != NULL);
+    CHECK(strstr(request->messages[0].content, "\"name\":\"ls\"") != NULL);
+    CHECK(strcmp(request->messages[1].role, "user") == 0);
+    CHECK(strcmp(request->messages[1].content, "Reply OK") == 0);
+    pie->calls++;
+    if (pie->emit_tool_call) {
+        static const char dsml[] =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"ls\">\n"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">."
+            "</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        CHECK(sink(1, dsml, sizeof(dsml) - 1, sink_data));
+    } else {
+        CHECK(sink(1, "OK", 2, sink_data));
+    }
+    result->prompt_tokens = 23;
+    result->cached_tokens = 7;
+    result->completion_tokens = 1;
+    result->finish_reason = "stop";
+    return OPENAI_GENERATE_OK;
+}
+
 static double monotonic_ms(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
@@ -314,20 +355,20 @@ static char *exchange(const OpenAIHttpConfig *config,
     return response;
 }
 
-static char *post_request_handler(
+static char *post_path_request_handler(
     const OpenAIHttpConfig *config, OpenAIGenerateHandler handler,
-    void *user_data, const char *body) {
+    void *user_data, const char *path, const char *body) {
     size_t capacity = strlen(body) + 256;
     char *request = malloc(capacity);
     if (!request) return NULL;
     int size = snprintf(
         request, capacity,
-        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "POST %s HTTP/1.1\r\n"
         "Host: localhost\r\n"
         "authorization: Bearer secret\r\n"
         "content-type: application/json\r\n"
         "content-length: %zu\r\n\r\n%s",
-        strlen(body), body);
+        path, strlen(body), body);
     if (size < 0 || (size_t)size >= capacity) {
         free(request);
         return NULL;
@@ -336,6 +377,13 @@ static char *post_request_handler(
         config, handler, user_data, request, (size_t)size, NULL);
     free(request);
     return response;
+}
+
+static char *post_request_handler(
+    const OpenAIHttpConfig *config, OpenAIGenerateHandler handler,
+    void *user_data, const char *body) {
+    return post_path_request_handler(
+        config, handler, user_data, "/v1/chat/completions", body);
 }
 
 static char *post_request(const OpenAIHttpConfig *config, FakeContext *fake,
@@ -1062,6 +1110,68 @@ static int test_streaming_completion(void) {
     return 0;
 }
 
+static int test_pie_responses_streaming(void) {
+    OpenAIHttpConfig config = {
+        .host = "127.0.0.1",
+        .port = 8080,
+        .api_key = "secret",
+        .model_name = "deepseek-v4",
+    };
+    static const char body[] =
+        "{\"model\":\"deepseek-v4-flash\",\"input\":["
+        "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\","
+        "\"text\":\"You are Pie.\"}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+        "\"text\":\"Reply OK\"}]}],"
+        "\"tools\":[{\"type\":\"function\",\"name\":\"ls\","
+        "\"description\":\"List files\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"path\":{\"type\":\"string\"}}}}],"
+        "\"stream\":true,\"store\":false,\"max_output_tokens\":8}"
+        ;
+
+    PieResponsesContext pie = {0};
+    char *response = post_path_request_handler(
+        &config, pie_responses_generate, &pie, "/v1/responses", body);
+    CHECK(has_status(response, 200));
+    CHECK(strstr(response, "Content-Type: text/event-stream") != NULL);
+    char *created = strstr(response, "\"type\":\"response.created\"");
+    char *added = strstr(response, "\"type\":\"response.output_item.added\"");
+    char *delta = strstr(response, "\"type\":\"response.output_text.delta\"");
+    char *completed = strstr(response, "\"type\":\"response.completed\"");
+    CHECK(created && added && delta && completed);
+    CHECK(created < added && added < delta && delta < completed);
+    CHECK(strstr(delta, "\"delta\":\"OK\"") != NULL);
+    CHECK(strstr(completed, "\"input_tokens\":23") != NULL);
+    CHECK(strstr(completed, "\"cached_tokens\":7") != NULL);
+    CHECK(strstr(completed, "\"output_tokens\":1") != NULL);
+    CHECK(pie.calls == 1);
+    free(response);
+
+    pie.emit_tool_call = 1;
+    response = post_path_request_handler(
+        &config, pie_responses_generate, &pie, "/v1/responses", body);
+    CHECK(has_status(response, 200));
+    char *tool_added = strstr(
+        response, "\"type\":\"response.output_item.added\","
+                  "\"output_index\":0,\"item\":{\"id\":\"fc_");
+    char *args_delta = strstr(
+        response, "\"type\":\"response.function_call_arguments.delta\"");
+    char *args_done = strstr(
+        response, "\"type\":\"response.function_call_arguments.done\"");
+    char *tool_done = strstr(
+        response, "\"type\":\"response.output_item.done\"");
+    completed = strstr(response, "\"type\":\"response.completed\"");
+    CHECK(tool_added && args_delta && args_done && tool_done && completed);
+    CHECK(tool_added < args_delta && args_delta < args_done &&
+          args_done < tool_done && tool_done < completed);
+    CHECK(strstr(response, "\"name\":\"ls\"") != NULL);
+    CHECK(strstr(response, "{\\\"path\\\":\\\".\\\"}") != NULL);
+    CHECK(strstr(response, "DSML") == NULL);
+    CHECK(pie.calls == 2);
+    free(response);
+    return 0;
+}
+
 static int test_token_byte_normalization(void) {
     OpenAIHttpConfig config = {
         .host = "127.0.0.1",
@@ -1317,6 +1427,7 @@ int main(void) {
     CHECK(test_host_header_requirements() == 0);
     CHECK(test_non_streaming_completion() == 0);
     CHECK(test_streaming_completion() == 0);
+    CHECK(test_pie_responses_streaming() == 0);
     CHECK(test_token_byte_normalization() == 0);
     CHECK(test_finish_reasons() == 0);
     CHECK(test_stream_disconnect_stops_sink() == 0);
