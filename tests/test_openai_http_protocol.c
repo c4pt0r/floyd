@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "../openai_http.h"
+#include "../openai_responses.h"
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -389,6 +390,89 @@ static int test_json_formatters(void) {
     return 0;
 }
 
+static int test_pie_responses_request_and_replay(void) {
+    static const char body[] =
+        "{\"model\":\"deepseek-v4-flash\",\"input\":["
+        "{\"role\":\"system\",\"content\":[{\"type\":\"input_text\","
+        "\"text\":\"System\"}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+        "\"text\":\"Inspect\"}]},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\","
+        "\"text\":\"I will inspect.\"}]},"
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\","
+        "\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\","
+        "\"output\":\"Floyd README\"}],"
+        "\"tools\":[{\"type\":\"function\",\"name\":\"read\","
+        "\"description\":\"Read a file\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"path\":{\"type\":\"string\"}}}}],"
+        "\"stream\":true,\"store\":false,\"max_output_tokens\":64,"
+        "\"temperature\":0,\"prompt_cache_key\":\"session-1\"}"
+        ;
+    OpenAIResponsesRequest request = {0};
+    char error[256] = {0};
+    CHECK(openai_responses_request_parse(
+        body, "deepseek-v4", &request, error, sizeof(error)));
+    CHECK(strcmp(request.chat.model, "deepseek-v4-flash") == 0);
+    CHECK(request.chat.stream == 1);
+    CHECK(request.chat.max_tokens == 64);
+    CHECK(request.chat.message_count == 4);
+    CHECK(strcmp(request.chat.messages[0].role, "system") == 0);
+    CHECK(strstr(request.chat.messages[0].content, "## Tools") != NULL);
+    CHECK(strstr(request.chat.messages[0].content, "System") != NULL);
+    CHECK(strcmp(request.chat.messages[1].content, "Inspect") == 0);
+    CHECK(strcmp(request.chat.messages[2].role, "assistant") == 0);
+    CHECK(strstr(request.chat.messages[2].content, "I will inspect.") != NULL);
+    CHECK(strstr(request.chat.messages[2].content,
+                 "<｜DSML｜invoke name=\"read\">") != NULL);
+    CHECK(strstr(request.chat.messages[2].content,
+                 "name=\"path\" string=\"true\">README.md") != NULL);
+    CHECK(strcmp(request.chat.messages[3].role, "user") == 0);
+    CHECK(strcmp(request.chat.messages[3].content,
+                 "<tool_result>Floyd README</tool_result>") == 0);
+    openai_responses_request_free(&request);
+
+    static const char *invalid[] = {
+        "{\"model\":\"other\",\"input\":[{\"role\":\"user\","
+        "\"content\":\"x\"}]}",
+        "{\"model\":\"deepseek-v4-flash\",\"input\":[{\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_image\",\"image_url\":\"x\"}]}]}",
+        "{\"model\":\"deepseek-v4-flash\",\"input\":[{\"role\":\"user\","
+        "\"content\":\"x\"}],\"store\":true}",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        memset(&request, 0, sizeof(request));
+        memset(error, 0, sizeof(error));
+        CHECK(!openai_responses_request_parse(
+            invalid[i], "deepseek-v4", &request, error, sizeof(error)));
+        CHECK(error[0] != 0);
+        openai_responses_request_free(&request);
+    }
+    return 0;
+}
+
+static int test_responses_dsml_projection(void) {
+    static const char raw[] =
+        "Checking.\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd &amp;&amp; ls"
+        "</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"timeout\" string=\"false\">10"
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    OpenAIResponsesOutput output = {0};
+    CHECK(openai_responses_output_parse(
+        raw, sizeof(raw) - 1, &output));
+    CHECK(strcmp(output.text, "Checking.") == 0);
+    CHECK(output.tool_call_count == 1);
+    CHECK(strcmp(output.tool_calls[0].name, "bash") == 0);
+    CHECK(strcmp(output.tool_calls[0].arguments,
+                 "{\"command\":\"pwd && ls\",\"timeout\":10}") == 0);
+    openai_responses_output_free(&output);
+    return 0;
+}
+
 int main(void) {
     CHECK(test_valid_request() == 0);
     CHECK(test_defaults_and_model_match() == 0);
@@ -399,6 +483,8 @@ int main(void) {
     CHECK(test_large_object_duplicate_detection() == 0);
     CHECK(test_literal_nul_escape_text() == 0);
     CHECK(test_json_formatters() == 0);
+    CHECK(test_pie_responses_request_and_replay() == 0);
+    CHECK(test_responses_dsml_projection() == 0);
     puts("OpenAI HTTP protocol tests: ok");
     return 0;
 }

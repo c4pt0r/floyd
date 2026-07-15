@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "json.h"
+#include "openai_responses.h"
 
 static void openai_error(char *error, size_t error_size, const char *message) {
     if (error && error_size) snprintf(error, error_size, "%s", message);
@@ -392,6 +393,21 @@ static int openai_body_has_decoded_nul(const char *body) {
     return 0;
 }
 
+int openai_json_body_validate(
+    const char *body, char *error, size_t error_size) {
+    if (!body) {
+        openai_error(error, error_size, "JSON body is required");
+        return 0;
+    }
+    if (!openai_strict_json_validate(body, error, error_size)) return 0;
+    if (openai_body_has_decoded_nul(body)) {
+        openai_error(error, error_size,
+                     "JSON strings must not contain escaped U+0000");
+        return 0;
+    }
+    return 1;
+}
+
 static int openai_compare_keys(const void *left, const void *right) {
     const char *const *left_key = left;
     const char *const *right_key = right;
@@ -458,18 +474,13 @@ static int openai_chat_request_parse_detailed(
         return 0;
     }
 
-    if (!openai_strict_json_validate(body, error, error_size)) return 0;
+    if (!openai_json_body_validate(body, error, error_size)) return 0;
 
     char json_error[256] = {0};
     jval *root = json_parse_full(body, json_error, sizeof(json_error));
     if (!root) {
         openai_error(error, error_size, json_error);
         return 0;
-    }
-    if (openai_body_has_decoded_nul(body)) {
-        openai_error(error, error_size,
-                     "JSON strings must not contain escaped U+0000");
-        goto fail;
     }
     if (root->t != J_OBJ) {
         openai_error(error, error_size, "request must be a JSON object");
@@ -1486,6 +1497,277 @@ static int openai_http_make_completion_id(char *id, size_t id_size) {
     return size > 0 && (size_t)size < id_size;
 }
 
+static int openai_http_make_response_id(char *id, size_t id_size) {
+    static uint64_t counter;
+    struct timespec now;
+    if (!id || !id_size || clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    uint64_t sequence = __sync_add_and_fetch(&counter, 1);
+    int size = snprintf(
+        id, id_size, "resp_%llx_%llx_%llx",
+        (unsigned long long)now.tv_sec,
+        (unsigned long long)now.tv_nsec,
+        (unsigned long long)sequence);
+    return size > 0 && (size_t)size < id_size;
+}
+
+static int openai_responses_item_id(
+    char *id, size_t id_size, const char *prefix,
+    const char *response_id, size_t index) {
+    int size = snprintf(id, id_size, "%s%s_%zu", prefix, response_id, index);
+    return size > 0 && (size_t)size < id_size;
+}
+
+static int openai_responses_send_created(
+    OpenAIHttpConnection *connection, const char *id,
+    const char *model, long long created) {
+    char *event;
+    size_t event_size;
+    FILE *output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    int formatted = fputs("{\"type\":\"response.created\",\"response\":{"
+                          "\"id\":", output) != EOF &&
+                    openai_json_string(output, id) &&
+                    fputs(",\"object\":\"response\",\"created_at\":",
+                          output) != EOF &&
+                    fprintf(output, "%lld,\"status\":\"in_progress\","
+                                    "\"model\":", created) >= 0 &&
+                    openai_json_string(output, model) &&
+                    fputs(",\"output\":[]}}", output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    return openai_sse_send_event(connection, event, event_size, formatted);
+}
+
+static int openai_responses_send_text(
+    OpenAIHttpConnection *connection, const char *response_id,
+    const char *text, size_t text_size, size_t output_index) {
+    char item_id[192];
+    if (!openai_responses_item_id(
+            item_id, sizeof(item_id), "msg_", response_id, output_index))
+        return 0;
+    char *event;
+    size_t event_size;
+    FILE *output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    int formatted = fprintf(
+        output,
+        "{\"type\":\"response.output_item.added\","
+        "\"output_index\":%zu,\"item\":{\"id\":",
+        output_index) >= 0 &&
+        openai_json_string(output, item_id) &&
+        fputs(",\"type\":\"message\",\"status\":\"in_progress\","
+              "\"role\":\"assistant\",\"content\":[]}}", output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    if (!openai_sse_send_event(connection, event, event_size, formatted)) return 0;
+
+    output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    formatted = fputs("{\"type\":\"response.output_text.delta\","
+                      "\"item_id\":", output) != EOF &&
+                openai_json_string(output, item_id) &&
+                fprintf(output,
+                        ",\"output_index\":%zu,\"content_index\":0,"
+                        "\"delta\":", output_index) >= 0 &&
+                openai_json_string_n(output, text, text_size) &&
+                fputc('}', output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    if (!openai_sse_send_event(connection, event, event_size, formatted)) return 0;
+
+    output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    formatted = fputs("{\"type\":\"response.output_text.done\","
+                      "\"item_id\":", output) != EOF &&
+                openai_json_string(output, item_id) &&
+                fprintf(output,
+                        ",\"output_index\":%zu,\"content_index\":0,"
+                        "\"text\":", output_index) >= 0 &&
+                openai_json_string_n(output, text, text_size) &&
+                fputc('}', output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    if (!openai_sse_send_event(connection, event, event_size, formatted)) return 0;
+
+    output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    formatted = fprintf(
+        output,
+        "{\"type\":\"response.output_item.done\","
+        "\"output_index\":%zu,\"item\":{\"id\":",
+        output_index) >= 0 &&
+        openai_json_string(output, item_id) &&
+        fputs(",\"type\":\"message\",\"status\":\"completed\","
+              "\"role\":\"assistant\",\"content\":[{"
+              "\"type\":\"output_text\",\"text\":", output) != EOF &&
+        openai_json_string_n(output, text, text_size) &&
+        fputs(",\"annotations\":[]}]}}", output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    return openai_sse_send_event(connection, event, event_size, formatted);
+}
+
+static int openai_responses_write_tool_item(
+    FILE *output, const OpenAIResponsesToolCall *call,
+    const char *function_id, const char *call_id, const char *status) {
+    return fputs("{\"id\":", output) != EOF &&
+           openai_json_string(output, function_id) &&
+           fputs(",\"type\":\"function_call\",\"status\":", output) != EOF &&
+           openai_json_string(output, status) &&
+           fputs(",\"name\":", output) != EOF &&
+           openai_json_string(output, call->name) &&
+           fputs(",\"call_id\":", output) != EOF &&
+           openai_json_string(output, call_id) &&
+           fputs(",\"arguments\":", output) != EOF &&
+           openai_json_string(output, call->arguments) &&
+           fputc('}', output) != EOF;
+}
+
+static int openai_responses_send_tool(
+    OpenAIHttpConnection *connection, const char *response_id,
+    const OpenAIResponsesToolCall *call, size_t output_index) {
+    char function_id[192];
+    char call_id[192];
+    if (!openai_responses_item_id(
+            function_id, sizeof(function_id), "fc_", response_id,
+            output_index) ||
+        !openai_responses_item_id(
+            call_id, sizeof(call_id), "call_", response_id,
+            output_index)) return 0;
+    char *event;
+    size_t event_size;
+    FILE *output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    int formatted = fprintf(
+        output,
+        "{\"type\":\"response.output_item.added\","
+        "\"output_index\":%zu,\"item\":{\"id\":",
+        output_index) >= 0 &&
+        openai_json_string(output, function_id) &&
+        fputs(",\"type\":\"function_call\",\"status\":\"in_progress\","
+              "\"name\":", output) != EOF &&
+        openai_json_string(output, call->name) &&
+        fputs(",\"call_id\":", output) != EOF &&
+        openai_json_string(output, call_id) &&
+        fputs(",\"arguments\":\"\"}}", output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    if (!openai_sse_send_event(connection, event, event_size, formatted)) return 0;
+
+    output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    formatted = fputs("{\"type\":\"response.function_call_arguments.delta\","
+                      "\"item_id\":", output) != EOF &&
+                openai_json_string(output, function_id) &&
+                fprintf(output, ",\"output_index\":%zu,\"delta\":",
+                        output_index) >= 0 &&
+                openai_json_string(output, call->arguments) &&
+                fputc('}', output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    if (!openai_sse_send_event(connection, event, event_size, formatted)) return 0;
+
+    output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    formatted = fputs("{\"type\":\"response.function_call_arguments.done\","
+                      "\"item_id\":", output) != EOF &&
+                openai_json_string(output, function_id) &&
+                fprintf(output, ",\"output_index\":%zu,\"name\":",
+                        output_index) >= 0 &&
+                openai_json_string(output, call->name) &&
+                fputs(",\"arguments\":", output) != EOF &&
+                openai_json_string(output, call->arguments) &&
+                fputc('}', output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    if (!openai_sse_send_event(connection, event, event_size, formatted)) return 0;
+
+    output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    formatted = fprintf(
+        output,
+        "{\"type\":\"response.output_item.done\","
+        "\"output_index\":%zu,\"item\":", output_index) >= 0 &&
+        openai_responses_write_tool_item(
+            output, call, function_id, call_id, "completed") &&
+        fputc('}', output) != EOF;
+    if (fclose(output) != 0) formatted = 0;
+    return openai_sse_send_event(connection, event, event_size, formatted);
+}
+
+static int openai_responses_write_response(
+    FILE *output, const char *id, const char *model, long long created,
+    const OpenAIResponsesOutput *content,
+    const OpenAIGenerationResult *result, int wrap_event) {
+    const char *status = result->finish_reason &&
+                         !strcmp(result->finish_reason, "length")
+        ? "incomplete" : "completed";
+    if (wrap_event &&
+        fputs("{\"type\":\"response.completed\",\"response\":", output) == EOF)
+        return 0;
+    if (fputs("{\"id\":", output) == EOF ||
+        !openai_json_string(output, id) ||
+        fputs(",\"object\":\"response\",\"created_at\":", output) == EOF ||
+        fprintf(output, "%lld,\"status\":", created) < 0 ||
+        !openai_json_string(output, status) ||
+        fputs(",\"model\":", output) == EOF ||
+        !openai_json_string(output, model)) return 0;
+    if (!strcmp(status, "incomplete") &&
+        fputs(",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}",
+              output) == EOF) return 0;
+    if (fputs(",\"output\":[", output) == EOF) return 0;
+    size_t output_index = 0;
+    if (content->text_size) {
+        char message_id[192];
+        if (!openai_responses_item_id(
+                message_id, sizeof(message_id), "msg_", id, output_index) ||
+            fputs("{\"id\":", output) == EOF ||
+            !openai_json_string(output, message_id) ||
+            fputs(",\"type\":\"message\",\"status\":", output) == EOF ||
+            !openai_json_string(output, status) ||
+            fputs(",\"role\":\"assistant\",\"content\":[{"
+                  "\"type\":\"output_text\",\"text\":", output) == EOF ||
+            !openai_json_string_n(output, content->text, content->text_size) ||
+            fputs(",\"annotations\":[]}]}", output) == EOF) return 0;
+        output_index++;
+    }
+    for (size_t i = 0; i < content->tool_call_count; i++, output_index++) {
+        char function_id[192];
+        char call_id[192];
+        if (output_index && fputc(',', output) == EOF) return 0;
+        if (!openai_responses_item_id(
+                function_id, sizeof(function_id), "fc_", id, output_index) ||
+            !openai_responses_item_id(
+                call_id, sizeof(call_id), "call_", id, output_index) ||
+            !openai_responses_write_tool_item(
+                output, &content->tool_calls[i], function_id, call_id, status))
+            return 0;
+    }
+    int uncached = result->prompt_tokens - result->cached_tokens;
+    if (uncached < 0) uncached = 0;
+    long long total = (long long)result->prompt_tokens + result->completion_tokens;
+    if (fprintf(
+            output,
+            "],\"usage\":{\"input_tokens\":%d,"
+            "\"input_tokens_details\":{\"cached_tokens\":%d,"
+            "\"cache_write_tokens\":%d},\"output_tokens\":%d,"
+            "\"output_tokens_details\":{\"reasoning_tokens\":0},"
+            "\"total_tokens\":%lld},\"floyd\":{\"prompt_ms\":%.3f,"
+            "\"decode_ms\":%.3f,\"cache_entries\":%llu,"
+            "\"cache_bytes\":%llu}}",
+            result->prompt_tokens, result->cached_tokens, uncached,
+            result->completion_tokens, total, result->prompt_ms,
+            result->decode_ms, (unsigned long long)result->cache_entries,
+            (unsigned long long)result->cache_bytes) < 0) return 0;
+    return !wrap_event || fputc('}', output) != EOF;
+}
+
+static int openai_responses_send_completed(
+    OpenAIHttpConnection *connection, const char *id, const char *model,
+    long long created, const OpenAIResponsesOutput *content,
+    const OpenAIGenerationResult *result) {
+    char *event;
+    size_t event_size;
+    FILE *output = openai_sse_event_stream(&event, &event_size);
+    if (!output) return 0;
+    int formatted = openai_responses_write_response(
+        output, id, model, created, content, result, 1);
+    if (fclose(output) != 0) formatted = 0;
+    return openai_sse_send_event(connection, event, event_size, formatted);
+}
+
 static int openai_sse_send_error(
     OpenAIHttpConnection *connection, int client_error,
     const char *message) {
@@ -1644,6 +1926,111 @@ static int openai_http_run_completion(
     return ok;
 }
 
+static int openai_http_run_responses(
+    OpenAIHttpConnection *connection, const OpenAIHttpConfig *config,
+    OpenAIGenerateHandler handler, void *user_data, char *body) {
+    OpenAIResponsesRequest request = {0};
+    char request_error[256] = {0};
+    if (!openai_responses_request_parse(
+            body, config->model_name, &request,
+            request_error, sizeof(request_error))) {
+        return openai_http_send_error(
+            connection, 400,
+            request_error[0] ? request_error : "invalid Responses request",
+            NULL, "invalid_request", NULL);
+    }
+    if (!handler) {
+        openai_responses_request_free(&request);
+        return openai_http_send_error(
+            connection, 500, "generation handler is unavailable",
+            NULL, "server_error", NULL);
+    }
+
+    OpenAIContentBuffer raw = {0};
+    OpenAIAccumulationSink accumulation = {
+        .connection = connection,
+        .buffer = &raw,
+    };
+    OpenAIUtf8Sink utf8 = {
+        .sink = openai_content_sink,
+        .sink_data = &accumulation,
+    };
+    OpenAIGenerationResult result = {0};
+    char generation_error[256] = {0};
+    int generated = handler(
+        user_data, &request.chat, openai_utf8_token_sink, &utf8,
+        &result, generation_error, sizeof(generation_error));
+    int finalized = generated == OPENAI_GENERATE_OK && openai_utf8_finish(&utf8);
+    openai_utf8_free(&utf8);
+    if (generated != OPENAI_GENERATE_OK || !finalized || raw.failed) {
+        free(raw.data);
+        openai_responses_request_free(&request);
+        int client_error = generated == OPENAI_GENERATE_CLIENT_ERROR;
+        return openai_http_send_error(
+            connection, client_error ? 400 : 500,
+            client_error && generation_error[0]
+                ? generation_error : "generation failed",
+            NULL, "generation_failed", NULL);
+    }
+
+    OpenAIResponsesOutput content = {0};
+    if (!openai_responses_output_parse(
+            raw.data ? raw.data : "", raw.size, &content)) {
+        free(raw.data);
+        openai_responses_request_free(&request);
+        return openai_http_send_error(
+            connection, 500, "could not project model output",
+            NULL, "server_error", NULL);
+    }
+    free(raw.data);
+    char id[96];
+    if (!openai_http_make_response_id(id, sizeof(id))) {
+        openai_responses_output_free(&content);
+        openai_responses_request_free(&request);
+        return openai_http_send_error(
+            connection, 500, "could not create response ID",
+            NULL, "server_error", NULL);
+    }
+    long long created = openai_created_now();
+    int ok;
+    if (request.chat.stream) {
+        ok = openai_http_send_sse_headers(connection) &&
+             openai_responses_send_created(
+                 connection, id, request.chat.model, created);
+        size_t output_index = 0;
+        if (ok && content.text_size) {
+            ok = openai_responses_send_text(
+                connection, id, content.text, content.text_size, output_index++);
+        }
+        for (size_t i = 0; ok && i < content.tool_call_count; i++) {
+            ok = openai_responses_send_tool(
+                connection, id, &content.tool_calls[i], output_index++);
+        }
+        if (ok) ok = openai_responses_send_completed(
+            connection, id, request.chat.model, created, &content, &result);
+    } else {
+        char *json = NULL;
+        size_t json_size = 0;
+        FILE *output = open_memstream(&json, &json_size);
+        int formatted = output && openai_responses_write_response(
+            output, id, request.chat.model, created, &content, &result, 0);
+        if (output && fclose(output) != 0) formatted = 0;
+        if (!formatted) {
+            free(json);
+            ok = openai_http_send_error(
+                connection, 500, "could not format response",
+                NULL, "server_error", NULL);
+        } else {
+            ok = openai_http_send_response(
+                connection, 200, "application/json", NULL, json, json_size);
+            free(json);
+        }
+    }
+    openai_responses_output_free(&content);
+    openai_responses_request_free(&request);
+    return ok;
+}
+
 static int openai_http_handle_connection_internal(
     int fd, const OpenAIHttpConfig *config,
     OpenAIGenerateHandler handler, void *user_data, int wake_fd) {
@@ -1746,7 +2133,8 @@ static int openai_http_handle_connection_internal(
         goto done;
     }
 
-    if (strcmp(request.path, "/v1/chat/completions") == 0) {
+    if (strcmp(request.path, "/v1/chat/completions") == 0 ||
+        strcmp(request.path, "/v1/responses") == 0) {
         if (strcmp(request.method, "POST") != 0) {
             ok = openai_http_send_error(
                 &connection, 405, "method not allowed",
@@ -1789,8 +2177,12 @@ static int openai_http_handle_connection_internal(
                 NULL, "invalid_json", NULL);
             goto done;
         }
-        ok = openai_http_run_completion(
-            &connection, config, handler, user_data, body);
+        if (strcmp(request.path, "/v1/responses") == 0)
+            ok = openai_http_run_responses(
+                &connection, config, handler, user_data, body);
+        else
+            ok = openai_http_run_completion(
+                &connection, config, handler, user_data, body);
         free(body);
         goto done;
     }

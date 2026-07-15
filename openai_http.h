@@ -52,6 +52,9 @@ typedef struct {
     int io_timeout_ms;
 } OpenAIHttpConfig;
 
+int openai_json_body_validate(
+    const char *body, char *error, size_t error_size);
+
 int openai_chat_request_parse(
     const char *body, const char *served_model, OpenAIChatRequest *request,
     char *error, size_t error_size);

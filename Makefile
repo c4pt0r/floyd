@@ -35,7 +35,7 @@ DEEPSEEK_V4_DS4_OBJ =
 FLOYD_OBJ = floyd.o
 DEEPSEEK_V4_CHAT_OBJ = deepseek_v4_chat.o
 DEEPSEEK_V4_SERVE_OBJ = deepseek_v4_serve.o deepseek_v4_prefix_cache.o
-OPENAI_HTTP_OBJ = openai_http.o
+OPENAI_HTTP_OBJ = openai_http.o openai_responses.o
 FLOYD_LINK = $(CC)
 LLAMA_CPP_DIR ?= .deps/llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-floyd
@@ -193,7 +193,10 @@ backend_metal.o: backend_metal.m backend_metal.h kernels_metal.h
 deepseek_v4_serve.o: deepseek_v4_serve.c deepseek_v4_serve.h json.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-openai_http.o: openai_http.c openai_http.h json.h
+openai_http.o: openai_http.c openai_http.h openai_responses.h json.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+openai_responses.o: openai_responses.c openai_responses.h openai_http.h json.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 deepseek_v4_prefix_cache.o: deepseek_v4_prefix_cache.c deepseek_v4_prefix_cache.h
@@ -210,11 +213,11 @@ metal-test: backend_metal.o tests/test_backend_metal.c backend_metal.h
 tests/test_json: tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_openai_http_protocol: tests/test_openai_http_protocol.c openai_http.c openai_http.h json.h
-	$(CC) $(CFLAGS) tests/test_openai_http_protocol.c openai_http.c -o $@ $(LDFLAGS)
+tests/test_openai_http_protocol: tests/test_openai_http_protocol.c openai_http.c openai_responses.c openai_http.h openai_responses.h json.h
+	$(CC) $(CFLAGS) tests/test_openai_http_protocol.c openai_http.c openai_responses.c -o $@ $(LDFLAGS)
 
-tests/test_openai_http_socket: tests/test_openai_http_socket.c openai_http.c openai_http.h json.h
-	$(CC) $(CFLAGS) tests/test_openai_http_socket.c openai_http.c -o $@ $(LDFLAGS)
+tests/test_openai_http_socket: tests/test_openai_http_socket.c openai_http.c openai_responses.c openai_http.h openai_responses.h json.h
+	$(CC) $(CFLAGS) tests/test_openai_http_socket.c openai_http.c openai_responses.c -o $@ $(LDFLAGS)
 
 tests/test_deepseek_v4_serve_protocol: tests/test_deepseek_v4_serve_protocol.c deepseek_v4_serve.c deepseek_v4_serve.h json.h
 	$(CC) $(CFLAGS) tests/test_deepseek_v4_serve_protocol.c deepseek_v4_serve.c -o $@ $(LDFLAGS)
