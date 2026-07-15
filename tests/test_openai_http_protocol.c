@@ -397,6 +397,8 @@ static int test_pie_responses_request_and_replay(void) {
         "\"text\":\"System\"}]},"
         "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
         "\"text\":\"Inspect\"}]},"
+        "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\","
+        "\"text\":\"Inspect first.\"}]},"
         "{\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\","
         "\"text\":\"I will inspect.\"}]},"
         "{\"type\":\"function_call\",\"call_id\":\"call_1\","
@@ -422,6 +424,7 @@ static int test_pie_responses_request_and_replay(void) {
     CHECK(strstr(request.chat.messages[0].content, "System") != NULL);
     CHECK(strcmp(request.chat.messages[1].content, "Inspect") == 0);
     CHECK(strcmp(request.chat.messages[2].role, "assistant") == 0);
+    CHECK(strcmp(request.chat.messages[2].reasoning, "Inspect first.") == 0);
     CHECK(strstr(request.chat.messages[2].content, "I will inspect.") != NULL);
     CHECK(strstr(request.chat.messages[2].content,
                  "<｜DSML｜invoke name=\"read\">") != NULL);
@@ -430,6 +433,26 @@ static int test_pie_responses_request_and_replay(void) {
     CHECK(strcmp(request.chat.messages[3].role, "user") == 0);
     CHECK(strcmp(request.chat.messages[3].content,
                  "<tool_result>Floyd README</tool_result>") == 0);
+    CHECK(request.chat.rendered_prompt != NULL);
+    static const char rendered_start[] =
+        "<｜begin▁of▁sentence｜>## Tools";
+    CHECK(strncmp(request.chat.rendered_prompt, rendered_start,
+                  strlen(rendered_start)) == 0);
+    CHECK(strstr(request.chat.rendered_prompt,
+                 "System<｜User｜>Inspect<｜Assistant｜>"
+                 "<think>Inspect first.</think>"
+                 "I will inspect.\n\n<｜DSML｜tool_calls>") != NULL);
+    CHECK(strstr(request.chat.rendered_prompt,
+                 "<｜end▁of▁sentence｜><｜User｜>"
+                 "<tool_result>Floyd README</tool_result>"
+                 "<｜Assistant｜><think>") != NULL);
+    CHECK(request.chat.rendered_anchor_bytes > 0);
+    CHECK(request.chat.rendered_anchor_bytes <
+          strlen(request.chat.rendered_prompt));
+    static const char rendered_tail[] = "<｜User｜><tool_result>";
+    CHECK(strncmp(request.chat.rendered_prompt +
+                      request.chat.rendered_anchor_bytes,
+                  rendered_tail, strlen(rendered_tail)) == 0);
     openai_responses_request_free(&request);
 
     static const char *invalid[] = {
@@ -453,6 +476,7 @@ static int test_pie_responses_request_and_replay(void) {
 
 static int test_responses_dsml_projection(void) {
     static const char raw[] =
+        "<think>Use the bash tool.</think>\n\n"
         "Checking.\n\n<｜DSML｜tool_calls>\n"
         "<｜DSML｜invoke name=\"bash\">\n"
         "<｜DSML｜parameter name=\"command\" string=\"true\">pwd &amp;&amp; ls"
@@ -463,12 +487,41 @@ static int test_responses_dsml_projection(void) {
         "</｜DSML｜tool_calls>";
     OpenAIResponsesOutput output = {0};
     CHECK(openai_responses_output_parse(
-        raw, sizeof(raw) - 1, &output));
+        raw, sizeof(raw) - 1, 1, &output));
+    CHECK(strcmp(output.reasoning, "Use the bash tool.") == 0);
     CHECK(strcmp(output.text, "Checking.") == 0);
     CHECK(output.tool_call_count == 1);
     CHECK(strcmp(output.tool_calls[0].name, "bash") == 0);
     CHECK(strcmp(output.tool_calls[0].arguments,
                  "{\"command\":\"pwd && ls\",\"timeout\":10}") == 0);
+    openai_responses_output_free(&output);
+
+    static const char quantized_raw[] =
+        "Use ls.</think>\n\n"
+        "<｜DSML｜tool_cls>\n"
+        "<｜DSML｜invoke name=\"ls\">\n"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">."
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜inv>\n"
+        "</｜DSML｜tool_cls>";
+    memset(&output, 0, sizeof(output));
+    CHECK(openai_responses_output_parse(
+        quantized_raw, sizeof(quantized_raw) - 1, 1, &output));
+    CHECK(strcmp(output.reasoning, "Use ls.") == 0);
+    CHECK(output.tool_call_count == 1);
+    CHECK(strcmp(output.tool_calls[0].name, "ls") == 0);
+    CHECK(strcmp(output.tool_calls[0].arguments, "{\"path\":\".\"}") == 0);
+    openai_responses_output_free(&output);
+
+    static const char unclosed_thinking[] =
+        "Considering <｜DSML｜tool_cls><｜DSML｜invoke name=\"ls\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">."
+        "</｜DSML｜parameter></｜DSML｜inv></｜DSML｜tool_cls>";
+    memset(&output, 0, sizeof(output));
+    CHECK(openai_responses_output_parse(
+        unclosed_thinking, sizeof(unclosed_thinking) - 1, 1, &output));
+    CHECK(output.tool_call_count == 0);
+    CHECK(strcmp(output.reasoning, unclosed_thinking) == 0);
     openai_responses_output_free(&output);
     return 0;
 }

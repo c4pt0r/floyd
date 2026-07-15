@@ -7,6 +7,7 @@
 typedef struct {
     char *role;
     char *content;
+    char *reasoning;
 } OpenAIMessage;
 
 typedef struct {
@@ -18,6 +19,9 @@ typedef struct {
     float top_p;
     int stream;
     int include_usage;
+    char *rendered_prompt;
+    size_t rendered_anchor_bytes;
+    int rendered_thinking;
 } OpenAIChatRequest;
 
 typedef struct {

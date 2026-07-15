@@ -183,6 +183,42 @@ static char *responses_content_text(const jval *content,
     return text;
 }
 
+static char *responses_reasoning_text(const jval *item,
+                                      char *error, size_t error_size) {
+    jval *summary = json_get((jval *)item, "summary");
+    if (!summary || summary->t != J_ARR) {
+        responses_error(error, error_size,
+                        "reasoning summary must be an array");
+        return NULL;
+    }
+    char *text = NULL;
+    size_t text_size = 0;
+    FILE *stream = open_memstream(&text, &text_size);
+    if (!stream) return NULL;
+    int ok = 1;
+    for (int i = 0; i < summary->len && ok; i++) {
+        jval *part = summary->kids[i];
+        jval *type = part && part->t == J_OBJ ? json_get(part, "type") : NULL;
+        jval *value = part && part->t == J_OBJ ? json_get(part, "text") : NULL;
+        if (!part || part->t != J_OBJ || !responses_unique_keys(part) ||
+            !type || type->t != J_STR || strcmp(type->str, "summary_text") ||
+            !value || value->t != J_STR) {
+            responses_error(error, error_size,
+                            "reasoning summary only supports summary_text");
+            ok = 0;
+            break;
+        }
+        if (i && fputc('\n', stream) == EOF) ok = 0;
+        if (ok && fputs(value->str, stream) == EOF) ok = 0;
+    }
+    if (fclose(stream) != 0) ok = 0;
+    if (!ok) {
+        free(text);
+        return NULL;
+    }
+    return text;
+}
+
 static int responses_dsml_attr(FILE *output, const char *value) {
     for (const unsigned char *p = (const unsigned char *)(value ? value : "");
          *p; p++) {
@@ -290,16 +326,28 @@ static char *responses_tools_prompt(const jval *tools) {
     int ok = fputs(
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
-        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block:\n\n"
+        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
         "<｜DSML｜tool_calls>\n"
         "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
         "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">"
         "$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        "...\n"
         "</｜DSML｜invoke>\n"
         "</｜DSML｜tool_calls>\n\n"
-        "String parameters use raw text with string=\"true\". Numbers, booleans, "
-        "arrays, and objects use JSON with string=\"false\". Use exact tool and "
-        "parameter names.\n\n### Available Tool Schemas\n\n", stream) != EOF;
+        "String parameters should be specified as raw text and set `string=\"true\"`. "
+        "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal "
+        "string characters with XML or HTML entity escapes. Only if a string value "
+        "itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write "
+        "that tag as `&lt;/｜DSML｜parameter>` inside the value. For all other types "
+        "(numbers, booleans, arrays, objects), pass the value in JSON format and set "
+        "`string=\"false\"`.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your "
+        "complete reasoning inside <think>...</think> BEFORE any tool calls or final "
+        "response.\n\nOtherwise, output directly after </think> with tool calls or "
+        "final response.\n\n### Available Tool Schemas\n\n", stream) != EOF;
     for (int i = 0; i < tools->len && ok; i++) {
         jval *tool = tools->kids[i];
         jval *type = tool && tool->t == J_OBJ ? json_get(tool, "type") : NULL;
@@ -313,6 +361,10 @@ static char *responses_tools_prompt(const jval *tools) {
         if (i && fputc('\n', stream) == EOF) ok = 0;
         if (ok) ok = responses_json_value(stream, tool);
     }
+    if (ok) ok = fputs(
+        "\n\nYou MUST strictly follow the above defined tool name and parameter "
+        "schemas to invoke tool calls. Use the exact parameter names from the schemas.",
+        stream) != EOF;
     if (fclose(stream) != 0) ok = 0;
     if (!ok) {
         free(prompt);
@@ -360,6 +412,59 @@ static int responses_prepend_system(OpenAIChatRequest *chat,
     return 1;
 }
 
+static int responses_render_prompt(OpenAIChatRequest *chat, int thinking) {
+    char *rendered = NULL;
+    size_t rendered_size = 0;
+    FILE *stream = open_memstream(&rendered, &rendered_size);
+    if (!stream) return 0;
+    int ok = fputs("<｜begin▁of▁sentence｜>", stream) != EOF;
+    int wrote_system = 0;
+    for (size_t i = 0; i < chat->message_count && ok; i++) {
+        if (strcmp(chat->messages[i].role, "system") != 0) continue;
+        if (wrote_system) ok = fputs("\n\n", stream) != EOF;
+        if (ok) ok = fputs(chat->messages[i].content, stream) != EOF;
+        wrote_system = 1;
+    }
+    for (size_t i = 0; i < chat->message_count && ok; i++) {
+        OpenAIMessage *message = &chat->messages[i];
+        if (!strcmp(message->role, "system")) continue;
+        if (i + 1 == chat->message_count) {
+            if (fflush(stream) != 0) {
+                ok = 0;
+                break;
+            }
+            chat->rendered_anchor_bytes = rendered_size;
+        }
+        if (!strcmp(message->role, "user")) {
+            ok = fputs("<｜User｜>", stream) != EOF &&
+                 fputs(message->content, stream) != EOF;
+        } else if (!strcmp(message->role, "assistant")) {
+            ok = fputs("<｜Assistant｜>", stream) != EOF;
+            if (ok && thinking)
+                ok = fputs("<think>", stream) != EOF &&
+                     fputs(message->reasoning ? message->reasoning : "", stream) != EOF &&
+                     fputs("</think>", stream) != EOF;
+            else if (ok)
+                ok = fputs("</think>", stream) != EOF;
+            ok = ok && fputs(message->content, stream) != EOF &&
+                 fputs("<｜end▁of▁sentence｜>", stream) != EOF;
+        } else {
+            ok = 0;
+        }
+    }
+    if (ok) ok = fputs(thinking ? "<｜Assistant｜><think>"
+                                : "<｜Assistant｜></think>", stream) != EOF;
+    if (fclose(stream) != 0) ok = 0;
+    if (!ok) {
+        free(rendered);
+        chat->rendered_anchor_bytes = 0;
+        return 0;
+    }
+    chat->rendered_prompt = rendered;
+    chat->rendered_thinking = thinking;
+    return 1;
+}
+
 static int responses_model_matches(const char *served, const char *requested) {
     if (strcmp(served, requested) == 0) return 1;
     return (!strcmp(served, "deepseek-v4") &&
@@ -380,6 +485,25 @@ static int responses_parse_number(const jval *root, const char *name,
         value->num < min || value->num > max) return 0;
     *output = value->num;
     return 1;
+}
+
+static int responses_thinking_enabled(const jval *root, int *enabled) {
+    *enabled = 1;
+    jval *reasoning = json_get((jval *)root, "reasoning");
+    if (!reasoning || reasoning->t == J_NULL) return 1;
+    if (reasoning->t != J_OBJ || !responses_unique_keys(reasoning)) return 0;
+    jval *effort = json_get(reasoning, "effort");
+    if (!effort || effort->t == J_NULL) return 1;
+    if (effort->t != J_STR) return 0;
+    static const char *accepted[] = {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    };
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        if (strcmp(effort->str, accepted[i]) != 0) continue;
+        *enabled = strcmp(effort->str, "none") != 0;
+        return 1;
+    }
+    return 0;
 }
 
 void openai_responses_request_free(OpenAIResponsesRequest *request) {
@@ -404,6 +528,7 @@ int openai_responses_request_parse(
 
     char parse_error[256] = {0};
     jval *root = json_parse_full(body, parse_error, sizeof(parse_error));
+    char *pending_reasoning = NULL;
     if (!root) {
         responses_error(error, error_size, parse_error);
         return 0;
@@ -503,8 +628,16 @@ int openai_responses_request_parse(
             int added = responses_add_message(&request->chat, role_name, text);
             free(text);
             if (!added) goto oom;
+            if (!strcmp(role_name, "assistant") && pending_reasoning) {
+                request->chat.messages[request->chat.message_count - 1].reasoning =
+                    pending_reasoning;
+                pending_reasoning = NULL;
+            }
         } else if (!strcmp(kind, "reasoning")) {
-            continue;
+            free(pending_reasoning);
+            pending_reasoning = responses_reasoning_text(
+                item, error, error_size);
+            if (!pending_reasoning) goto fail;
         } else if (!strcmp(kind, "function_call")) {
             jval *name = json_get(item, "name");
             jval *arguments = json_get(item, "arguments");
@@ -519,6 +652,13 @@ int openai_responses_request_parse(
                     request->chat.message_count - 1].role, "assistant")) {
                 if (!responses_add_message(&request->chat, "assistant", ""))
                     goto oom;
+            }
+            if (pending_reasoning &&
+                !request->chat.messages[
+                    request->chat.message_count - 1].reasoning) {
+                request->chat.messages[
+                    request->chat.message_count - 1].reasoning = pending_reasoning;
+                pending_reasoning = NULL;
             }
             char *dsml = responses_render_function_call(
                 name->str, arguments->str);
@@ -560,6 +700,8 @@ int openai_responses_request_parse(
             goto fail;
         }
     }
+    free(pending_reasoning);
+    pending_reasoning = NULL;
 
     char *tools_prompt = responses_tools_prompt(json_get(root, "tools"));
     if (!tools_prompt) {
@@ -576,6 +718,12 @@ int openai_responses_request_parse(
                         "the last Responses input must be user or tool output");
         goto fail;
     }
+    int thinking = 1;
+    if (!responses_thinking_enabled(root, &thinking)) {
+        responses_error(error, error_size, "reasoning effort is not supported");
+        goto fail;
+    }
+    if (!responses_render_prompt(&request->chat, thinking)) goto oom;
 
     json_free(root);
     return 1;
@@ -583,6 +731,7 @@ int openai_responses_request_parse(
 oom:
     responses_error(error, error_size, "out of memory parsing Responses request");
 fail:
+    free(pending_reasoning);
     json_free(root);
     openai_responses_request_free(request);
     return 0;
@@ -673,13 +822,52 @@ static const char *responses_tool_start(const char *raw,
             best_index = i;
         }
     }
-    if (!best) return NULL;
+    if (!best) {
+        static const char *loose_starts[] = {
+            "<｜DSML｜tool_cls>", "<DSML｜tool_cls>", "<tool_cls>",
+        };
+        const char *loose = NULL;
+        for (size_t i = 0; i < sizeof(loose_starts) / sizeof(loose_starts[0]); i++) {
+            const char *found = strstr(raw, loose_starts[i]);
+            if (found && (!loose || found < loose)) loose = found;
+        }
+        if (!loose) return NULL;
+        for (size_t i = 0; i < sizeof(invokes) / sizeof(invokes[0]); i++) {
+            const char *found = strstr(loose, invokes[i]);
+            if (found && (!best || found < best)) {
+                best = found;
+                best_index = i;
+            }
+        }
+        if (!best) return NULL;
+        *end_tag = NULL;
+        *invoke_start = invokes[best_index];
+        *invoke_end = invoke_ends[best_index];
+        *param_start = params[best_index];
+        *param_end = param_ends[best_index];
+        return best;
+    }
     *end_tag = ends[best_index];
     *invoke_start = invokes[best_index];
     *invoke_end = invoke_ends[best_index];
     *param_start = params[best_index];
     *param_end = param_ends[best_index];
     return best + strlen(starts[best_index]);
+}
+
+static const char *responses_invoke_close(const char *cursor,
+                                          const char *invoke_end) {
+    size_t exact_size = strlen(invoke_end);
+    if (!strncmp(cursor, invoke_end, exact_size)) return cursor + exact_size;
+    static const char *short_closes[] = {
+        "</｜DSML｜inv", "</DSML｜inv", "</inv",
+    };
+    for (size_t i = 0; i < sizeof(short_closes) / sizeof(short_closes[0]); i++) {
+        size_t size = strlen(short_closes[i]);
+        if (strncmp(cursor, short_closes[i], size)) continue;
+        return cursor[size] == '>' ? cursor + size + 1 : NULL;
+    }
+    return NULL;
 }
 
 static int responses_output_add_call(OpenAIResponsesOutput *output,
@@ -700,6 +888,7 @@ static int responses_output_add_call(OpenAIResponsesOutput *output,
 void openai_responses_output_free(OpenAIResponsesOutput *output) {
     if (!output) return;
     free(output->text);
+    free(output->reasoning);
     for (size_t i = 0; i < output->tool_call_count; i++) {
         free(output->tool_calls[i].name);
         free(output->tool_calls[i].arguments);
@@ -709,39 +898,67 @@ void openai_responses_output_free(OpenAIResponsesOutput *output) {
 }
 
 int openai_responses_output_parse(
-    const char *raw, size_t raw_size, OpenAIResponsesOutput *output) {
+    const char *raw, size_t raw_size, int thinking,
+    OpenAIResponsesOutput *output) {
     if (!output || (!raw && raw_size)) return 0;
     memset(output, 0, sizeof(*output));
     char *copy = responses_strndup(raw ? raw : "", raw_size);
     if (!copy) return 0;
+    const char *visible = copy;
+    if (thinking) {
+        const char *reasoning_start = !strncmp(visible, "<think>", 7)
+            ? visible + 7 : visible;
+        const char *reasoning_end = strstr(reasoning_start, "</think>");
+        if (reasoning_end) {
+            output->reasoning = responses_strndup(
+                reasoning_start, (size_t)(reasoning_end - reasoning_start));
+            if (!output->reasoning) goto fail;
+            visible = reasoning_end + 8;
+        } else {
+            output->reasoning = responses_strdup(reasoning_start);
+            output->text = responses_strdup("");
+            output->text_size = 0;
+            free(copy);
+            return output->reasoning && output->text;
+        }
+    }
     const char *end_tag = NULL;
     const char *invoke_start = NULL;
     const char *invoke_end = NULL;
     const char *param_start = NULL;
     const char *param_end = NULL;
     const char *cursor = responses_tool_start(
-        copy, &end_tag, &invoke_start, &invoke_end, &param_start, &param_end);
+        visible, &end_tag, &invoke_start, &invoke_end, &param_start, &param_end);
     if (!cursor) {
-        output->text = copy;
-        output->text_size = raw_size;
-        return 1;
+        output->text = responses_strdup(visible);
+        output->text_size = strlen(visible);
+        free(copy);
+        return output->text != NULL;
     }
     const char *block_start = cursor;
-    while (block_start > copy && block_start[-1] != '<') block_start--;
-    if (block_start > copy) block_start--;
-    size_t text_size = (size_t)(block_start - copy);
-    while (text_size && (copy[text_size - 1] == ' ' ||
-                         copy[text_size - 1] == '\t' ||
-                         copy[text_size - 1] == '\r' ||
-                         copy[text_size - 1] == '\n')) text_size--;
-    output->text = responses_strndup(copy, text_size);
+    while (block_start > visible && block_start[-1] != '<') block_start--;
+    if (block_start > visible) block_start--;
+    size_t text_size = (size_t)(block_start - visible);
+    while (text_size && (visible[text_size - 1] == ' ' ||
+                         visible[text_size - 1] == '\t' ||
+                         visible[text_size - 1] == '\r' ||
+                         visible[text_size - 1] == '\n')) text_size--;
+    while (text_size && (*visible == ' ' || *visible == '\t' ||
+                         *visible == '\r' || *visible == '\n')) {
+        visible++;
+        text_size--;
+    }
+    output->text = responses_strndup(visible, text_size);
     output->text_size = text_size;
     if (!output->text) goto fail;
 
     for (;;) {
         cursor = responses_skip_space(cursor);
-        if (!strncmp(cursor, end_tag, strlen(end_tag))) break;
-        if (strncmp(cursor, invoke_start, strlen(invoke_start))) goto fail;
+        if (end_tag && !strncmp(cursor, end_tag, strlen(end_tag))) break;
+        if (strncmp(cursor, invoke_start, strlen(invoke_start))) {
+            if (!end_tag && output->tool_call_count > 0) break;
+            goto fail;
+        }
         const char *tag_end = strchr(cursor, '>');
         if (!tag_end) goto fail;
         char *name = responses_xml_attr(
@@ -762,8 +979,10 @@ int openai_responses_output_parse(
         int parameter_count = 0;
         while (ok) {
             cursor = responses_skip_space(cursor);
-            if (!strncmp(cursor, invoke_end, strlen(invoke_end))) {
-                cursor += strlen(invoke_end);
+            const char *after_invoke = responses_invoke_close(
+                cursor, invoke_end);
+            if (after_invoke) {
+                cursor = after_invoke;
                 break;
             }
             if (strncmp(cursor, param_start, strlen(param_start))) {

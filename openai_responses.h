@@ -17,6 +17,7 @@ typedef struct {
 typedef struct {
     char *text;
     size_t text_size;
+    char *reasoning;
     OpenAIResponsesToolCall *tool_calls;
     size_t tool_call_count;
 } OpenAIResponsesOutput;
@@ -27,7 +28,8 @@ int openai_responses_request_parse(
 void openai_responses_request_free(OpenAIResponsesRequest *request);
 
 int openai_responses_output_parse(
-    const char *raw, size_t raw_size, OpenAIResponsesOutput *output);
+    const char *raw, size_t raw_size, int thinking,
+    OpenAIResponsesOutput *output);
 void openai_responses_output_free(OpenAIResponsesOutput *output);
 
 #endif

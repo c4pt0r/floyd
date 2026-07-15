@@ -1126,7 +1126,8 @@ static int test_pie_responses_streaming(void) {
         "\"tools\":[{\"type\":\"function\",\"name\":\"ls\","
         "\"description\":\"List files\",\"parameters\":{\"type\":\"object\","
         "\"properties\":{\"path\":{\"type\":\"string\"}}}}],"
-        "\"stream\":true,\"store\":false,\"max_output_tokens\":8}"
+        "\"stream\":true,\"store\":false,\"max_output_tokens\":8,"
+        "\"reasoning\":{\"effort\":\"none\"}}"
         ;
 
     PieResponsesContext pie = {0};

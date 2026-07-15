@@ -816,34 +816,20 @@ static void ds4_stats_add_spec_delta(
     }
 }
 
-int deepseek_v4_ds4_generate_messages(
+static int ds4_generate_prompt(
     DeepSeekV4Ds4Session *session,
-    const DeepSeekV4Ds4Message *messages, size_t message_count,
+    ds4_tokens prompt, int anchor_tokens,
     const DeepSeekV4Ds4RequestConfig *config,
     DeepSeekV4Ds4TokenCallback callback, void *user_data,
     DeepSeekV4Ds4Stats *stats, char *error, size_t error_size) {
-    if (!session ||
-        !deepseek_v4_ds4_request_config_validate(config, error, error_size) ||
-        !ds4_messages_validate(messages, message_count, error, error_size))
-        return -1;
     if (config->draft > 1 && !session->use_spec) {
         if (error && error_size)
             snprintf(error, error_size, "speculative draft requested without DSpark support");
+        ds4_tokens_free(&prompt);
         return -1;
     }
     if (stats) memset(stats, 0, sizeof(*stats));
 
-    ds4_tokens prompt = {0};
-    ds4_chat_begin(session->engine, &prompt);
-    for (size_t i = 0; i + 1 < message_count; i++)
-        ds4_chat_append_message(
-            session->engine, &prompt, messages[i].role, messages[i].content);
-    int anchor_tokens = prompt.len;
-    ds4_chat_append_message(
-        session->engine, &prompt, messages[message_count - 1].role,
-        messages[message_count - 1].content);
-    ds4_chat_append_assistant_prefix(
-        session->engine, &prompt, DS4_THINK_NONE);
     if (prompt.len >= session->max_context) {
         if (error && error_size)
             snprintf(error, error_size, "prompt exceeds DS4 context");
@@ -879,7 +865,7 @@ int deepseek_v4_ds4_generate_messages(
     }
 
     if (session->prefix_cache.budget_bytes > 0 &&
-        message_count > 1 && cached_tokens < anchor_tokens) {
+        anchor_tokens > 0 && cached_tokens < anchor_tokens) {
         int full_tokens = prompt.len;
         prompt.len = anchor_tokens;
         if (ds4_session_sync(session->session, &prompt, error, error_size) != 0) {
@@ -976,6 +962,77 @@ int deepseek_v4_ds4_generate_messages(
             session->engine, session->draft_tokens);
     ds4_tokens_free(&prompt);
     return generated;
+}
+
+int deepseek_v4_ds4_generate_messages(
+    DeepSeekV4Ds4Session *session,
+    const DeepSeekV4Ds4Message *messages, size_t message_count,
+    const DeepSeekV4Ds4RequestConfig *config,
+    DeepSeekV4Ds4TokenCallback callback, void *user_data,
+    DeepSeekV4Ds4Stats *stats, char *error, size_t error_size) {
+    if (!session ||
+        !deepseek_v4_ds4_request_config_validate(config, error, error_size) ||
+        !ds4_messages_validate(messages, message_count, error, error_size))
+        return -1;
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(session->engine, &prompt);
+    for (size_t i = 0; i + 1 < message_count; i++)
+        ds4_chat_append_message(
+            session->engine, &prompt, messages[i].role, messages[i].content);
+    int anchor_tokens = prompt.len;
+    ds4_chat_append_message(
+        session->engine, &prompt, messages[message_count - 1].role,
+        messages[message_count - 1].content);
+    ds4_chat_append_assistant_prefix(
+        session->engine, &prompt, DS4_THINK_NONE);
+    return ds4_generate_prompt(
+        session, prompt, anchor_tokens, config, callback, user_data,
+        stats, error, error_size);
+}
+
+int deepseek_v4_ds4_generate_rendered(
+    DeepSeekV4Ds4Session *session,
+    const char *rendered_prompt, size_t anchor_bytes,
+    const DeepSeekV4Ds4RequestConfig *config,
+    DeepSeekV4Ds4TokenCallback callback, void *user_data,
+    DeepSeekV4Ds4Stats *stats, char *error, size_t error_size) {
+    if (!session || !rendered_prompt || !rendered_prompt[0] ||
+        anchor_bytes > strlen(rendered_prompt)) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid rendered DS4 prompt");
+        return -1;
+    }
+    if (!deepseek_v4_ds4_request_config_validate(
+            config, error, error_size)) return -1;
+    ds4_tokens prompt = {0};
+    ds4_tokenize_rendered_chat(session->engine, rendered_prompt, &prompt);
+    int anchor_tokens = 0;
+    if (anchor_bytes > 0) {
+        char *anchor = malloc(anchor_bytes + 1);
+        if (!anchor) {
+            ds4_tokens_free(&prompt);
+            if (error && error_size)
+                snprintf(error, error_size, "out of memory tokenizing DS4 prompt");
+            return -1;
+        }
+        memcpy(anchor, rendered_prompt, anchor_bytes);
+        anchor[anchor_bytes] = 0;
+        ds4_tokens prefix = {0};
+        ds4_tokenize_rendered_chat(session->engine, anchor, &prefix);
+        free(anchor);
+        if (!ds4_tokens_starts_with(&prompt, &prefix)) {
+            ds4_tokens_free(&prefix);
+            ds4_tokens_free(&prompt);
+            if (error && error_size)
+                snprintf(error, error_size, "rendered DS4 cache boundary is not token aligned");
+            return -1;
+        }
+        anchor_tokens = prefix.len;
+        ds4_tokens_free(&prefix);
+    }
+    return ds4_generate_prompt(
+        session, prompt, anchor_tokens, config, callback, user_data,
+        stats, error, error_size);
 }
 
 void deepseek_v4_ds4_close(DeepSeekV4Ds4Session *session) {

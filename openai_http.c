@@ -447,9 +447,11 @@ static int openai_unique_object_keys(jval *object,
 void openai_chat_request_free(OpenAIChatRequest *request) {
     if (!request) return;
     free(request->model);
+    free(request->rendered_prompt);
     for (size_t i = 0; i < request->message_count; i++) {
         free(request->messages[i].role);
         free(request->messages[i].content);
+        free(request->messages[i].reasoning);
     }
     free(request->messages);
     memset(request, 0, sizeof(*request));
@@ -1975,7 +1977,8 @@ static int openai_http_run_responses(
 
     OpenAIResponsesOutput content = {0};
     if (!openai_responses_output_parse(
-            raw.data ? raw.data : "", raw.size, &content)) {
+            raw.data ? raw.data : "", raw.size,
+            request.chat.rendered_thinking, &content)) {
         free(raw.data);
         openai_responses_request_free(&request);
         return openai_http_send_error(

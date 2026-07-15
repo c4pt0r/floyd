@@ -217,6 +217,7 @@ static int serve_buffer_emit(int token, const char *piece, size_t piece_size,
 static int serve_generate(
     ServeContext *context,
     const DeepSeekV4Ds4Message *messages, size_t message_count,
+    const char *rendered_prompt, size_t rendered_anchor_bytes,
     int max_tokens, float temperature, float top_p, int draft,
     OpenAITokenSink sink, void *sink_data,
     OpenAIGenerationResult *result, char *error, size_t error_size) {
@@ -228,9 +229,13 @@ static int serve_generate(
         .draft = draft,
     };
     DeepSeekV4Ds4Stats stats;
-    int generated = deepseek_v4_ds4_generate_messages(
-        context->session, messages, message_count, &config,
-        sink, sink_data, &stats, error, error_size);
+    int generated = rendered_prompt
+        ? deepseek_v4_ds4_generate_rendered(
+              context->session, rendered_prompt, rendered_anchor_bytes,
+              &config, sink, sink_data, &stats, error, error_size)
+        : deepseek_v4_ds4_generate_messages(
+              context->session, messages, message_count, &config,
+              sink, sink_data, &stats, error, error_size);
     if (generated < 0) return 0;
 
     result->prompt_tokens = stats.prompt_tokens + stats.cached_tokens;
@@ -278,7 +283,7 @@ static int serve_request(void *user_data,
     if (request->draft < 0 && request->temperature > 0.0f) draft = 1;
     OpenAIGenerationResult result = {0};
     int generated = serve_generate(
-        context, messages, message_count, request->max_tokens,
+        context, messages, message_count, NULL, 0, request->max_tokens,
         request->temperature, request->top_p, draft,
         serve_buffer_emit, context, &result, error, error_size);
     free(messages);
@@ -315,7 +320,9 @@ static int serve_openai_request(
     int draft = deepseek_v4_openai_effective_draft(
         context->options->draft, request->temperature);
     int generated = serve_generate(
-        context, messages, request->message_count, request->max_tokens,
+        context, messages, request->message_count,
+        request->rendered_prompt, request->rendered_anchor_bytes,
+        request->max_tokens,
         request->temperature, request->top_p, draft,
         sink, sink_data, result, error, error_size);
     free(messages);

@@ -106,6 +106,12 @@ int deepseek_v4_ds4_generate_messages(
     const DeepSeekV4Ds4RequestConfig *config,
     DeepSeekV4Ds4TokenCallback callback, void *user_data,
     DeepSeekV4Ds4Stats *stats, char *error, size_t error_size);
+int deepseek_v4_ds4_generate_rendered(
+    DeepSeekV4Ds4Session *session,
+    const char *rendered_prompt, size_t anchor_bytes,
+    const DeepSeekV4Ds4RequestConfig *config,
+    DeepSeekV4Ds4TokenCallback callback, void *user_data,
+    DeepSeekV4Ds4Stats *stats, char *error, size_t error_size);
 void deepseek_v4_ds4_close(DeepSeekV4Ds4Session *session);
 
 #ifdef __cplusplus
