@@ -7,6 +7,7 @@
 
 typedef struct {
     OpenAIChatRequest chat;
+    int has_tools;
 } OpenAIResponsesRequest;
 
 typedef struct {
@@ -20,6 +21,7 @@ typedef struct {
     char *reasoning;
     OpenAIResponsesToolCall *tool_calls;
     size_t tool_call_count;
+    int malformed_tool_call;
 } OpenAIResponsesOutput;
 
 int openai_responses_request_parse(

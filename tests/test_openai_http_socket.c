@@ -58,6 +58,7 @@ typedef struct {
 typedef struct {
     int calls;
     int emit_tool_call;
+    int malformed_first;
 } PieResponsesContext;
 
 static int fake_generate(void *ctx, const OpenAIChatRequest *request,
@@ -225,8 +226,15 @@ static int pie_responses_generate(
     CHECK(strstr(request->messages[0].content, "\"name\":\"ls\"") != NULL);
     CHECK(strcmp(request->messages[1].role, "user") == 0);
     CHECK(strcmp(request->messages[1].content, "Reply OK") == 0);
-    pie->calls++;
-    if (pie->emit_tool_call) {
+    int call = pie->calls++;
+    if (pie->malformed_first && call == 0) {
+        static const char malformed[] =
+            "Need ls.</think>\n\n"
+            "<｜DSML｜tool_calls>\n<｜DSML｜invtest";
+        CHECK(strstr(request->rendered_prompt,
+                     "Tool protocol correction") == NULL);
+        CHECK(sink(1, malformed, sizeof(malformed) - 1, sink_data));
+    } else if (pie->emit_tool_call || pie->malformed_first) {
         static const char dsml[] =
             "<｜DSML｜tool_calls>\n"
             "<｜DSML｜invoke name=\"ls\">\n"
@@ -234,6 +242,9 @@ static int pie_responses_generate(
             "</｜DSML｜parameter>\n"
             "</｜DSML｜invoke>\n"
             "</｜DSML｜tool_calls>";
+        if (pie->malformed_first)
+            CHECK(strstr(request->rendered_prompt,
+                         "Tool protocol correction") != NULL);
         CHECK(sink(1, dsml, sizeof(dsml) - 1, sink_data));
     } else {
         CHECK(sink(1, "OK", 2, sink_data));
@@ -1169,6 +1180,17 @@ static int test_pie_responses_streaming(void) {
     CHECK(strstr(response, "{\\\"path\\\":\\\".\\\"}") != NULL);
     CHECK(strstr(response, "DSML") == NULL);
     CHECK(pie.calls == 2);
+    free(response);
+
+    PieResponsesContext retry = {.malformed_first = 1};
+    response = post_path_request_handler(
+        &config, pie_responses_generate, &retry, "/v1/responses", body);
+    CHECK(has_status(response, 200));
+    CHECK(strstr(response, "\"type\":\"response.function_call_arguments.done\"") != NULL);
+    CHECK(strstr(response, "\"name\":\"ls\"") != NULL);
+    CHECK(strstr(response, "{\\\"path\\\":\\\".\\\"}") != NULL);
+    CHECK(strstr(response, "invtest") == NULL);
+    CHECK(retry.calls == 2);
     free(response);
     return 0;
 }

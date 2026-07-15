@@ -1928,6 +1928,33 @@ static int openai_http_run_completion(
     return ok;
 }
 
+static char *openai_responses_retry_prompt(
+    const OpenAIChatRequest *request) {
+    static const char correction[] =
+        "\n\nTool protocol correction: emit one complete tool call. "
+        "Spell the tag names tool_calls, invoke, and parameter exactly; "
+        "never abbreviate or invent tag names. Every invoke must include its "
+        "tool name and all required parameters. After closing the reasoning "
+        "section, emit only the tool call block.";
+    if (!request || !request->rendered_prompt) return NULL;
+    const char *suffix = request->rendered_thinking
+        ? "<｜Assistant｜><think>" : "<｜Assistant｜></think>";
+    size_t prompt_size = strlen(request->rendered_prompt);
+    size_t suffix_size = strlen(suffix);
+    size_t correction_size = sizeof(correction) - 1;
+    if (prompt_size < suffix_size ||
+        memcmp(request->rendered_prompt + prompt_size - suffix_size,
+               suffix, suffix_size) != 0 ||
+        correction_size > SIZE_MAX - prompt_size - 1) return NULL;
+    size_t base_size = prompt_size - suffix_size;
+    char *retry = malloc(prompt_size + correction_size + 1);
+    if (!retry) return NULL;
+    memcpy(retry, request->rendered_prompt, base_size);
+    memcpy(retry + base_size, correction, correction_size);
+    memcpy(retry + base_size + correction_size, suffix, suffix_size + 1);
+    return retry;
+}
+
 static int openai_http_run_responses(
     OpenAIHttpConnection *connection, const OpenAIHttpConfig *config,
     OpenAIGenerateHandler handler, void *user_data, char *body) {
@@ -1948,44 +1975,60 @@ static int openai_http_run_responses(
             NULL, "server_error", NULL);
     }
 
-    OpenAIContentBuffer raw = {0};
-    OpenAIAccumulationSink accumulation = {
-        .connection = connection,
-        .buffer = &raw,
-    };
-    OpenAIUtf8Sink utf8 = {
-        .sink = openai_content_sink,
-        .sink_data = &accumulation,
-    };
     OpenAIGenerationResult result = {0};
-    char generation_error[256] = {0};
-    int generated = handler(
-        user_data, &request.chat, openai_utf8_token_sink, &utf8,
-        &result, generation_error, sizeof(generation_error));
-    int finalized = generated == OPENAI_GENERATE_OK && openai_utf8_finish(&utf8);
-    openai_utf8_free(&utf8);
-    if (generated != OPENAI_GENERATE_OK || !finalized || raw.failed) {
-        free(raw.data);
-        openai_responses_request_free(&request);
-        int client_error = generated == OPENAI_GENERATE_CLIENT_ERROR;
-        return openai_http_send_error(
-            connection, client_error ? 400 : 500,
-            client_error && generation_error[0]
-                ? generation_error : "generation failed",
-            NULL, "generation_failed", NULL);
-    }
-
     OpenAIResponsesOutput content = {0};
-    if (!openai_responses_output_parse(
-            raw.data ? raw.data : "", raw.size,
-            request.chat.rendered_thinking, &content)) {
+    char *retry_prompt = NULL;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        OpenAIChatRequest retry_request = request.chat;
+        if (retry_prompt) retry_request.rendered_prompt = retry_prompt;
+        OpenAIContentBuffer raw = {0};
+        OpenAIAccumulationSink accumulation = {
+            .connection = connection,
+            .buffer = &raw,
+        };
+        OpenAIUtf8Sink utf8 = {
+            .sink = openai_content_sink,
+            .sink_data = &accumulation,
+        };
+        memset(&result, 0, sizeof(result));
+        char generation_error[256] = {0};
+        int generated = handler(
+            user_data, &retry_request, openai_utf8_token_sink, &utf8,
+            &result, generation_error, sizeof(generation_error));
+        int finalized = generated == OPENAI_GENERATE_OK &&
+                        openai_utf8_finish(&utf8);
+        openai_utf8_free(&utf8);
+        if (generated != OPENAI_GENERATE_OK || !finalized || raw.failed) {
+            free(raw.data);
+            free(retry_prompt);
+            openai_responses_request_free(&request);
+            int client_error = generated == OPENAI_GENERATE_CLIENT_ERROR;
+            return openai_http_send_error(
+                connection, client_error ? 400 : 500,
+                client_error && generation_error[0]
+                    ? generation_error : "generation failed",
+                NULL, "generation_failed", NULL);
+        }
+        if (!openai_responses_output_parse(
+                raw.data ? raw.data : "", raw.size,
+                request.chat.rendered_thinking, &content)) {
+            free(raw.data);
+            free(retry_prompt);
+            openai_responses_request_free(&request);
+            return openai_http_send_error(
+                connection, 500, "could not project model output",
+                NULL, "server_error", NULL);
+        }
         free(raw.data);
-        openai_responses_request_free(&request);
-        return openai_http_send_error(
-            connection, 500, "could not project model output",
-            NULL, "server_error", NULL);
+        if (!request.has_tools || !content.malformed_tool_call || attempt != 0)
+            break;
+        retry_prompt = openai_responses_retry_prompt(&request.chat);
+        if (!retry_prompt) break;
+        openai_responses_output_free(&content);
+        fprintf(stderr,
+                "FLOYD_RESPONSES retry=malformed_tool_call attempt=1\n");
     }
-    free(raw.data);
+    free(retry_prompt);
     char id[96];
     if (!openai_http_make_response_id(id, sizeof(id))) {
         openai_responses_output_free(&content);

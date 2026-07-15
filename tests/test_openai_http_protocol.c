@@ -513,6 +513,22 @@ static int test_responses_dsml_projection(void) {
     CHECK(strcmp(output.tool_calls[0].arguments, "{\"path\":\".\"}") == 0);
     openai_responses_output_free(&output);
 
+    static const char alternate_outer[] =
+        "Use ls.</think>\n\n"
+        "<｜DSML｜tool_cfiles>\n"
+        "<｜DSML｜invoke name=\"ls\">\n"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">."
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_cfiles>";
+    memset(&output, 0, sizeof(output));
+    CHECK(openai_responses_output_parse(
+        alternate_outer, sizeof(alternate_outer) - 1, 1, &output));
+    CHECK(output.tool_call_count == 1);
+    CHECK(strcmp(output.tool_calls[0].name, "ls") == 0);
+    CHECK(strcmp(output.tool_calls[0].arguments, "{\"path\":\".\"}") == 0);
+    openai_responses_output_free(&output);
+
     static const char unclosed_thinking[] =
         "Considering <｜DSML｜tool_cls><｜DSML｜invoke name=\"ls\">"
         "<｜DSML｜parameter name=\"path\" string=\"true\">."

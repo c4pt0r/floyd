@@ -319,6 +319,7 @@ static char *responses_render_tool_output(const char *output) {
 static char *responses_tools_prompt(const jval *tools) {
     if (!tools) return responses_strdup("");
     if (tools->t != J_ARR) return NULL;
+    if (tools->len == 0) return responses_strdup("");
     char *prompt = NULL;
     size_t prompt_size = 0;
     FILE *stream = open_memstream(&prompt, &prompt_size);
@@ -363,7 +364,10 @@ static char *responses_tools_prompt(const jval *tools) {
     }
     if (ok) ok = fputs(
         "\n\nYou MUST strictly follow the above defined tool name and parameter "
-        "schemas to invoke tool calls. Use the exact parameter names from the schemas.",
+        "schemas to invoke tool calls. Use the exact parameter names from the schemas. "
+        "Every tool call must contain a complete invoke element and complete parameter "
+        "elements. Never abbreviate or invent the tag names tool_calls, invoke, or "
+        "parameter.",
         stream) != EOF;
     if (fclose(stream) != 0) ok = 0;
     if (!ok) {
@@ -708,6 +712,7 @@ int openai_responses_request_parse(
         responses_error(error, error_size, "tools must contain function tools");
         goto fail;
     }
+    request->has_tools = tools_prompt[0] != 0;
     int prepended = responses_prepend_system(&request->chat, tools_prompt);
     free(tools_prompt);
     if (!prepended) goto oom;
@@ -824,7 +829,7 @@ static const char *responses_tool_start(const char *raw,
     }
     if (!best) {
         static const char *loose_starts[] = {
-            "<｜DSML｜tool_cls>", "<DSML｜tool_cls>", "<tool_cls>",
+            "<｜DSML｜tool_c", "<DSML｜tool_c", "<tool_c",
         };
         const char *loose = NULL;
         for (size_t i = 0; i < sizeof(loose_starts) / sizeof(loose_starts[0]); i++) {
@@ -853,6 +858,13 @@ static const char *responses_tool_start(const char *raw,
     *param_start = params[best_index];
     *param_end = param_ends[best_index];
     return best + strlen(starts[best_index]);
+}
+
+static int responses_has_tool_intent(const char *raw) {
+    return raw &&
+           (strstr(raw, "<｜DSML｜tool_c") ||
+            strstr(raw, "<DSML｜tool_c") ||
+            strstr(raw, "<tool_c"));
 }
 
 static const char *responses_invoke_close(const char *cursor,
@@ -904,6 +916,7 @@ int openai_responses_output_parse(
     memset(output, 0, sizeof(*output));
     char *copy = responses_strndup(raw ? raw : "", raw_size);
     if (!copy) return 0;
+    int malformed_tool_call = 0;
     const char *visible = copy;
     if (thinking) {
         const char *reasoning_start = !strncmp(visible, "<think>", 7)
@@ -932,6 +945,7 @@ int openai_responses_output_parse(
     if (!cursor) {
         output->text = responses_strdup(visible);
         output->text_size = strlen(visible);
+        output->malformed_tool_call = responses_has_tool_intent(visible);
         free(copy);
         return output->text != NULL;
     }
@@ -1043,8 +1057,10 @@ int openai_responses_output_parse(
     return output->tool_call_count > 0;
 
 fail:
+    malformed_tool_call = responses_has_tool_intent(visible);
     openai_responses_output_free(output);
     output->text = copy;
     output->text_size = raw_size;
+    output->malformed_tool_call = malformed_tool_call;
     return 1;
 }
